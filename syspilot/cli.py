@@ -123,8 +123,9 @@ def cli(ctx: click.Context, config: str | None, log_level: str) -> None:
 @click.option("--pid", "-p", type=int, help="Target process ID")
 @click.option("--name", "-n", help="Target process name")
 @click.option("--interval", "-i", default=5.0, help="Monitoring interval (seconds)")
+@click.option("--manual", "-m", multiple=True, help="Load specific manuals (e.g., numactl, pytorch)")
 @click.pass_context
-def monitor(ctx: click.Context, pid: int | None, name: str | None, interval: float) -> None:
+def monitor(ctx: click.Context, pid: int | None, name: str | None, interval: float, manual: tuple[str, ...]) -> None:
     config: SysPilotConfig = ctx.obj["config"]
     config.target_pid = pid
     config.target_name = name
@@ -144,6 +145,16 @@ def monitor(ctx: click.Context, pid: int | None, name: str | None, interval: flo
         config.target_pid = processes[0].pid
     
     agent = SysPilotAgent(config)
+    
+    if manual:
+        console.print(f"[cyan]Loading manuals: {', '.join(manual)}[/cyan]")
+        results = agent.load_manuals(list(manual))
+        for manual_name, success in results.items():
+            if success:
+                console.print(f"  [green]✓ Loaded: {manual_name}[/green]")
+            else:
+                console.print(f"  [red]✗ Failed: {manual_name}[/red]")
+    
     manager = ProfilingManager()
     tuner = ApplicationTuner(config.tuning)
     
@@ -154,7 +165,8 @@ def monitor(ctx: click.Context, pid: int | None, name: str | None, interval: flo
     console.print(Panel(
         f"[bold green]SysPilot Monitor[/bold green]\n"
         f"Target: PID {config.target_pid or 'System-wide'}\n"
-        f"Interval: {interval}s",
+        f"Interval: {interval}s\n"
+        f"Manuals: {len(agent.context.loaded_manuals)} loaded",
         title="Starting",
     ))
     
@@ -167,12 +179,23 @@ def monitor(ctx: click.Context, pid: int | None, name: str | None, interval: flo
 
 @cli.command()
 @click.argument("pid", type=int)
+@click.option("--manual", "-m", multiple=True, help="Load specific manuals (e.g., numactl, pytorch)")
 @click.pass_context
-def analyze(ctx: click.Context, pid: int) -> None:
+def analyze(ctx: click.Context, pid: int, manual: tuple[str, ...]) -> None:
     config: SysPilotConfig = ctx.obj["config"]
     config.target_pid = pid
     
     agent = SysPilotAgent(config)
+    
+    if manual:
+        console.print(f"[cyan]Loading manuals: {', '.join(manual)}[/cyan]")
+        results = agent.load_manuals(list(manual))
+        for manual_name, success in results.items():
+            if success:
+                console.print(f"  [green]✓ Loaded: {manual_name}[/green]")
+            else:
+                console.print(f"  [red]✗ Failed: {manual_name}[/red]")
+    
     manager = ProfilingManager()
     tuner = ApplicationTuner(config.tuning)
     
@@ -207,6 +230,35 @@ def profile(ctx: click.Context, pid: int, collector: tuple[str, ...]) -> None:
             table.add_row(str(key), str(value))
         
         console.print(table)
+
+
+@cli.command()
+def manuals() -> None:
+    """List available tuning manuals."""
+    from pathlib import Path
+    manual_dir = Path(__file__).parent.parent / "manual"
+    
+    if not manual_dir.exists():
+        console.print("[yellow]No manuals directory found[/yellow]")
+        return
+    
+    manuals_list = [p.stem for p in manual_dir.glob("*.md")]
+    
+    if not manuals_list:
+        console.print("[yellow]No manuals available[/yellow]")
+        return
+    
+    table = Table(title="Available Tuning Manuals")
+    table.add_column("Manual", style="cyan")
+    table.add_column("Path", style="green")
+    
+    for manual_name in sorted(manuals_list):
+        manual_path = manual_dir / f"{manual_name}.md"
+        table.add_row(manual_name, str(manual_path))
+    
+    console.print(table)
+    console.print("\n[dim]Use --manual/-m flag with monitor or analyze commands to load manuals[/dim]")
+    console.print("[dim]Example: syspilot analyze 1234 --manual numactl --manual pytorch[/dim]")
 
 
 @cli.command()

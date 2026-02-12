@@ -90,3 +90,4 @@ syspilot.yaml
 /backups/
 config
 log
+node_modules

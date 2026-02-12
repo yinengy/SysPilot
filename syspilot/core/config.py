@@ -40,6 +40,42 @@ class LLMConfig:
                 self.api_key = os.getenv("OPENAI_API_KEY")
             elif self.provider == LLMProvider.ANTHROPIC:
                 self.api_key = os.getenv("ANTHROPIC_API_KEY")
+    
+    @classmethod
+    def from_dict(cls, config: dict[str, Any]) -> LLMConfig:
+        provider_str = config.get("provider", "openai")
+        if isinstance(provider_str, str):
+            provider = LLMProvider(provider_str)
+        else:
+            provider = provider_str
+        
+        return cls(
+            provider=provider,
+            model=config.get("model", "gpt-4o"),
+            api_key=config.get("api_key"),
+            base_url=config.get("base_url"),
+            temperature=config.get("temperature", 0.1),
+            max_tokens=config.get("max_tokens", 4096),
+        )
+    
+    @classmethod
+    def from_file(cls, path: str | Path | None = None) -> LLMConfig:
+        if path is None:
+            path = Path(__file__).parent.parent.parent / "config" / "llm_config.json"
+        else:
+            path = Path(path)
+        
+        if not path.exists():
+            raise FileNotFoundError(
+                f"LLM config not found at {path}. "
+                "Please create config/llm_config.json with provider, base_url, api_key, and model."
+            )
+        
+        import json
+        with open(path, 'r') as f:
+            config = json.load(f)
+        
+        return cls.from_dict(config)
 
 
 @dataclass

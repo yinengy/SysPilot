@@ -13,6 +13,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from pathlib import Path
 from typing import Any, Callable
 
 from syspilot.core.config import SysPilotConfig
@@ -62,6 +63,7 @@ class AgentContext:
     tuning_history: list[TuningRecommendation] = field(default_factory=list)
     active_scripts: dict[str, str] = field(default_factory=dict)  # name -> script content
     system_baseline: dict[str, Any] = field(default_factory=dict)
+    loaded_manuals: dict[str, str] = field(default_factory=dict)
     
     def get_context_summary(self, max_profiles: int = 5) -> str:
         """Generate a condensed context summary for LLM."""
@@ -100,18 +102,25 @@ Your capabilities:
 2. Profile target applications to understand their resource usage patterns
 3. Write custom scripts (Python, Bash, eBPF) to gather specific profiling data
 4. Analyze profiling results and identify performance bottlenecks
-5. Recommend and apply configuration tuning
+5. Recommend and apply configuration tuning based on loaded manuals
 
 Key principles:
 - MINIMIZE CONTEXT: Always summarize large profiling outputs into essential insights
 - DYNAMIC SCRIPTING: Write scripts to process raw data (strace, perf, etc.) and extract key metrics
 - eBPF PROFICIENCY: Use eBPF for low-overhead, precise system profiling when needed
 - CONSERVATIVE TUNING: Recommend changes with clear reasoning and confidence levels
+- MANUAL-GUIDED TUNING: When manuals are loaded, use them to identify tuning opportunities
 
 When writing profiling scripts:
 - Process raw data and output only essential metrics
 - Include error handling and timeouts
 - For eBPF: use BCC Python bindings or bpftrace
+
+When tuning with manuals:
+- Detect which libraries/tools the application uses (check loaded .so files, imports, process name)
+- Reference the loaded manual sections for detection heuristics and tuning patterns
+- Follow the manual's decision trees and recommended configurations
+- Explain tuning rationale by citing specific manual sections
 
 Available tools will be provided for each interaction."""
 
@@ -127,9 +136,57 @@ Available tools will be provided for each interaction."""
         self._tool_definitions: list[ToolDefinition] = []
         self._message_history: list[Message] = []
         self._running = False
+        self._manual_dir = Path(__file__).parent.parent.parent / "manual"
         
-        # Initialize with system prompt
-        self._message_history.append(Message(role="system", content=self.SYSTEM_PROMPT))
+        # Initialize with system prompt (manuals will be loaded separately)
+        self._update_system_prompt()
+    
+    def _update_system_prompt(self) -> None:
+        prompt_parts = [self.SYSTEM_PROMPT]
+        
+        if self.context.loaded_manuals:
+            prompt_parts.append("\n\n## LOADED MANUALS")
+            prompt_parts.append("You have access to the following technical manuals for tuning:")
+            for manual_name, manual_content in self.context.loaded_manuals.items():
+                prompt_parts.append(f"\n### Manual: {manual_name}")
+                prompt_parts.append(manual_content)
+        
+        full_prompt = "\n".join(prompt_parts)
+        
+        if self._message_history and self._message_history[0].role == "system":
+            self._message_history[0] = Message(role="system", content=full_prompt)
+        else:
+            self._message_history.insert(0, Message(role="system", content=full_prompt))
+    
+    def load_manual(self, manual_name: str) -> bool:
+        manual_path = self._manual_dir / f"{manual_name}.md"
+        
+        if not manual_path.exists():
+            logger.warning(f"Manual not found: {manual_path}")
+            return False
+        
+        try:
+            with open(manual_path, 'r') as f:
+                content = f.read()
+            
+            self.context.loaded_manuals[manual_name] = content
+            self._update_system_prompt()
+            logger.info(f"Loaded manual: {manual_name} ({len(content)} bytes)")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to load manual {manual_name}: {e}")
+            return False
+    
+    def load_manuals(self, manual_names: list[str]) -> dict[str, bool]:
+        results = {}
+        for name in manual_names:
+            results[name] = self.load_manual(name)
+        return results
+    
+    def list_available_manuals(self) -> list[str]:
+        if not self._manual_dir.exists():
+            return []
+        return [p.stem for p in self._manual_dir.glob("*.md")]
     
     def register_tool(
         self,
