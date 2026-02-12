@@ -8,10 +8,11 @@ SysPilot is an intelligent agent that monitors system resources, profiles applic
 
 ### Key Features
 
+- **Iterative Tuning Engine**: Profile → Tune → Verify → Iterate loop for finding optimal configurations
 - **Dynamic Script Generation**: Agent writes custom scripts to gather specific profiling data
 - **eBPF Proficiency**: Low-overhead system profiling using eBPF/bpftrace
-- **Context Minimization**: Processes large profiling outputs into essential insights
-- **Application Tuning**: Detects misconfigurations and recommends optimizations
+- **Context Minimization**: Processes large profiling outputs into essential insights (using LLM parsing)
+- **Application Tuning**: Detects misconfigurations (NUMA, CPU affinity, etc.) and recommends optimizations
 - **Multi-LLM Support**: Works with OpenAI and Anthropic models
 
 ## Architecture
@@ -19,11 +20,11 @@ SysPilot is an intelligent agent that monitors system resources, profiles applic
 ```
 syspilot/
 ├── core/           # Agent framework, LLM interface, configuration
-├── profiling/      # System collectors (CPU, memory, process)
+├── profiling/      # System collectors (CPU, memory, process, NUMA)
 ├── skills/         # Dynamic script execution, eBPF templates
-│   ├── builtin/    # Strace analyzer, perf analyzer
+│   ├── builtin/    # Strace analyzer, perf analyzer, data processor
 │   └── ebpf/       # eBPF skill and templates
-├── tuning/         # Config detection and application tuning
+├── tuning/         # Config detection, tuning engine, and application tuner
 ├── utils/          # Logging, process utilities
 └── cli.py          # Command-line interface
 ```
@@ -67,6 +68,12 @@ syspilot monitor --pid 1234
 # Monitor by process name
 syspilot monitor --name nginx
 
+# Iteratively tune a running process (Attach Mode)
+syspilot tune --pid 1234 --manual numactl
+
+# Launch and tune a command (Spawn Mode)
+syspilot tune --command "./benchmark -t 4" --manual numactl --parse-output
+
 # Analyze a specific process
 syspilot analyze 1234
 
@@ -76,6 +83,48 @@ syspilot profile 1234
 # List available skills
 syspilot skills
 ```
+
+## Tuning Workflows
+
+SysPilot supports two primary tuning workflows via the `tune` command:
+
+### 1. Spawn Mode (Recommended for Benchmarks)
+
+Use this when you want SysPilot to manage the entire lifecycle: launch, baseline, tune, and verify.
+
+```bash
+syspilot tune \
+  --command "/path/to/app --args" \
+  --manual numactl \
+  --max-iterations 5 \
+  --parse-output
+```
+
+**Features:**
+- Runs baseline benchmark automatically
+- Collects NUMA topology and system profile
+- Agent analyzes performance and recommends flags (e.g., `numactl --interleave=all`)
+- Runs tuned command and compares results side-by-side
+- `--parse-output` uses LLM to extract app-specific metrics (e.g., tokens/sec) from stdout
+
+### 2. Attach Mode (Recommended for Services)
+
+Use this for long-running services (databases, web servers) that are already running.
+
+```bash
+syspilot tune --pid 12345 --manual postgresql --dry-run
+```
+
+**Features:**
+- Connects to existing process
+- Profiles live metrics (CPU, memory, NUMA placement)
+- Recommends runtime changes (sysctl, prlimit) or restart configurations
+- `--dry-run` allows safe inspection of recommended actions
+
+## Demos
+
+- **Interactive Visualization**: Check out `examples/llama_numa_demo.html` to see how SysPilot optimized llama.cpp.
+- **Run it yourself**: Execute `python examples/llama_numa_testbench.py` to run the end-to-end llama.cpp tuning benchmark on your machine.
 
 ## Configuration
 
@@ -180,6 +229,8 @@ result = await skill.execute(
 | `network_connections` | Track network connections |
 | `context_switches` | Track context switches |
 | `page_faults` | Track page faults |
+| `numa_page_migrations` | Track NUMA page migrations |
+| `cache_misses` | Track hardware cache misses |
 
 ## How It Works
 
@@ -189,6 +240,7 @@ result = await skill.execute(
 4. **Summarization**: Processes large outputs into minimal context
 5. **Analysis**: LLM analyzes summarized data for bottlenecks
 6. **Tuning**: Recommends or applies configuration changes
+7. **Verification**: Tuning Engine runs iterative loops to verify improvements
 
 ## Development
 
