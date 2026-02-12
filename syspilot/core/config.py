@@ -60,22 +60,35 @@ class LLMConfig:
     
     @classmethod
     def from_file(cls, path: str | Path | None = None) -> LLMConfig:
-        if path is None:
-            path = Path(__file__).parent.parent.parent / "config" / "llm_config.json"
-        else:
-            path = Path(path)
+        if path:
+            p = Path(path)
+            if not p.exists():
+                raise FileNotFoundError(f"LLM config not found at {path}")
+            import json
+            with open(p, 'r') as f:
+                return cls.from_dict(json.load(f))
         
-        if not path.exists():
-            raise FileNotFoundError(
-                f"LLM config not found at {path}. "
-                "Please create config/llm_config.json with provider, base_url, api_key, and model."
-            )
+        # Search default locations
+        search_paths = [
+            # Source tree location (relative to this file)
+            Path(__file__).parent.parent.parent / "config" / "llm_config.json",
+            # User config location
+            Path("~/.syspilot/llm_config.json").expanduser(),
+            # Current directory
+            Path("llm_config.json"),
+        ]
         
-        import json
-        with open(path, 'r') as f:
-            config = json.load(f)
+        for p in search_paths:
+            if p.exists():
+                import json
+                try:
+                    with open(p, 'r') as f:
+                        return cls.from_dict(json.load(f))
+                except Exception:
+                    continue
         
-        return cls.from_dict(config)
+        # Fallback to defaults (will rely on env vars)
+        return cls()
 
 
 @dataclass

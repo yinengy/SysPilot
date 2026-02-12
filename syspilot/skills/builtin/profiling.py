@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
+import tempfile
 import time
+import uuid
 from typing import Any
 
 from syspilot.skills.base import BaseSkill, SkillResult
@@ -145,4 +148,123 @@ rm -f perf.data perf.data.old 2>/dev/null || true
                 "event": {"type": "string", "description": "Perf event to record", "default": "cycles"},
             },
             "required": ["pid"],
+        }
+
+
+class DataProcessorSkill(BaseSkill):
+    name = "data_processor"
+    description = (
+        "Two-phase data processing: 'capture' runs a command and stores raw output, "
+        "'process' runs a script against the captured data to produce compressed insights"
+    )
+
+    PREVIEW_LINES = 15
+
+    def __init__(self) -> None:
+        self.executor = ScriptExecutor()
+        self._captures: dict[str, str] = {}
+
+    async def execute(self, **kwargs: Any) -> SkillResult:
+        action = kwargs.get("action", "capture")
+
+        if action == "capture":
+            return await self._capture(kwargs.get("command", ""))
+        elif action == "process":
+            return await self._process(
+                capture_id=kwargs.get("capture_id", ""),
+                script=kwargs.get("script", ""),
+            )
+        else:
+            return SkillResult(
+                success=False,
+                output="",
+                summary=f"Unknown action: {action}",
+                execution_time_seconds=0,
+                error=f"Unknown action: {action}",
+            )
+
+    async def _capture(self, command: str) -> SkillResult:
+        if not command:
+            return SkillResult(
+                success=False, output="", summary="No command provided",
+                execution_time_seconds=0, error="Empty command",
+            )
+
+        result = await self.executor.execute_bash(command)
+        if not result.success:
+            return result
+
+        capture_id = uuid.uuid4().hex[:12]
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".capture", delete=False, prefix=f"syspilot_{capture_id}_",
+        )
+        tmp.write(result.output)
+        tmp.close()
+        self._captures[capture_id] = tmp.name
+
+        lines = result.output.splitlines()
+        preview = "\n".join(lines[:self.PREVIEW_LINES])
+
+        return SkillResult(
+            success=True,
+            output=preview,
+            summary=f"Captured {len(lines)} lines ({len(result.output)} bytes) as {capture_id}",
+            execution_time_seconds=result.execution_time_seconds,
+            data={"capture_id": capture_id, "total_lines": len(lines), "total_bytes": len(result.output)},
+        )
+
+    async def _process(self, capture_id: str, script: str) -> SkillResult:
+        if not capture_id or capture_id not in self._captures:
+            return SkillResult(
+                success=False, output="", summary=f"Unknown capture_id: {capture_id}",
+                execution_time_seconds=0, error="Invalid capture_id",
+            )
+        if not script:
+            return SkillResult(
+                success=False, output="", summary="No processing script provided",
+                execution_time_seconds=0, error="Empty script",
+            )
+
+        filepath = self._captures[capture_id]
+        injected = f'raw_data = open("{filepath}").read()\n' + script
+
+        result = await self.executor.execute_python(injected)
+
+        try:
+            os.unlink(filepath)
+        except OSError:
+            pass
+        self._captures.pop(capture_id, None)
+
+        return result
+
+    def get_parameters_schema(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["capture", "process"],
+                    "description": (
+                        "'capture': run a shell command and store raw output. "
+                        "'process': run a Python script against previously captured data."
+                    ),
+                },
+                "command": {
+                    "type": "string",
+                    "description": "Shell command to capture (used with action=capture)",
+                },
+                "capture_id": {
+                    "type": "string",
+                    "description": "ID returned from a previous capture (used with action=process)",
+                },
+                "script": {
+                    "type": "string",
+                    "description": (
+                        "Python script to process captured data. The variable 'raw_data' "
+                        "is pre-injected with the captured output string."
+                    ),
+                },
+            },
+            "required": ["action"],
         }

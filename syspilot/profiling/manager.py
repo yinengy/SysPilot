@@ -8,6 +8,7 @@ from typing import Any
 from syspilot.profiling.collectors.base import BaseCollector, CollectorResult
 from syspilot.profiling.collectors.cpu import CPUCollector
 from syspilot.profiling.collectors.memory import MemoryCollector
+from syspilot.profiling.collectors.numa import NUMACollector
 from syspilot.profiling.collectors.process import ProcessCollector
 
 logger = logging.getLogger(__name__)
@@ -19,7 +20,7 @@ class ProfilingManager:
         self._register_default_collectors()
     
     def _register_default_collectors(self) -> None:
-        for collector_cls in [CPUCollector, MemoryCollector, ProcessCollector]:
+        for collector_cls in [CPUCollector, MemoryCollector, ProcessCollector, NUMACollector]:
             collector = collector_cls()
             if collector.is_available():
                 self._collectors[collector.name] = collector

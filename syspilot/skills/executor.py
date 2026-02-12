@@ -24,11 +24,59 @@ class ExecutionConfig:
     env_vars: dict[str, str] | None = None
 
 
+BLOCKED_COMMANDS: set[str] = {
+    "rm", "rmdir", "mkfs", "dd", "shutdown", "reboot", "poweroff",
+    "halt", "init", "systemctl", "format", "fdisk", "parted",
+    ":(){:|:&};:", "fork", "wget", "curl",
+}
+
+SUDO_ALLOWED: set[str] = {"bpftrace", "perf", "sysctl", "prlimit", "numactl"}
+
+
 class ScriptExecutor:
     """Executes dynamically generated scripts safely."""
     
     def __init__(self, config: ExecutionConfig | None = None) -> None:
         self.config = config or ExecutionConfig()
+    
+    def _validate_command(self, cmd: list[str]) -> None:
+        """Raise ValueError if the command violates sandbox policy.
+        
+        Checks:
+        1. The base binary must not be in the BLOCKED_COMMANDS set.
+        2. If sandbox_enabled, the base binary must be in allowed_commands
+           (when an allow-list is configured).
+        3. sudo is only permitted for a known subset of tools.
+        """
+        if not cmd:
+            raise ValueError("Empty command")
+
+        # Determine the "real" binary (skip leading sudo)
+        base_idx = 0
+        if cmd[0] == "sudo" and len(cmd) > 1:
+            base_idx = 1
+        base_cmd = Path(cmd[base_idx]).name  # handle absolute paths
+
+        # Block dangerous commands unconditionally
+        if base_cmd in BLOCKED_COMMANDS:
+            raise ValueError(
+                f"Command '{base_cmd}' is blocked by sandbox policy"
+            )
+
+        # Enforce allow-list when sandbox is on and list is provided
+        if self.config.sandbox_enabled and self.config.allowed_commands is not None:
+            if base_cmd not in self.config.allowed_commands:
+                raise ValueError(
+                    f"Command '{base_cmd}' is not in the allowed commands list: "
+                    f"{self.config.allowed_commands}"
+                )
+
+        # Restrict sudo usage
+        if cmd[0] == "sudo" and base_cmd not in SUDO_ALLOWED:
+            raise ValueError(
+                f"sudo is not permitted for '{base_cmd}'. "
+                f"Allowed sudo commands: {SUDO_ALLOWED}"
+            )
     
     async def execute_python(
         self,
@@ -100,6 +148,17 @@ class ScriptExecutor:
     ) -> SkillResult:
         start_time = time.time()
         timeout = timeout_override or self.config.timeout_seconds
+        
+        try:
+            self._validate_command(cmd)
+        except ValueError as e:
+            return SkillResult(
+                success=False,
+                output="",
+                summary=f"Sandbox violation: {e}",
+                execution_time_seconds=0,
+                error=str(e),
+            )
         
         env = os.environ.copy()
         if self.config.env_vars:

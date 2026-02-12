@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import shutil
+import subprocess
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -174,16 +175,113 @@ class ApplicationTuner:
     
     def _apply_action(self, pid: int, action: TuningAction) -> bool:
         logger.info(f"Applying tuning action: {action.parameter} = {action.new_value}")
-        logger.warning("Direct tuning application not yet implemented")
-        return False
-    
+
+        dispatch = {
+            "sysctl": self._apply_sysctl,
+            "prlimit": self._apply_prlimit,
+            "command": self._apply_command,
+            "env_var": self._apply_env_var,
+            "numactl": self._apply_numactl,
+        }
+
+        handler = dispatch.get(action.config_type)
+        if handler is None:
+            logger.warning(f"No handler for config_type '{action.config_type}'")
+            return False
+
+        try:
+            return handler(pid, action)
+        except Exception as e:
+            logger.error(f"Failed to apply action {action.parameter}: {e}")
+            return False
+
+    def _apply_sysctl(self, pid: int, action: TuningAction) -> bool:
+        param = action.parameter
+        value = str(action.new_value)
+        result = subprocess.run(
+            ["sudo", "sysctl", "-w", f"{param}={value}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            logger.error(f"sysctl failed: {result.stderr}")
+            return False
+        return True
+
+    def _apply_prlimit(self, pid: int, action: TuningAction) -> bool:
+        resource = action.parameter
+        value = str(action.new_value)
+        result = subprocess.run(
+            ["sudo", "prlimit", f"--pid={pid}", f"--{resource}={value}:{value}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            logger.error(f"prlimit failed: {result.stderr}")
+            return False
+        return True
+
+    def _apply_command(self, pid: int, action: TuningAction) -> bool:
+        cmd = action.new_value
+        if not isinstance(cmd, str):
+            logger.error("command config_type expects new_value to be a shell command string")
+            return False
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            logger.error(f"Command failed: {result.stderr}")
+            return False
+        return True
+
+    def _apply_env_var(self, pid: int, action: TuningAction) -> bool:
+        logger.info(
+            f"Environment variable '{action.parameter}' should be set to "
+            f"'{action.new_value}' on next process restart."
+        )
+        return True
+
+    def _apply_numactl(self, pid: int, action: TuningAction) -> bool:
+        cmd = action.new_value
+        if not isinstance(cmd, str):
+            logger.error("numactl config_type expects new_value to be a numactl command string")
+            return False
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            logger.error(f"numactl command failed: {result.stderr}")
+            return False
+        return True
+
     def rollback(self, action: TuningAction) -> bool:
         if not action.backup_path or not action.backup_path.exists():
             logger.error("No backup available for rollback")
             return False
-        
+
         logger.info(f"Rolling back: {action.parameter}")
-        return True
+        try:
+            backup_data = json.loads(action.backup_path.read_text())
+            original = backup_data.get("original_value")
+            if original is None:
+                logger.error("Backup does not contain original_value")
+                return False
+
+            rollback_action = TuningAction(
+                config_type=action.config_type,
+                parameter=action.parameter,
+                current_value=action.new_value,
+                new_value=original,
+                reason=f"rollback of {action.parameter}",
+            )
+
+            pid = 0
+            success = self._apply_action(pid, rollback_action)
+            if success:
+                action.applied = False
+                logger.info(f"Rollback successful: {action.parameter}")
+            return success
+        except Exception as e:
+            logger.error(f"Rollback failed: {e}")
+            return False
     
     def get_history(self) -> list[TuningAction]:
         return self._history.copy()

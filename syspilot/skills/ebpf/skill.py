@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import re
 import shutil
 import time
 from typing import Any
@@ -7,6 +9,8 @@ from typing import Any
 from syspilot.skills.base import BaseSkill, SkillResult
 from syspilot.skills.executor import ScriptExecutor
 from syspilot.skills.ebpf.templates import EBPFTemplates
+
+logger = logging.getLogger(__name__)
 
 
 class EBPFSkill(BaseSkill):
@@ -142,6 +146,18 @@ class EBPFSkill(BaseSkill):
                 error="Empty script",
             )
         
+        validation_error = self._validate_script(script, script_type)
+        if validation_error:
+            return SkillResult(
+                success=False,
+                output="",
+                summary=f"Script validation failed: {validation_error}",
+                execution_time_seconds=0,
+                error=validation_error,
+            )
+        
+        logger.info(f"Running custom {script_type} eBPF script ({len(script)} bytes, {duration}s)")
+        
         if script_type == "bpftrace":
             if not self._check_bpftrace():
                 return SkillResult(
@@ -172,6 +188,35 @@ class EBPFSkill(BaseSkill):
             error=f"Unsupported script type: {script_type}",
         )
     
+    @staticmethod
+    def _validate_script(script: str, script_type: str) -> str | None:
+        # Security: reject scripts containing shell injection patterns
+        dangerous_patterns = [
+            r";\s*rm\s",
+            r"\|\s*bash",
+            r"\$\(",
+            r"`[^`]+`",
+            r">\s*/dev/sd",
+            r"mkfs\.",
+        ]
+        for pattern in dangerous_patterns:
+            if re.search(pattern, script):
+                return f"Script contains potentially dangerous pattern: {pattern}"
+
+        if script_type == "bpftrace":
+            if "tracepoint:" not in script and "kprobe:" not in script \
+               and "uprobe:" not in script and "profile:" not in script \
+               and "software:" not in script and "hardware:" not in script \
+               and "interval:" not in script:
+                return "bpftrace script must contain at least one probe definition"
+
+        elif script_type == "bcc":
+            if "from bcc" not in script and "import bcc" not in script \
+               and "BPF(" not in script:
+                return "BCC script must import bcc or use BPF()"
+
+        return None
+    
     def get_parameters_schema(self) -> dict[str, Any]:
         return {
             "type": "object",
@@ -179,29 +224,41 @@ class EBPFSkill(BaseSkill):
                 "action": {
                     "type": "string",
                     "enum": ["run_template", "run_custom", "list_templates", "check_availability"],
-                    "description": "Action to perform",
+                    "description": (
+                        "Action to perform. Use 'list_templates' to see available templates. "
+                        "Use 'run_template' with a template_name for predefined profiling. "
+                        "Use 'run_custom' to run agent-generated eBPF scripts. "
+                        "Use 'check_availability' to verify eBPF tooling is installed."
+                    ),
                 },
                 "template_name": {
                     "type": "string",
-                    "description": "Name of the eBPF template to run",
+                    "description": (
+                        "Name of the eBPF template (e.g. syscall_count, cpu_profile, "
+                        "memory_alloc, io_latency, context_switches, page_faults, "
+                        "numa_page_migrations, cache_misses, bcc_syscall_latency)"
+                    ),
                 },
                 "pid": {
                     "type": "integer",
-                    "description": "Target process ID",
+                    "description": "Target process ID (required for all profiling templates)",
                 },
                 "duration": {
                     "type": "integer",
-                    "description": "Profiling duration in seconds",
+                    "description": "Profiling duration in seconds (default: 5)",
                     "default": 5,
                 },
                 "script": {
                     "type": "string",
-                    "description": "Custom eBPF script content",
+                    "description": (
+                        "Custom eBPF script content. For bpftrace: must contain probe "
+                        "definitions (tracepoint:, kprobe:, etc). For BCC: must import bcc."
+                    ),
                 },
                 "script_type": {
                     "type": "string",
                     "enum": ["bpftrace", "bcc"],
-                    "description": "Type of eBPF script",
+                    "description": "Type of eBPF script (bpftrace for one-liners, bcc for Python-based)",
                 },
             },
             "required": ["action"],

@@ -156,6 +156,53 @@ interval:s:{duration}
 }}
 '''
 
+    NUMA_PAGE_MIGRATIONS = '''#!/usr/bin/env bpftrace
+// Track NUMA page migrations via migrate_pages syscall
+tracepoint:syscalls:sys_enter_migrate_pages
+/pid == {pid}/
+{{
+    @migrations = count();
+}}
+
+tracepoint:exceptions:page_fault_user
+/pid == {pid}/
+{{
+    @user_faults = count();
+}}
+
+tracepoint:exceptions:page_fault_kernel
+/pid == {pid}/
+{{
+    @kernel_faults = count();
+}}
+
+interval:s:{duration}
+{{
+    exit();
+}}
+'''
+
+    CACHE_MISSES = '''#!/usr/bin/env bpftrace
+// Track hardware cache misses
+hardware:cache-misses:1000
+/pid == {pid}/
+{{
+    @cache_misses = count();
+    @miss_stacks[ustack(5)] = count();
+}}
+
+hardware:cache-references:10000
+/pid == {pid}/
+{{
+    @cache_refs = count();
+}}
+
+interval:s:{duration}
+{{
+    exit();
+}}
+'''
+
     BCC_SYSCALL_LATENCY = '''#!/usr/bin/env python3
 from bcc import BPF
 import time
@@ -204,6 +251,8 @@ b["dist"].print_log2_hist("latency")
             "network_connections": cls.NETWORK_CONNECTIONS,
             "context_switches": cls.CONTEXT_SWITCHES,
             "page_faults": cls.PAGE_FAULTS,
+            "numa_page_migrations": cls.NUMA_PAGE_MIGRATIONS,
+            "cache_misses": cls.CACHE_MISSES,
             "bcc_syscall_latency": cls.BCC_SYSCALL_LATENCY,
         }
         return templates.get(name)
@@ -219,6 +268,8 @@ b["dist"].print_log2_hist("latency")
             {"name": "network_connections", "description": "Track network connections"},
             {"name": "context_switches", "description": "Track context switches"},
             {"name": "page_faults", "description": "Track page faults"},
+            {"name": "numa_page_migrations", "description": "Track NUMA page migrations and cross-node faults"},
+            {"name": "cache_misses", "description": "Track hardware cache misses with stack traces"},
             {"name": "bcc_syscall_latency", "description": "Syscall latency with BCC"},
         ]
     

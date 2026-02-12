@@ -98,11 +98,12 @@ class SysPilotAgent:
     SYSTEM_PROMPT = """You are SysPilot, an AI agent specialized in system monitoring and application performance tuning.
 
 Your capabilities:
-1. Monitor system resources (CPU, memory, cache, I/O)
+1. Monitor system resources (CPU, memory, cache, I/O, NUMA topology)
 2. Profile target applications to understand their resource usage patterns
 3. Write custom scripts (Python, Bash, eBPF) to gather specific profiling data
 4. Analyze profiling results and identify performance bottlenecks
 5. Recommend and apply configuration tuning based on loaded manuals
+6. Iteratively tune applications: profile → apply → re-profile → compare → iterate
 
 Key principles:
 - MINIMIZE CONTEXT: Always summarize large profiling outputs into essential insights
@@ -110,17 +111,34 @@ Key principles:
 - eBPF PROFICIENCY: Use eBPF for low-overhead, precise system profiling when needed
 - CONSERVATIVE TUNING: Recommend changes with clear reasoning and confidence levels
 - MANUAL-GUIDED TUNING: When manuals are loaded, use them to identify tuning opportunities
+- ITERATIVE TUNING: Run profile-apply-measure loops and roll back regressions automatically
+
+When to use eBPF:
+- You need low-overhead kernel-level tracing (syscall patterns, page faults, context switches)
+- Standard profiling tools don't provide sufficient granularity
+- You need to trace NUMA page migrations, cache misses, or memory allocation patterns
+- The target application is latency-sensitive and cannot tolerate strace overhead
+
+Dynamic Script Generation pipeline:
+1. CAPTURE: Run a command and save its raw output to a temp file
+2. SAMPLE: Read the first few lines to understand the output format
+3. GENERATE: Write a Python processing script to compress the raw output into key insights
+4. EXECUTE: Run the processing script against the captured data
+5. RETURN: Provide the compressed result to minimize LLM context usage
 
 When writing profiling scripts:
 - Process raw data and output only essential metrics
 - Include error handling and timeouts
 - For eBPF: use BCC Python bindings or bpftrace
 
-When tuning with manuals:
+When tuning:
 - Detect which libraries/tools the application uses (check loaded .so files, imports, process name)
 - Reference the loaded manual sections for detection heuristics and tuning patterns
+- Use the apply_tuning tool with config_type: sysctl | prlimit | command | env_var | numactl
 - Follow the manual's decision trees and recommended configurations
-- Explain tuning rationale by citing specific manual sections
+- After applying changes, re-profile to verify improvement
+- Roll back any change that causes >5% performance regression
+- Stop iterating when 2 consecutive iterations show <1% improvement
 
 Available tools will be provided for each interaction."""
 
@@ -136,7 +154,23 @@ Available tools will be provided for each interaction."""
         self._tool_definitions: list[ToolDefinition] = []
         self._message_history: list[Message] = []
         self._running = False
-        self._manual_dir = Path(__file__).parent.parent.parent / "manual"
+        
+        # Robust manual directory discovery
+        manual_candidates = [
+            # Source tree: syspilot/core/agent.py -> ../../../manual
+            Path(__file__).parent.parent.parent / "manual",
+            # User config: ~/.syspilot/manual
+            Path("~/.syspilot/manual").expanduser(),
+            # Current directory
+            Path("manual"),
+        ]
+        
+        self._manual_dir = manual_candidates[0] # Default
+        for p in manual_candidates:
+            if p.exists() and p.is_dir():
+                self._manual_dir = p
+                logger.debug(f"Using manual directory: {p}")
+                break
         
         # Initialize with system prompt (manuals will be loaded separately)
         self._update_system_prompt()
@@ -284,23 +318,30 @@ Respond with your analysis and any tool calls needed."""
         return response
 
     async def run_monitoring_loop(self) -> None:
-        """Run the main monitoring loop."""
         self._running = True
         self.state = AgentState.MONITORING
         logger.info("Starting monitoring loop")
         
+        iteration = 0
         while self._running:
             try:
-                # Trigger a monitoring step
-                await self.step("Check system status and profile target if needed.")
-                
-                # Wait for next interval
+                iteration += 1
+                prompt = (
+                    f"Monitoring iteration {iteration}.\n"
+                    f"Target PID: {self.context.target_pid or 'system-wide'}\n\n"
+                    "Steps:\n"
+                    "1. Collect profiling data using collect_profile\n"
+                    "2. Analyze the results for anomalies or bottlenecks\n"
+                    "3. If a tuning manual is loaded, check if any recommended optimizations apply\n"
+                    "4. If issues are found, suggest specific tuning actions with config_type and parameters\n"
+                    "5. Summarize findings in 3 sentences or fewer"
+                )
+                await self.step(prompt)
                 await asyncio.sleep(self.config.monitoring.interval_seconds)
-                
             except Exception as e:
                 logger.error(f"Monitoring loop error: {e}")
                 self.state = AgentState.ERROR
-                await asyncio.sleep(5)  # Brief pause before retry
+                await asyncio.sleep(5)
                 self.state = AgentState.MONITORING
 
     def stop(self) -> None:
@@ -356,6 +397,70 @@ Be conservative and explain each change."""
         response = await self.step(prompt)
         self.state = AgentState.IDLE
         return response.content
+
+    async def run_tuning_loop(
+        self,
+        tuning_engine: Any,
+        max_iterations: int | None = None,
+    ) -> str:
+        from syspilot.tuning.engine import TuningEngine
+
+        if not isinstance(tuning_engine, TuningEngine):
+            raise TypeError("tuning_engine must be a TuningEngine instance")
+
+        self.state = AgentState.TUNING
+        self._running = True
+        pid = self.context.target_pid
+        if not pid:
+            self.state = AgentState.IDLE
+            return "No target PID specified for tuning."
+
+        iterations = max_iterations or tuning_engine.max_iterations
+
+        for i in range(1, iterations + 1):
+            if not self._running:
+                break
+
+            prompt = (
+                f"Tuning iteration {i}/{iterations} for PID {pid}.\n\n"
+                "Steps:\n"
+                "1. Collect current profiling data\n"
+                "2. Analyze metrics and loaded manuals\n"
+                "3. Recommend tuning actions as a JSON list of objects with keys: "
+                "config_type (sysctl|prlimit|command|env_var|numactl), parameter, "
+                "current_value, new_value, reason\n"
+                "4. If no further optimizations are possible, respond with an empty list []"
+            )
+
+            response = await self.step(prompt)
+
+            try:
+                import re as _re
+                json_match = _re.search(r'\[.*\]', response.content, _re.DOTALL)
+                if json_match:
+                    recommendations = json.loads(json_match.group())
+                else:
+                    recommendations = []
+            except (json.JSONDecodeError, ValueError):
+                recommendations = []
+
+            if not recommendations:
+                logger.info(f"No more recommendations at iteration {i}, stopping")
+                break
+
+            result = await tuning_engine.run_iteration(pid, recommendations, i)
+
+            if result.rolled_back:
+                logger.warning(f"Iteration {i} rolled back, stopping tuning loop")
+                break
+
+            if tuning_engine.is_converged():
+                logger.info("Tuning converged, stopping")
+                break
+
+        self.state = AgentState.IDLE
+        summary = tuning_engine.get_summary()
+        return json.dumps(summary, indent=2)
 
     def add_profile_result(self, result: ProfileResult) -> None:
         """Add a profiling result to context."""
