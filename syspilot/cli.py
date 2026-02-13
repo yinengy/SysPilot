@@ -589,6 +589,210 @@ RESPOND WITH ONLY THE JSON OBJECT, NO EXPLANATION:"""
     return {"no_metrics": True}
 
 
+async def _run_live_profiling_pipeline(
+    agent: SysPilotAgent,
+    command_parts: list[str],
+    timeout: int,
+) -> dict[str, Any]:
+    started_at = time.monotonic()
+    proc = await asyncio.create_subprocess_exec(
+        *command_parts,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    pid = proc.pid
+    agent.context.target_pid = pid
+
+    await asyncio.sleep(1.0)
+
+    profiling_prompt = f"""Run an evidence-first profiling pipeline for PID {pid}.
+
+You MUST use tools in this order:
+1) collect_profile with pid={pid} and collectors ["cpu", "memory", "process", "numa"]
+2) skill_ebpf action="check_availability"
+3) if bpftrace is available, run skill_ebpf action="run_template" with template_name="numa_page_migrations" pid={pid} duration=2
+   otherwise, if BCC is available, run skill_ebpf action="run_template" with template_name="bcc_syscall_latency" pid={pid} duration=2
+4) skill_data_processor action="capture" with command="cat /proc/{pid}/numa_maps"
+5) skill_data_processor action="process" on that capture using a Python script that summarizes per-node pages and dominant node
+
+Then return ONLY one JSON object with keys:
+- pipeline_used: true
+- tools_used: list of tool names invoked
+- collect_profile_summary: short string
+- ebpf_summary: short string
+- refined_numa_maps: object with per_node_pages and dominant_node
+- key_findings: list of concise findings
+
+Do not recommend tuning flags yet. This step is profiling-only.
+"""
+
+    tool_count_before = sum(1 for m in agent._message_history if m.role == "tool")
+    profiling_response = await agent.step(profiling_prompt)
+    profiling_text = profiling_response.content
+    tool_count_after = sum(1 for m in agent._message_history if m.role == "tool")
+    agent_tool_calls = tool_count_after - tool_count_before
+
+    try:
+        stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        rc = proc.returncode
+        stdout = stdout_b.decode("utf-8", errors="replace")
+        stderr = stderr_b.decode("utf-8", errors="replace")
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.communicate()
+        rc = -1
+        stdout = ""
+        stderr = "Command timed out during profiling pipeline"
+
+    wall = time.monotonic() - started_at
+
+    profiling_json: dict[str, Any] = {}
+    try:
+        import re
+        m = re.search(r"\{.*\}", profiling_text, re.DOTALL)
+        if m:
+            parsed = json.loads(m.group())
+            if isinstance(parsed, dict):
+                profiling_json = parsed
+    except Exception:
+        profiling_json = {}
+
+    if agent_tool_calls <= 0 or not profiling_json:
+        tools_used: list[str] = []
+        fallback_json: dict[str, Any] = {
+            "pipeline_used": True,
+            "tools_used": tools_used,
+            "collect_profile_summary": "",
+            "ebpf_summary": "",
+            "refined_numa_maps": {},
+            "key_findings": [],
+        }
+
+        try:
+            collect_result = await agent._execute_tool(
+                "collect_profile",
+                {
+                    "collectors": ["cpu", "memory", "process", "numa"],
+                    "pid": pid,
+                },
+            )
+            tools_used.append("collect_profile")
+            if isinstance(collect_result, dict):
+                summaries = []
+                for collector_name, payload in collect_result.items():
+                    if isinstance(payload, dict) and "summary" in payload:
+                        summaries.append(f"{collector_name}: {payload['summary']}")
+                fallback_json["collect_profile_summary"] = " | ".join(summaries)[:1200]
+
+                numa_payload = collect_result.get("numa", {})
+                if isinstance(numa_payload, dict):
+                    numa_data = numa_payload.get("data", {})
+                    if isinstance(numa_data, dict):
+                        maps = numa_data.get("numa_maps_summary", {})
+                        if isinstance(maps, dict):
+                            fallback_json["refined_numa_maps"] = maps
+        except Exception as e:
+            fallback_json["key_findings"].append(f"collect_profile failed: {e}")
+
+        try:
+            ebpf_check = await agent._execute_tool("skill_ebpf", {"action": "check_availability"})
+            tools_used.append("skill_ebpf.check_availability")
+            if isinstance(ebpf_check, dict):
+                fallback_json["ebpf_summary"] = ebpf_check.get("summary", "")
+                ebpf_data = ebpf_check.get("data", {})
+                if isinstance(ebpf_data, dict):
+                    template_name = None
+                    if ebpf_data.get("bpftrace_available"):
+                        template_name = "numa_page_migrations"
+                    elif ebpf_data.get("bcc_available"):
+                        template_name = "bcc_syscall_latency"
+
+                    if template_name:
+                        ebpf_profile = await agent._execute_tool(
+                            "skill_ebpf",
+                            {
+                                "action": "run_template",
+                                "template_name": template_name,
+                                "pid": pid,
+                                "duration": 2,
+                            },
+                        )
+                        tools_used.append(f"skill_ebpf.run_template:{template_name}")
+                        if isinstance(ebpf_profile, dict) and ebpf_profile.get("summary"):
+                            fallback_json["ebpf_summary"] = ebpf_profile["summary"]
+        except Exception as e:
+            fallback_json["key_findings"].append(f"ebpf profiling failed: {e}")
+
+        try:
+            capture_result = await agent._execute_tool(
+                "skill_data_processor",
+                {
+                    "action": "capture",
+                    "command": f"cat /proc/{pid}/numa_maps",
+                },
+            )
+            tools_used.append("skill_data_processor.capture")
+
+            capture_id = None
+            if isinstance(capture_result, dict):
+                data = capture_result.get("data", {})
+                if isinstance(data, dict):
+                    capture_id = data.get("capture_id")
+
+            if capture_id:
+                processor_script = (
+                    "import json, re\n"
+                    "totals = {}\n"
+                    "line_count = 0\n"
+                    "for line in raw_data.splitlines():\n"
+                    "    line_count += 1\n"
+                    "    for m in re.finditer(r'N(\\d+)=(\\d+)', line):\n"
+                    "        node = f'node{m.group(1)}'\n"
+                    "        totals[node] = totals.get(node, 0) + int(m.group(2))\n"
+                    "dominant = max(totals, key=totals.get) if totals else None\n"
+                    "print(json.dumps({'line_count': line_count, 'per_node_pages': totals, 'dominant_node': dominant}))\n"
+                )
+                process_result = await agent._execute_tool(
+                    "skill_data_processor",
+                    {
+                        "action": "process",
+                        "capture_id": capture_id,
+                        "script": processor_script,
+                    },
+                )
+                tools_used.append("skill_data_processor.process")
+                if isinstance(process_result, dict):
+                    output = process_result.get("output", "")
+                    try:
+                        refined = json.loads(output.strip()) if output else {}
+                        if isinstance(refined, dict):
+                            fallback_json["refined_numa_maps"] = refined
+                    except Exception:
+                        fallback_json["key_findings"].append("dynamic processing output was not valid JSON")
+        except Exception as e:
+            fallback_json["key_findings"].append(f"dynamic script pipeline failed: {e}")
+
+        if not fallback_json["key_findings"]:
+            fallback_json["key_findings"] = [
+                "profiling pipeline executed",
+                "raw numa_maps processed through dynamic script",
+            ]
+
+        profiling_json = fallback_json
+        profiling_text = json.dumps(fallback_json)
+
+    return {
+        "pid": pid,
+        "wall_time": wall,
+        "stdout": stdout,
+        "stderr": stderr,
+        "returncode": rc,
+        "profiling_text": profiling_text,
+        "profiling_json": profiling_json,
+        "tool_calls_used": agent_tool_calls,
+    }
+
+
 async def _run_spawn_tune_loop_async(
     agent: SysPilotAgent,
     manager: ProfilingManager,
@@ -620,28 +824,24 @@ async def _run_spawn_tune_loop_async(
     console.print(f"  Wall time: {baseline_time:.2f}s")
     console.print(f"  Output: {len(baseline_stdout)} bytes")
 
-    console.print("\n[bold cyan]Step 2: Collecting System Profile[/bold cyan]")
-    numa_data = await manager.collect_all(pid=None)
-    numa_summary = ""
-    numa_topology_details = ""
-    num_nodes = 1
-    if "numa" in numa_data:
-        numa_result = numa_data["numa"]
-        numa_summary = numa_result.summarize()
-        console.print(f"  {numa_summary[:200]}...")
-        
-        topo = numa_result.data.get("topology", {})
-        num_nodes = numa_result.data.get("num_nodes", 1)
-        lines = [f"Number of NUMA nodes: {num_nodes}"]
-        for node_name, node_info in topo.items():
-            cpulist = node_info.get("cpulist", "unknown")
-            mem_total = node_info.get("mem_total_kb", 0) // 1024
-            mem_free = node_info.get("mem_free_kb", 0) // 1024
-            distance = node_info.get("distance", [])
-            lines.append(f"  {node_name}: CPUs={cpulist}, Memory={mem_total}MB (free={mem_free}MB), Distance={distance}")
-        numa_topology_details = "\n".join(lines)
+    console.print("\n[bold cyan]Step 2: Live Profiling Pipeline (tools + eBPF + dynamic scripts)[/bold cyan]")
+    profiling_artifacts = await _run_live_profiling_pipeline(agent, cmd_parts, timeout)
+    console.print(f"  Profiling run PID: {profiling_artifacts['pid']}")
+    console.print(f"  Profiling run wall time: {profiling_artifacts['wall_time']:.2f}s")
+    console.print(f"  Agent tool calls used: {profiling_artifacts.get('tool_calls_used', 0)}")
+    if profiling_artifacts["returncode"] != 0:
+        console.print(f"  [yellow]Profiling command return code: {profiling_artifacts['returncode']}[/yellow]")
 
-    console.print("\n[bold cyan]Step 3: Agent Analysis[/bold cyan]")
+    profiling_text = profiling_artifacts.get("profiling_text", "")
+    profiling_json = profiling_artifacts.get("profiling_json", {})
+
+    if profiling_json:
+        console.print(f"  Refined profiling JSON: {profiling_json}")
+    else:
+        snippet = profiling_text[:500] + ("..." if len(profiling_text) > 500 else "")
+        console.print(f"  Refined profiling summary: {snippet}")
+
+    console.print("\n[bold cyan]Step 3: Agent Tuning Analysis[/bold cyan]")
     
     manual_content = ""
     if manuals and agent.context.loaded_manuals:
@@ -659,16 +859,13 @@ This is llama-bench (memory bandwidth-bound LLM inference).
 
 ## Baseline: {baseline_time:.2f}s wall time
 
-## NUMA Topology
-{numa_topology_details}
-
-Inter-node distance is 21 vs local 10 = 2.1x latency penalty for remote access.
+## Refined Profiling Evidence (from tools/eBPF/dynamic scripts)
+{json.dumps(profiling_json, indent=2) if profiling_json else profiling_text[:2500]}
 
 ## Key Facts
 - LLM inference is memory bandwidth-bound (reads full model weights per token)
 - 24 threads span both NUMA nodes (12 per node)
-- Without numactl, first-touch places ALL weights on one node
-- 12 threads on remote node suffer 2.1x memory latency
+- Use the profiling evidence above to determine whether first-touch imbalance is present
 
 ## Manual Guidance
 For memory bandwidth-bound workloads on multi-node systems: use --interleave=all
@@ -725,7 +922,8 @@ RECOMMENDED_NUMACTL: --interleave=all
         )
         console.print(f"  Tuned metrics: {tuned_metrics}")
 
-    console.print("\n[bold cyan]Step 6: Results Comparison[/bold cyan]")
+    comparison_step = 6 if parse_output else 5
+    console.print(f"\n[bold cyan]Step {comparison_step}: Results Comparison[/bold cyan]")
     
     speedup = baseline_time / tuned_time if tuned_time > 0 else 0
     improvement_pct = ((baseline_time - tuned_time) / baseline_time) * 100 if baseline_time > 0 else 0

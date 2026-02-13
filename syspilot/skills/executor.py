@@ -51,10 +51,13 @@ class ScriptExecutor:
         if not cmd:
             raise ValueError("Empty command")
 
-        # Determine the "real" binary (skip leading sudo)
         base_idx = 0
-        if cmd[0] == "sudo" and len(cmd) > 1:
+        if cmd[0] == "sudo":
             base_idx = 1
+            while base_idx < len(cmd) and cmd[base_idx].startswith("-"):
+                base_idx += 1
+            if base_idx >= len(cmd):
+                raise ValueError("sudo command missing target binary")
         base_cmd = Path(cmd[base_idx]).name  # handle absolute paths
 
         # Block dangerous commands unconditionally
@@ -131,7 +134,7 @@ class ScriptExecutor:
             script_path = f.name
         
         try:
-            cmd = ["sudo", "bpftrace", script_path]
+            cmd = ["sudo", "-n", "bpftrace", script_path]
             return await self._run_command(
                 cmd,
                 script,

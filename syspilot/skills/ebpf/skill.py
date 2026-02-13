@@ -125,11 +125,44 @@ class EBPFSkill(BaseSkill):
                 execution_time_seconds=0,
                 error=f"Template not found: {template_name}",
             )
-        
+
+        bcc_fallback_map = {
+            "numa_page_migrations": "bcc_syscall_latency",
+            "cache_misses": "bcc_syscall_latency",
+        }
+
         if template_name.startswith("bcc_"):
+            if not self._check_bcc():
+                return SkillResult(
+                    success=False,
+                    output="",
+                    summary="BCC template requested but BCC is not available",
+                    execution_time_seconds=0,
+                    error="BCC not installed",
+                )
             return await self.executor.execute_python(script)
-        else:
+
+        if self._check_bpftrace():
             return await self.executor.execute_bpftrace(script, duration)
+
+        fallback_template = bcc_fallback_map.get(template_name)
+        if fallback_template and self._check_bcc():
+            fallback_script = EBPFTemplates.render(fallback_template, pid, duration)
+            if fallback_script:
+                logger.info(
+                    "bpftrace unavailable, falling back from %s to %s",
+                    template_name,
+                    fallback_template,
+                )
+                return await self.executor.execute_python(fallback_script)
+
+        return SkillResult(
+            success=False,
+            output="",
+            summary=f"Template '{template_name}' requires bpftrace, but bpftrace is unavailable",
+            execution_time_seconds=0,
+            error="bpftrace not installed",
+        )
     
     async def _run_custom(
         self,

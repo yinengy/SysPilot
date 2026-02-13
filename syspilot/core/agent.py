@@ -134,6 +134,11 @@ When writing profiling scripts:
 When tuning:
 - Detect which libraries/tools the application uses (check loaded .so files, imports, process name)
 - Reference the loaded manual sections for detection heuristics and tuning patterns
+- Before recommending configuration changes for a workload, run a profiling pipeline first:
+  1) collect_profile for process/system metrics
+  2) eBPF profiling when available (cache misses, page faults, or NUMA migrations)
+  3) dynamic script refinement (capture/process) to compress raw profiling output
+- Base recommendations on measured profiling evidence, not assumptions
 - Use the apply_tuning tool with config_type: sysctl | prlimit | command | env_var | numactl
 - Follow the manual's decision trees and recommended configurations
 - After applying changes, re-profile to verify improvement
