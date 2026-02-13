@@ -34,6 +34,8 @@ class LLMConfig:
     openai_auth_file: str | None = None
     temperature: float = 0.1
     max_tokens: int = 4096
+    debug_conversation: bool = False
+    debug_markdown_file: str | None = None
     
     def __post_init__(self) -> None:
         """Load API key from environment if not provided."""
@@ -64,6 +66,8 @@ class LLMConfig:
             openai_auth_file=config.get("openai_auth_file"),
             temperature=config.get("temperature", 0.1),
             max_tokens=config.get("max_tokens", 4096),
+            debug_conversation=config.get("debug_conversation", False),
+            debug_markdown_file=config.get("debug_markdown_file"),
         )
     
     @classmethod
@@ -195,6 +199,8 @@ class SysPilotConfig:
                 "openai_auth_file": self.llm.openai_auth_file,
                 "temperature": self.llm.temperature,
                 "max_tokens": self.llm.max_tokens,
+                "debug_conversation": self.llm.debug_conversation,
+                "debug_markdown_file": self.llm.debug_markdown_file,
             },
             "monitoring": {
                 "interval_seconds": self.monitoring.interval_seconds,

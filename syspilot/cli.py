@@ -165,8 +165,16 @@ def _register_tuning_tools(agent: SysPilotAgent, tuner: ApplicationTuner) -> Non
 @click.version_option(version=__version__)
 @click.option("--config", "-c", type=click.Path(exists=True), help="Config file path")
 @click.option("--log-level", default="INFO", help="Logging level")
+@click.option("--debug-llm", is_flag=True, help="Show full LLM conversation input/output")
+@click.option("--debug-llm-md", type=click.Path(), help="Write LLM conversation transcript to markdown file")
 @click.pass_context
-def cli(ctx: click.Context, config: str | None, log_level: str) -> None:
+def cli(
+    ctx: click.Context,
+    config: str | None,
+    log_level: str,
+    debug_llm: bool,
+    debug_llm_md: str | None,
+) -> None:
     ctx.ensure_object(dict)
     
     if config:
@@ -179,6 +187,10 @@ def cli(ctx: click.Context, config: str | None, log_level: str) -> None:
         ctx.obj["config"] = sys_config
     
     ctx.obj["config"].log_level = log_level
+    if debug_llm or debug_llm_md:
+        ctx.obj["config"].llm.debug_conversation = True
+    if debug_llm_md:
+        ctx.obj["config"].llm.debug_markdown_file = debug_llm_md
     setup_logging(log_level)
 
 
@@ -862,19 +874,22 @@ This is llama-bench (memory bandwidth-bound LLM inference).
 ## Refined Profiling Evidence (from tools/eBPF/dynamic scripts)
 {json.dumps(profiling_json, indent=2) if profiling_json else profiling_text[:2500]}
 
+## Loaded Manual Evidence
+{manual_content if manual_content else "(No manual content provided)"}
+
 ## Key Facts
 - LLM inference is memory bandwidth-bound (reads full model weights per token)
 - 24 threads span both NUMA nodes (12 per node)
 - Use the profiling evidence above to determine whether first-touch imbalance is present
 
 ## Manual Guidance
-For memory bandwidth-bound workloads on multi-node systems: use --interleave=all
-This spreads pages round-robin, giving each node local access to ~50% of data.
+Use the loaded manual content above and cite one concrete policy rule in your rationale.
 
 ## YOUR RESPONSE (keep it SHORT)
 
 1. One sentence: why this workload needs NUMA tuning
-2. One line with your recommendation:
+2. One sentence: which manual rule you used
+3. One line with your recommendation:
 
 RECOMMENDED_NUMACTL: --interleave=all
 """
