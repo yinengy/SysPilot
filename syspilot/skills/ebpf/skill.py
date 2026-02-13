@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import importlib.util
 import logging
 import re
 import shutil
-import time
 from typing import Any
 
 from syspilot.skills.base import BaseSkill, SkillResult
@@ -29,23 +29,20 @@ class EBPFSkill(BaseSkill):
     
     def _check_bcc(self) -> bool:
         if self._bcc_available is None:
-            try:
-                import bcc
-                self._bcc_available = True
-            except ImportError:
-                self._bcc_available = False
+            self._bcc_available = importlib.util.find_spec("bcc") is not None
         return self._bcc_available
     
     async def execute(self, **kwargs: Any) -> SkillResult:
         action = kwargs.get("action", "run_template")
         
         if action == "list_templates":
+            templates = EBPFTemplates.list_templates()
             return SkillResult(
                 success=True,
-                output=str(EBPFTemplates.list_templates()),
+                output=str(templates),
                 summary="Listed available eBPF templates",
                 execution_time_seconds=0,
-                data={"templates": EBPFTemplates.list_templates()},
+                data={"templates": templates},
             )
         
         if action == "check_availability":
@@ -126,11 +123,6 @@ class EBPFSkill(BaseSkill):
                 error=f"Template not found: {template_name}",
             )
 
-        bcc_fallback_map = {
-            "numa_page_migrations": "bcc_syscall_latency",
-            "cache_misses": "bcc_syscall_latency",
-        }
-
         if template_name.startswith("bcc_"):
             if not self._check_bcc():
                 return SkillResult(
@@ -144,17 +136,6 @@ class EBPFSkill(BaseSkill):
 
         if self._check_bpftrace():
             return await self.executor.execute_bpftrace(script, duration)
-
-        fallback_template = bcc_fallback_map.get(template_name)
-        if fallback_template and self._check_bcc():
-            fallback_script = EBPFTemplates.render(fallback_template, pid, duration)
-            if fallback_script:
-                logger.info(
-                    "bpftrace unavailable, falling back from %s to %s",
-                    template_name,
-                    fallback_template,
-                )
-                return await self.executor.execute_python(fallback_script)
 
         return SkillResult(
             success=False,

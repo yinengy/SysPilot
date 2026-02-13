@@ -16,6 +16,8 @@ def test_config_from_dict():
         "llm": {
             "provider": "anthropic",
             "model": "claude-3-opus-20240229",
+            "debug_conversation": True,
+            "debug_markdown_file": "/tmp/llm_debug.md",
         },
         "monitoring": {
             "interval_seconds": 10.0,
@@ -26,6 +28,8 @@ def test_config_from_dict():
     config = SysPilotConfig.from_dict(data)
     assert config.llm.provider == LLMProvider.ANTHROPIC
     assert config.llm.model == "claude-3-opus-20240229"
+    assert config.llm.debug_conversation is True
+    assert config.llm.debug_markdown_file == "/tmp/llm_debug.md"
     assert config.monitoring.interval_seconds == 10.0
     assert config.target_pid == 1234
 
@@ -33,9 +37,13 @@ def test_config_from_dict():
 def test_config_to_dict():
     config = SysPilotConfig()
     config.target_pid = 5678
+    config.llm.debug_conversation = True
+    config.llm.debug_markdown_file = "/tmp/out.md"
     
     data = config.to_dict()
     assert data["llm"]["provider"] == "openai"
+    assert data["llm"]["debug_conversation"] is True
+    assert data["llm"]["debug_markdown_file"] == "/tmp/out.md"
     assert data["target_pid"] == 5678
 
 

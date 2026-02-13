@@ -1,11 +1,11 @@
+import json
+from unittest.mock import MagicMock, patch
+
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
-from datetime import datetime
 
 from syspilot.core.config import TuningConfig
-from syspilot.tuning.tuner import ApplicationTuner, TuningAction
 from syspilot.tuning.engine import TuningEngine, IterationResult
-from syspilot.profiling.collectors.base import CollectorResult
+from syspilot.tuning.tuner import ApplicationTuner, TuningAction
 
 
 def test_tuning_action_defaults():
@@ -123,6 +123,60 @@ def test_tuning_engine_summary():
     summary = engine.get_summary()
     assert summary["total_iterations"] == 1
     assert summary["iterations"][0]["improvement_pct"] == 3.5
+
+
+def test_rollback_uses_action_pid(tmp_path):
+    config = TuningConfig(dry_run=False, backup_configs=False)
+    tuner = ApplicationTuner(config)
+
+    backup_path = tmp_path / "rollback.json"
+    backup_path.write_text(json.dumps({
+        "original_value": "65536",
+        "pid": 1234,
+    }))
+
+    action = TuningAction(
+        config_type="prlimit",
+        parameter="nofile",
+        current_value="65536",
+        new_value="131072",
+        reason="raise fd limit",
+        pid=1234,
+        applied=True,
+        backup_path=backup_path,
+    )
+
+    with patch.object(tuner, "_apply_action", return_value=True) as mock_apply:
+        assert tuner.rollback(action) is True
+
+    mock_apply.assert_called_once()
+    assert mock_apply.call_args.args[0] == 1234
+    rollback_action = mock_apply.call_args.args[1]
+    assert rollback_action.new_value == "65536"
+
+
+def test_rollback_prlimit_requires_pid(tmp_path):
+    config = TuningConfig(dry_run=False, backup_configs=False)
+    tuner = ApplicationTuner(config)
+
+    backup_path = tmp_path / "rollback_no_pid.json"
+    backup_path.write_text(json.dumps({"original_value": "65536"}))
+
+    action = TuningAction(
+        config_type="prlimit",
+        parameter="nofile",
+        current_value="65536",
+        new_value="131072",
+        reason="raise fd limit",
+        pid=None,
+        applied=True,
+        backup_path=backup_path,
+    )
+
+    with patch.object(tuner, "_apply_action", return_value=True) as mock_apply:
+        assert tuner.rollback(action) is False
+
+    mock_apply.assert_not_called()
 
 
 def test_executor_sandbox_blocked():

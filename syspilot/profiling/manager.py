@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
-from typing import Any
 
 from syspilot.profiling.collectors.base import BaseCollector, CollectorResult
 from syspilot.profiling.collectors.cpu import CPUCollector
@@ -36,22 +34,26 @@ class ProfilingManager:
         collector_names: list[str] | None = None,
         pid: int | None = None,
     ) -> dict[str, CollectorResult]:
-        names = collector_names or list(self._collectors.keys())
-        
-        tasks = []
-        for name in names:
-            if name in self._collectors:
-                tasks.append(self._collect_one(name, pid))
-        
+        requested_names = collector_names or list(self._collectors.keys())
+
+        selected_names = [name for name in requested_names if name in self._collectors]
+        for name in requested_names:
+            if name not in self._collectors:
+                logger.warning("Unknown collector requested: %s", name)
+
+        if not selected_names:
+            return {}
+
+        tasks = [self._collect_one(name, pid) for name in selected_names]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        output = {}
-        for name, result in zip(names, results):
-            if isinstance(result, Exception):
-                logger.error(f"Collector {name} failed: {result}")
+
+        output: dict[str, CollectorResult] = {}
+        for name, result in zip(selected_names, results):
+            if isinstance(result, BaseException):
+                logger.error("Collector %s failed: %s", name, result)
             else:
                 output[name] = result
-        
+
         return output
     
     async def _collect_one(self, name: str, pid: int | None) -> CollectorResult:
@@ -68,7 +70,12 @@ class ProfilingManager:
         results: dict[str, CollectorResult],
         max_length: int = 2000,
     ) -> str:
-        summaries = []
-        for name, result in results.items():
-            summaries.append(result.summarize(max_length // len(results)))
-        return "\n\n".join(summaries)
+        if not results:
+            return ""
+
+        per_result_budget = max(1, max_length // len(results))
+        summaries = [result.summarize(per_result_budget) for result in results.values()]
+        combined = "\n\n".join(summaries)
+        if len(combined) > max_length:
+            return combined[: max_length - 3] + "..."
+        return combined

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import shlex
 import subprocess
 import sys
@@ -16,7 +15,7 @@ from rich.table import Table
 from rich.panel import Panel
 
 from syspilot import __version__
-from syspilot.core.config import SysPilotConfig, LLMProvider, LLMConfig
+from syspilot.core.config import SysPilotConfig, LLMConfig
 from syspilot.core.agent import SysPilotAgent
 from syspilot.core.openai_auth import (
     build_authorization_url,
@@ -399,8 +398,8 @@ def manuals() -> None:
         table.add_row(manual_name, str(manual_path))
     
     console.print(table)
-    console.print("\n[dim]Use --manual/-m flag with monitor or analyze commands to load manuals[/dim]")
-    console.print("[dim]Example: syspilot analyze 1234 --manual numactl --manual pytorch[/dim]")
+    console.print("\n[dim]Use --manual/-m with monitor, analyze, or tune commands[/dim]")
+    console.print("[dim]Examples: syspilot analyze 1234 --manual numactl | syspilot tune --pid 1234 --manual numactl[/dim]")
 
 
 @cli.command()
@@ -479,7 +478,7 @@ def tune(
     _register_tuning_tools(agent, tuner)
 
     if command:
-        _run_spawn_tune_loop(agent, manager, command, manual, max_iterations, timeout, parse_output)
+        _run_spawn_tune_loop(agent, command, manual, max_iterations, timeout, parse_output)
     else:
         assert pid is not None
         _run_attach_tune_loop(agent, manager, tuner, pid, max_iterations, dry_run)
@@ -807,7 +806,6 @@ Do not recommend tuning flags yet. This step is profiling-only.
 
 async def _run_spawn_tune_loop_async(
     agent: SysPilotAgent,
-    manager: ProfilingManager,
     command: str,
     manuals: tuple[str, ...],
     max_iterations: int,
@@ -996,7 +994,6 @@ RECOMMENDED_NUMACTL: --interleave=all
 
 def _run_spawn_tune_loop(
     agent: SysPilotAgent,
-    manager: ProfilingManager,
     command: str,
     manuals: tuple[str, ...],
     max_iterations: int,
@@ -1006,7 +1003,6 @@ def _run_spawn_tune_loop(
     asyncio.run(
         _run_spawn_tune_loop_async(
             agent=agent,
-            manager=manager,
             command=command,
             manuals=manuals,
             max_iterations=max_iterations,

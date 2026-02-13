@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import shutil
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime
@@ -22,6 +21,7 @@ class TuningAction:
     current_value: Any
     new_value: Any
     reason: str
+    pid: int | None = None
     applied: bool = False
     backup_path: Path | None = None
 
@@ -141,6 +141,7 @@ class ApplicationTuner:
                 current_value=action_dict.get("current_value"),
                 new_value=action_dict.get("new_value"),
                 reason=action_dict.get("reason", ""),
+                pid=pid,
             )
             
             if self.config.dry_run:
@@ -168,12 +169,13 @@ class ApplicationTuner:
             "config_type": action.config_type,
             "parameter": action.parameter,
             "original_value": action.current_value,
+            "pid": action.pid,
         }
         
         backup_path.write_text(json.dumps(backup_data, indent=2))
         return backup_path
     
-    def _apply_action(self, pid: int, action: TuningAction) -> bool:
+    def _apply_action(self, pid: int | None, action: TuningAction) -> bool:
         logger.info(f"Applying tuning action: {action.parameter} = {action.new_value}")
 
         dispatch = {
@@ -195,7 +197,7 @@ class ApplicationTuner:
             logger.error(f"Failed to apply action {action.parameter}: {e}")
             return False
 
-    def _apply_sysctl(self, pid: int, action: TuningAction) -> bool:
+    def _apply_sysctl(self, pid: int | None, action: TuningAction) -> bool:
         param = action.parameter
         value = str(action.new_value)
         result = subprocess.run(
@@ -207,7 +209,11 @@ class ApplicationTuner:
             return False
         return True
 
-    def _apply_prlimit(self, pid: int, action: TuningAction) -> bool:
+    def _apply_prlimit(self, pid: int | None, action: TuningAction) -> bool:
+        if pid is None:
+            logger.error("prlimit action requires target PID")
+            return False
+
         resource = action.parameter
         value = str(action.new_value)
         result = subprocess.run(
@@ -219,7 +225,7 @@ class ApplicationTuner:
             return False
         return True
 
-    def _apply_command(self, pid: int, action: TuningAction) -> bool:
+    def _apply_command(self, pid: int | None, action: TuningAction) -> bool:
         cmd = action.new_value
         if not isinstance(cmd, str):
             logger.error("command config_type expects new_value to be a shell command string")
@@ -232,14 +238,14 @@ class ApplicationTuner:
             return False
         return True
 
-    def _apply_env_var(self, pid: int, action: TuningAction) -> bool:
+    def _apply_env_var(self, pid: int | None, action: TuningAction) -> bool:
         logger.info(
             f"Environment variable '{action.parameter}' should be set to "
             f"'{action.new_value}' on next process restart."
         )
         return True
 
-    def _apply_numactl(self, pid: int, action: TuningAction) -> bool:
+    def _apply_numactl(self, pid: int | None, action: TuningAction) -> bool:
         cmd = action.new_value
         if not isinstance(cmd, str):
             logger.error("numactl config_type expects new_value to be a numactl command string")
@@ -265,16 +271,26 @@ class ApplicationTuner:
                 logger.error("Backup does not contain original_value")
                 return False
 
+            target_pid = action.pid
+            if target_pid is None:
+                pid_from_backup = backup_data.get("pid")
+                if isinstance(pid_from_backup, int):
+                    target_pid = pid_from_backup
+
+            if action.config_type == "prlimit" and target_pid is None:
+                logger.error("Rollback for prlimit requires a target PID")
+                return False
+
             rollback_action = TuningAction(
                 config_type=action.config_type,
                 parameter=action.parameter,
                 current_value=action.new_value,
                 new_value=original,
                 reason=f"rollback of {action.parameter}",
+                pid=target_pid,
             )
 
-            pid = 0
-            success = self._apply_action(pid, rollback_action)
+            success = self._apply_action(target_pid, rollback_action)
             if success:
                 action.applied = False
                 logger.info(f"Rollback successful: {action.parameter}")

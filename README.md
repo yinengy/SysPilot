@@ -56,6 +56,21 @@ sudo apt install bpftrace bpfcc-tools linux-headers-$(uname -r)
 sudo dnf install bpftrace bcc
 ```
 
+### eBPF Permissions (Linux)
+
+If eBPF profiling fails with `Operation not permitted`, run SysPilot with elevated privileges:
+
+```bash
+sudo -E python3 -m syspilot.cli tune --command "..." --manual numactl
+```
+
+For stricter hosts, check kernel controls:
+
+```bash
+cat /proc/sys/kernel/unprivileged_bpf_disabled
+cat /proc/sys/kernel/perf_event_paranoid
+```
+
 ## Quick Start
 
 ```bash
@@ -73,6 +88,9 @@ syspilot tune --pid 1234 --manual numactl
 
 # Launch and tune a command (Spawn Mode)
 syspilot tune --command "./benchmark -t 4" --manual numactl --parse-output
+
+# Enable full LLM debug logging + markdown transcript
+syspilot --debug-llm --debug-llm-md /tmp/syspilot_llm_debug.md tune --command "./benchmark -t 4" --manual numactl
 
 # Analyze a specific process
 syspilot analyze 1234
@@ -102,10 +120,27 @@ syspilot tune \
 
 **Features:**
 - Runs baseline benchmark automatically
-- Collects NUMA topology and system profile
+- Runs evidence-first profiling pipeline (collectors + eBPF + dynamic script refinement)
 - Agent analyzes performance and recommends flags (e.g., `numactl --interleave=all`)
 - Runs tuned command and compares results side-by-side
 - `--parse-output` uses LLM to extract app-specific metrics (e.g., tokens/sec) from stdout
+
+## Debugging LLM Conversations
+
+Use debug mode to inspect every LLM request/response and tool-calling turn.
+
+```bash
+# Console JSON logs
+syspilot --debug-llm tune --command "./benchmark -t 4" --manual numactl
+
+# Human-readable markdown transcript
+syspilot --debug-llm-md /tmp/syspilot_llm_debug.md tune --command "./benchmark -t 4" --manual numactl
+```
+
+The markdown transcript includes:
+- per-exchange request metadata (model/tools/kwargs)
+- new messages sent to the model
+- full model response, tool calls, and token usage
 
 ### 2. Attach Mode (Recommended for Services)
 
@@ -135,6 +170,9 @@ llm:
   provider: openai  # or openai_auth / anthropic
   model: gpt-4o
   temperature: 0.1
+  debug_conversation: false
+  # optional: write markdown transcript when debug_conversation=true
+  # debug_markdown_file: ~/.syspilot/logs/llm_debug.md
 
 monitoring:
   interval_seconds: 5.0
