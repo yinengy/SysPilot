@@ -1,5 +1,6 @@
 import pytest
 from syspilot.core.config import SysPilotConfig, LLMConfig, LLMProvider
+from syspilot.core.llm import LLMInterface
 
 
 def test_default_config():
@@ -36,3 +37,45 @@ def test_config_to_dict():
     data = config.to_dict()
     assert data["llm"]["provider"] == "openai"
     assert data["target_pid"] == 5678
+
+
+def test_openai_auth_config_from_dict():
+    llm = LLMConfig.from_dict(
+        {
+            "provider": "openai_auth",
+            "model": "gpt-5.3-codex",
+            "openai_auth_file": "~/.syspilot/auth/openai.json",
+        }
+    )
+
+    assert llm.provider == LLMProvider.OPENAI_AUTH
+    assert llm.model == "gpt-5.3-codex"
+    assert llm.openai_auth_file == "~/.syspilot/auth/openai.json"
+
+
+def test_to_dict_includes_openai_auth_file():
+    config = SysPilotConfig()
+    config.llm.provider = LLMProvider.OPENAI_AUTH
+    config.llm.openai_auth_file = "~/.syspilot/auth/openai.json"
+
+    data = config.to_dict()
+    assert data["llm"]["provider"] == "openai_auth"
+    assert data["llm"]["openai_auth_file"] == "~/.syspilot/auth/openai.json"
+
+
+def test_llm_interface_selects_openai_auth_provider():
+    llm = LLMConfig(provider=LLMProvider.OPENAI_AUTH, model="gpt-5.3-codex")
+    provider = LLMInterface(llm).provider
+    assert provider.__class__.__name__ == "OpenAIAuthProvider"
+
+
+def test_openai_auth_default_model_is_latest_codex():
+    llm = LLMConfig.from_dict({"provider": "openai_auth"})
+    assert llm.model == "gpt-5.3-codex"
+
+
+def test_openai_auth_rejects_legacy_codex_models():
+    llm = LLMConfig(provider=LLMProvider.OPENAI_AUTH, model="gpt-5.1-codex")
+    provider = LLMInterface(llm).provider
+    with pytest.raises(ValueError):
+        getattr(provider, "_resolve_model")()

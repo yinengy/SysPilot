@@ -13,7 +13,7 @@ SysPilot is an intelligent agent that monitors system resources, profiles applic
 - **eBPF Proficiency**: Low-overhead system profiling using eBPF/bpftrace
 - **Context Minimization**: Processes large profiling outputs into essential insights (using LLM parsing)
 - **Application Tuning**: Detects misconfigurations (NUMA, CPU affinity, etc.) and recommends optimizations
-- **Multi-LLM Support**: Works with OpenAI and Anthropic models
+- **Multi-LLM Support**: Works with OpenAI API keys, OpenAI account OAuth, and Anthropic models
 
 ## Architecture
 
@@ -132,7 +132,7 @@ Create `syspilot.yaml`:
 
 ```yaml
 llm:
-  provider: openai  # or anthropic
+  provider: openai  # or openai_auth / anthropic
   model: gpt-4o
   temperature: 0.1
 
@@ -154,6 +154,28 @@ Set your API key:
 export OPENAI_API_KEY="your-key"
 # or
 export ANTHROPIC_API_KEY="your-key"
+```
+
+### OpenAI OAuth (no OpenCode dependency)
+
+If you want to use ChatGPT account OAuth (Free/Plus/Pro) instead of OpenAI API keys:
+
+```bash
+syspilot auth login
+```
+
+This is implemented directly in SysPilot and does not require installing OpenCode.
+
+Then configure SysPilot with provider `openai_auth`:
+
+```yaml
+llm:
+  provider: openai_auth
+  model: gpt-5.3-codex  # supported: gpt-5.2-codex, gpt-5.3-codex
+  # Optional override, default is ~/.syspilot/auth/openai.json
+  openai_auth_file: ~/.syspilot/auth/openai.json
+  # Optional override, default is https://chatgpt.com/backend-api/codex
+  # base_url: https://chatgpt.com/backend-api/codex
 ```
 
 ## Usage Examples

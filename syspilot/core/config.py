@@ -19,6 +19,7 @@ import yaml
 class LLMProvider(str, Enum):
     """Supported LLM providers."""
     OPENAI = "openai"
+    OPENAI_AUTH = "openai_auth"
     ANTHROPIC = "anthropic"
     LOCAL = "local"
 
@@ -30,6 +31,7 @@ class LLMConfig:
     model: str = "gpt-4o"
     api_key: str | None = None
     base_url: str | None = None
+    openai_auth_file: str | None = None
     temperature: float = 0.1
     max_tokens: int = 4096
     
@@ -40,6 +42,9 @@ class LLMConfig:
                 self.api_key = os.getenv("OPENAI_API_KEY")
             elif self.provider == LLMProvider.ANTHROPIC:
                 self.api_key = os.getenv("ANTHROPIC_API_KEY")
+
+        if self.provider == LLMProvider.OPENAI_AUTH and self.model == "gpt-4o":
+            self.model = "gpt-5.3-codex"
     
     @classmethod
     def from_dict(cls, config: dict[str, Any]) -> LLMConfig:
@@ -48,12 +53,15 @@ class LLMConfig:
             provider = LLMProvider(provider_str)
         else:
             provider = provider_str
+
+        default_model = "gpt-5.3-codex" if provider == LLMProvider.OPENAI_AUTH else "gpt-4o"
         
         return cls(
             provider=provider,
-            model=config.get("model", "gpt-4o"),
+            model=config.get("model", default_model),
             api_key=config.get("api_key"),
             base_url=config.get("base_url"),
+            openai_auth_file=config.get("openai_auth_file"),
             temperature=config.get("temperature", 0.1),
             max_tokens=config.get("max_tokens", 4096),
         )
@@ -70,12 +78,12 @@ class LLMConfig:
         
         # Search default locations
         search_paths = [
-            # Source tree location (relative to this file)
-            Path(__file__).parent.parent.parent / "config" / "llm_config.json",
             # User config location
             Path("~/.syspilot/llm_config.json").expanduser(),
             # Current directory
             Path("llm_config.json"),
+            # Source tree location (relative to this file)
+            Path(__file__).parent.parent.parent / "config" / "llm_config.json",
         ]
         
         for p in search_paths:
@@ -152,10 +160,7 @@ class SysPilotConfig:
         config = cls()
         
         if "llm" in data:
-            llm_data = data["llm"]
-            if "provider" in llm_data:
-                llm_data["provider"] = LLMProvider(llm_data["provider"])
-            config.llm = LLMConfig(**llm_data)
+            config.llm = LLMConfig.from_dict(data["llm"])
         
         if "monitoring" in data:
             config.monitoring = MonitoringConfig(**data["monitoring"])
@@ -186,6 +191,8 @@ class SysPilotConfig:
             "llm": {
                 "provider": self.llm.provider.value,
                 "model": self.llm.model,
+                "base_url": self.llm.base_url,
+                "openai_auth_file": self.llm.openai_auth_file,
                 "temperature": self.llm.temperature,
                 "max_tokens": self.llm.max_tokens,
             },

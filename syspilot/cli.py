@@ -18,6 +18,16 @@ from rich.panel import Panel
 from syspilot import __version__
 from syspilot.core.config import SysPilotConfig, LLMProvider, LLMConfig
 from syspilot.core.agent import SysPilotAgent
+from syspilot.core.openai_auth import (
+    build_authorization_url,
+    create_pkce_verifier_and_challenge,
+    create_state,
+    exchange_authorization_code,
+    parse_authorization_input,
+    save_auth,
+    syspilot_openai_auth_file,
+    wait_for_callback_code,
+)
 from syspilot.profiling import ProfilingManager
 from syspilot.skills import SkillRegistry
 from syspilot.skills.builtin import DynamicScriptSkill, StraceAnalyzerSkill, PerfAnalyzerSkill, DataProcessorSkill
@@ -170,6 +180,61 @@ def cli(ctx: click.Context, config: str | None, log_level: str) -> None:
     
     ctx.obj["config"].log_level = log_level
     setup_logging(log_level)
+
+
+@cli.group()
+def auth() -> None:
+    pass
+
+
+@auth.command("login")
+@click.option("--manual", is_flag=True, help="Use manual redirect URL paste flow")
+@click.option("--timeout", default=180, type=int, show_default=True, help="OAuth callback timeout seconds")
+@click.option("--auth-file", type=click.Path(), help="Path to save OpenAI auth credentials")
+def auth_login(manual: bool, timeout: int, auth_file: str | None) -> None:
+    verifier, challenge = create_pkce_verifier_and_challenge()
+    state = create_state()
+    auth_url = build_authorization_url(state, challenge)
+
+    code: str | None = None
+    if not manual:
+        code, opened = wait_for_callback_code(
+            state=state,
+            timeout_seconds=timeout,
+            authorize_url=auth_url,
+        )
+        if opened:
+            console.print("[cyan]Browser opened for OpenAI login. Waiting for callback...[/cyan]")
+        else:
+            console.print("[yellow]Could not open browser automatically.[/yellow]")
+
+        if not code:
+            console.print("[yellow]Automatic callback unavailable or timed out. Using manual mode.[/yellow]")
+
+    if not code:
+        console.print("[cyan]Open this URL and complete login:[/cyan]")
+        console.print(auth_url)
+        pasted = click.prompt("Paste full redirect URL (or authorization code)")
+        parsed_code, parsed_state = parse_authorization_input(pasted)
+
+        if not parsed_code:
+            console.print("[red]Could not parse authorization code from input.[/red]")
+            raise SystemExit(1)
+        if parsed_state and parsed_state != state:
+            console.print("[red]State mismatch in OAuth callback.[/red]")
+            raise SystemExit(1)
+
+        code = parsed_code
+
+    try:
+        auth_data = exchange_authorization_code(code, verifier)
+    except Exception as exc:
+        console.print(f"[red]OpenAI login failed: {exc}[/red]")
+        raise SystemExit(1)
+
+    output_path = Path(auth_file).expanduser() if auth_file else syspilot_openai_auth_file()
+    save_auth(auth_data, output_path)
+    console.print(f"[green]OpenAI auth saved to {output_path}[/green]")
 
 
 @cli.command()
@@ -477,43 +542,54 @@ def _parse_numactl_recommendation(response: str) -> list[str]:
     return []
 
 
-def _extract_metrics_from_output(agent: SysPilotAgent, output: str, context: str = "") -> dict[str, Any]:
-    prompt = f"""Extract performance metrics from this program output. Return JSON only.
+async def _extract_metrics_from_output(
+    agent: SysPilotAgent,
+    output: str,
+    context: str = "",
+) -> dict[str, Any]:
+    prompt = f"""Extract ONLY runtime performance outcome metrics from this program output. Return JSON only.
 
 {f"Context: {context}" if context else ""}
 
 Program output:
 ```
-{output[:3000]}
+{output[:4000]}
 ```
 
-Return a JSON object with extracted metrics. Common metrics include:
-- throughput (tokens/sec, ops/sec, MB/s, etc.)
-- latency (ms, us, etc.)  
-- bandwidth (GB/s, MB/s, etc.)
-- execution_time (reported by program itself)
-- any other numeric performance metrics
+Include only metrics that represent measurable performance outcomes, such as:
+- throughput/rate (tokens_per_sec, ops_per_sec, req_per_sec, qps, rps, fps)
+- latency (ms/us/ns), including p50/p90/p95/p99
+- execution time / duration / runtime
+- bandwidth
 
-Example response format:
-{{"throughput_tokens_per_sec": 45.2, "latency_ms": 22.1, "bandwidth_gb_s": 12.5}}
+Exclude configuration or static metadata, including:
+- model size/params
+- thread counts, batch sizes, token counts
+- topology/hardware metadata
+- any key like n_threads, n_batch, n_prompt_tokens, model_size_bytes, model_params
+
+Return one flat JSON object: {{"metric_name": number, ...}}
+Do not return nested JSON, text, or explanations.
 
 If no metrics found, return: {{"no_metrics": true}}
 
 RESPOND WITH ONLY THE JSON OBJECT, NO EXPLANATION:"""
 
-    response = asyncio.run(agent.step(prompt))
+    response = await agent.step(prompt)
     
     import re
     json_match = re.search(r'\{[^{}]*\}', response.content, re.DOTALL)
     if json_match:
         try:
-            return json.loads(json_match.group())
+            parsed = json.loads(json_match.group())
+            if isinstance(parsed, dict):
+                return parsed
         except json.JSONDecodeError:
             pass
     return {"no_metrics": True}
 
 
-def _run_spawn_tune_loop(
+async def _run_spawn_tune_loop_async(
     agent: SysPilotAgent,
     manager: ProfilingManager,
     command: str,
@@ -545,7 +621,7 @@ def _run_spawn_tune_loop(
     console.print(f"  Output: {len(baseline_stdout)} bytes")
 
     console.print("\n[bold cyan]Step 2: Collecting System Profile[/bold cyan]")
-    numa_data = asyncio.run(manager.collect_all(pid=None))
+    numa_data = await manager.collect_all(pid=None)
     numa_summary = ""
     numa_topology_details = ""
     num_nodes = 1
@@ -606,7 +682,7 @@ This spreads pages round-robin, giving each node local access to ~50% of data.
 RECOMMENDED_NUMACTL: --interleave=all
 """
 
-    response = asyncio.run(agent.step(prompt))
+    response = await agent.step(prompt)
     console.print(f"\n[dim]{response.content}[/dim]")
     
     numactl_flags = _parse_numactl_recommendation(response.content)
@@ -634,11 +710,19 @@ RECOMMENDED_NUMACTL: --interleave=all
     if parse_output:
         console.print("\n[bold cyan]Step 5: Extracting Metrics from Output[/bold cyan]")
         console.print("  Parsing baseline output...")
-        baseline_metrics = _extract_metrics_from_output(agent, baseline_stdout, "baseline run without numactl")
+        baseline_metrics = await _extract_metrics_from_output(
+            agent,
+            baseline_stdout,
+            "baseline run without numactl",
+        )
         console.print(f"  Baseline metrics: {baseline_metrics}")
         
         console.print("  Parsing tuned output...")
-        tuned_metrics = _extract_metrics_from_output(agent, tuned_stdout, f"tuned run with numactl {' '.join(numactl_flags)}")
+        tuned_metrics = await _extract_metrics_from_output(
+            agent,
+            tuned_stdout,
+            f"tuned run with numactl {' '.join(numactl_flags)}",
+        )
         console.print(f"  Tuned metrics: {tuned_metrics}")
 
     console.print("\n[bold cyan]Step 6: Results Comparison[/bold cyan]")
@@ -695,6 +779,28 @@ RECOMMENDED_NUMACTL: --interleave=all
         console.print(f"\n[yellow]Modest improvement ({improvement_pct:.1f}%)[/yellow]")
     else:
         console.print(f"\n[red]No improvement or regression ({improvement_pct:.1f}%)[/red]")
+
+
+def _run_spawn_tune_loop(
+    agent: SysPilotAgent,
+    manager: ProfilingManager,
+    command: str,
+    manuals: tuple[str, ...],
+    max_iterations: int,
+    timeout: int,
+    parse_output: bool = False,
+) -> None:
+    asyncio.run(
+        _run_spawn_tune_loop_async(
+            agent=agent,
+            manager=manager,
+            command=command,
+            manuals=manuals,
+            max_iterations=max_iterations,
+            timeout=timeout,
+            parse_output=parse_output,
+        )
+    )
 
 
 @cli.command()

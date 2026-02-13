@@ -313,6 +313,10 @@ class LLMInterface:
         if self._provider is None:
             if self.config.provider == LLMProvider.OPENAI:
                 self._provider = OpenAIProvider(self.config)
+            elif self.config.provider == LLMProvider.OPENAI_AUTH:
+                from syspilot.core.openai_auth_provider import OpenAIAuthProvider
+
+                self._provider = OpenAIAuthProvider(self.config)
             elif self.config.provider == LLMProvider.ANTHROPIC:
                 self._provider = AnthropicProvider(self.config)
             else:
