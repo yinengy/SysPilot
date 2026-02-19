@@ -93,6 +93,9 @@ syspilot tune --pid 1234 --manual numactl
 # Launch and tune a command (Spawn Mode)
 syspilot tune --command "./benchmark -t 4" --manual numactl --parse-output
 
+# Force plain text mode for tune (optional)
+syspilot tune --ui-mode plain --command "./benchmark -t 4" --manual numactl
+
 # Enable full LLM debug logging + markdown transcript
 syspilot --debug-llm --debug-llm-md /tmp/syspilot_llm_debug.md tune --command "./benchmark -t 4" --manual numactl
 
@@ -106,6 +109,23 @@ syspilot profile 1234
 syspilot skills
 ```
 
+### Tune UI Mode (V1)
+
+- `tune` is TUI-first by default (`--ui-mode tui`).
+- Plain output remains available via `--ui-mode plain`.
+- Fallback behavior is automatic and non-fatal:
+  - non-TTY sessions (CI/headless) fall back to plain mode
+  - missing/unavailable TUI binary falls back to plain mode
+  - TUI disconnect during a run falls back to plain mode and tuning continues
+
+Optional TUI binary override:
+
+```bash
+syspilot tune --ui-mode tui --tui-bin /path/to/syspilot-tui --command "./benchmark -t 4"
+# or via env var
+SYSPILOT_TUI_BIN=/path/to/syspilot-tui syspilot tune --ui-mode tui --command "./benchmark -t 4"
+```
+
 ## Tuning Workflows
 
 SysPilot supports two primary tuning workflows via the `tune` command:
@@ -117,6 +137,7 @@ Use this when you want SysPilot to manage the entire lifecycle: launch, baseline
 ```bash
 syspilot tune \
   --command "/path/to/app --args" \
+  --ui-mode tui \
   --workdir /path/to/working/dir \
   --manual numactl \
   --max-iterations 5 \
@@ -130,6 +151,21 @@ syspilot tune \
 - Stops by convergence (non-improving iteration patience) or `--max-iterations`
 - Compares baseline vs best-found configuration side-by-side
 - `--parse-output` uses LLM to extract app-specific metrics (e.g., tokens/sec) from stdout
+
+### Tune UI Overhead Gate
+
+Use the benchmark harness to compare plain vs TUI mode and enforce the p95 overhead budget:
+
+```bash
+python3 scripts/bench_tune_ui_overhead.py \
+  --runs 30 \
+  --warmup 5 \
+  --threshold-p95 3.0 \
+  --command "python3 tests/fixtures/bench_stable.py" \
+  --json-out .sisyphus/evidence/final-overhead.json
+```
+
+If TUI cannot run (for example non-TTY sessions or missing TUI binary), the benchmark exits non-zero and records a clear `failure_reason`/`failure_detail` in the JSON artifact.
 
 ## Debugging LLM Conversations
 

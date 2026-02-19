@@ -1,0 +1,4 @@
+{not json at all
+{"schema_version":"v1","run_id":"run-123","seq":0,"ts":"2026-02-19T00:00:00Z","event_type":"lifecycle","event":"run.started","payload":{}}
+{"schema_version":"v1","run_id":"run-123","seq":10,"ts":"2026-02-19T00:00:10Z","event":"phase.started","payload":{"phase":"tuned","iteration":2}}
+{"schema_version":"v1","run_id":"run-123","seq":11,"ts":"2026-02-19T00:00:11Z","event_type":"lifecycle","event":"run.finished","payload":{"status":"ok"}}

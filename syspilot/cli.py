@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import shlex
 import subprocess
 import sys
 import time
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import click
 import psutil
@@ -32,22 +34,46 @@ from syspilot.core.openai_auth import (
 )
 from syspilot.profiling import ProfilingManager
 from syspilot.skills import SkillRegistry
-from syspilot.skills.builtin import DynamicScriptSkill, StraceAnalyzerSkill, PerfAnalyzerSkill, DataProcessorSkill
+from syspilot.skills.builtin import (
+    DynamicScriptSkill,
+    StraceAnalyzerSkill,
+    PerfAnalyzerSkill,
+    DataProcessorSkill,
+)
 from syspilot.skills.ebpf import EBPFSkill
 from syspilot.tuning import ApplicationTuner
 from syspilot.tuning.engine import TuningEngine
 from syspilot.utils import setup_logging, find_process_by_name
+from syspilot.ui.emitter import TuneEventEmitter
+from syspilot.ui.output_sink import OutputSink, SwitchableOutputSink, TuneUIMode, make_output_sink
+from syspilot.ui.tui_sidecar import TuneTuiOrchestrator
 
 console = Console()
 
 
+class _TuneEmitter(Protocol):
+    def publish(
+        self,
+        event_name: str,
+        payload: dict[str, object] | None = None,
+        *,
+        event_type: str | None = None,
+    ) -> bool: ...
+
+
 def _register_default_skills(agent: SysPilotAgent) -> None:
     registry = SkillRegistry()
-    
-    for skill_cls in [DynamicScriptSkill, StraceAnalyzerSkill, PerfAnalyzerSkill, EBPFSkill, DataProcessorSkill]:
+
+    for skill_cls in [
+        DynamicScriptSkill,
+        StraceAnalyzerSkill,
+        PerfAnalyzerSkill,
+        EBPFSkill,
+        DataProcessorSkill,
+    ]:
         skill = skill_cls()
         registry.register(skill)
-        
+
         async def skill_executor(skill_instance: Any = skill, **kwargs: Any) -> dict[str, Any]:
             result = await skill_instance.execute(**kwargs)
             return {
@@ -57,7 +83,7 @@ def _register_default_skills(agent: SysPilotAgent) -> None:
                 "error": result.error,
                 "data": result.data,
             }
-        
+
         agent.register_tool(
             name=f"skill_{skill.name}",
             func=skill_executor,
@@ -79,7 +105,7 @@ def _register_profiling_tools(agent: SysPilotAgent, manager: ProfilingManager) -
             }
             for name, result in results.items()
         }
-    
+
     agent.register_tool(
         name="collect_profile",
         func=collect_profile,
@@ -104,7 +130,7 @@ def _register_profiling_tools(agent: SysPilotAgent, manager: ProfilingManager) -
 def _register_tuning_tools(agent: SysPilotAgent, tuner: ApplicationTuner) -> None:
     def analyze_config(pid: int) -> dict[str, Any]:
         return tuner.analyze(pid)
-    
+
     agent.register_tool(
         name="analyze_config",
         func=analyze_config,
@@ -148,7 +174,10 @@ def _register_tuning_tools(agent: SysPilotAgent, tuner: ApplicationTuner) -> Non
                     "items": {
                         "type": "object",
                         "properties": {
-                            "config_type": {"type": "string", "enum": ["sysctl", "prlimit", "command", "env_var", "numactl"]},
+                            "config_type": {
+                                "type": "string",
+                                "enum": ["sysctl", "prlimit", "command", "env_var", "numactl"],
+                            },
                             "parameter": {"type": "string"},
                             "current_value": {},
                             "new_value": {},
@@ -169,7 +198,9 @@ def _register_tuning_tools(agent: SysPilotAgent, tuner: ApplicationTuner) -> Non
 @click.option("--config", "-c", type=click.Path(exists=True), help="Config file path")
 @click.option("--log-level", default="INFO", help="Logging level")
 @click.option("--debug-llm", is_flag=True, help="Show full LLM conversation input/output")
-@click.option("--debug-llm-md", type=click.Path(), help="Write LLM conversation transcript to markdown file")
+@click.option(
+    "--debug-llm-md", type=click.Path(), help="Write LLM conversation transcript to markdown file"
+)
 @click.pass_context
 def cli(
     ctx: click.Context,
@@ -179,7 +210,7 @@ def cli(
     debug_llm_md: str | None,
 ) -> None:
     ctx.ensure_object(dict)
-    
+
     if config:
         ctx.obj["config"] = SysPilotConfig.from_yaml(Path(config))
     else:
@@ -188,7 +219,7 @@ def cli(
         # Try to load credentials from default locations
         sys_config.llm = LLMConfig.from_file()
         ctx.obj["config"] = sys_config
-    
+
     ctx.obj["config"].log_level = log_level
     if debug_llm or debug_llm_md:
         ctx.obj["config"].llm.debug_conversation = True
@@ -204,7 +235,9 @@ def auth() -> None:
 
 @auth.command("login")
 @click.option("--manual", is_flag=True, help="Use manual redirect URL paste flow")
-@click.option("--timeout", default=180, type=int, show_default=True, help="OAuth callback timeout seconds")
+@click.option(
+    "--timeout", default=180, type=int, show_default=True, help="OAuth callback timeout seconds"
+)
 @click.option("--auth-file", type=click.Path(), help="Path to save OpenAI auth credentials")
 def auth_login(manual: bool, timeout: int, auth_file: str | None) -> None:
     verifier, challenge = create_pkce_verifier_and_challenge()
@@ -224,7 +257,9 @@ def auth_login(manual: bool, timeout: int, auth_file: str | None) -> None:
             console.print("[yellow]Could not open browser automatically.[/yellow]")
 
         if not code:
-            console.print("[yellow]Automatic callback unavailable or timed out. Using manual mode.[/yellow]")
+            console.print(
+                "[yellow]Automatic callback unavailable or timed out. Using manual mode.[/yellow]"
+            )
 
     if not code:
         console.print("[cyan]Open this URL and complete login:[/cyan]")
@@ -256,14 +291,18 @@ def auth_login(manual: bool, timeout: int, auth_file: str | None) -> None:
 @click.option("--pid", "-p", type=int, help="Target process ID")
 @click.option("--name", "-n", help="Target process name")
 @click.option("--interval", "-i", default=5.0, help="Monitoring interval (seconds)")
-@click.option("--manual", "-m", multiple=True, help="Load specific manuals (e.g., numactl, pytorch)")
+@click.option(
+    "--manual", "-m", multiple=True, help="Load specific manuals (e.g., numactl, pytorch)"
+)
 @click.pass_context
-def monitor(ctx: click.Context, pid: int | None, name: str | None, interval: float, manual: tuple[str, ...]) -> None:
+def monitor(
+    ctx: click.Context, pid: int | None, name: str | None, interval: float, manual: tuple[str, ...]
+) -> None:
     config: SysPilotConfig = ctx.obj["config"]
     config.target_pid = pid
     config.target_name = name
     config.monitoring.interval_seconds = interval
-    
+
     if name and not pid:
         processes = find_process_by_name(name)
         if not processes:
@@ -276,9 +315,9 @@ def monitor(ctx: click.Context, pid: int | None, name: str | None, interval: flo
             console.print("[yellow]Please specify --pid[/yellow]")
             sys.exit(1)
         config.target_pid = processes[0].pid
-    
+
     agent = SysPilotAgent(config)
-    
+
     if manual:
         console.print(f"[cyan]Loading manuals: {', '.join(manual)}[/cyan]")
         results = agent.load_manuals(list(manual))
@@ -287,22 +326,24 @@ def monitor(ctx: click.Context, pid: int | None, name: str | None, interval: flo
                 console.print(f"  [green]✓ Loaded: {manual_name}[/green]")
             else:
                 console.print(f"  [red]✗ Failed: {manual_name}[/red]")
-    
+
     manager = ProfilingManager()
     tuner = ApplicationTuner(config.tuning)
-    
+
     _register_default_skills(agent)
     _register_profiling_tools(agent, manager)
     _register_tuning_tools(agent, tuner)
-    
-    console.print(Panel(
-        f"[bold green]SysPilot Monitor[/bold green]\n"
-        f"Target: PID {config.target_pid or 'System-wide'}\n"
-        f"Interval: {interval}s\n"
-        f"Manuals: {len(agent.context.loaded_manuals)} loaded",
-        title="Starting",
-    ))
-    
+
+    console.print(
+        Panel(
+            f"[bold green]SysPilot Monitor[/bold green]\n"
+            f"Target: PID {config.target_pid or 'System-wide'}\n"
+            f"Interval: {interval}s\n"
+            f"Manuals: {len(agent.context.loaded_manuals)} loaded",
+            title="Starting",
+        )
+    )
+
     try:
         asyncio.run(agent.run_monitoring_loop())
     except KeyboardInterrupt:
@@ -312,14 +353,16 @@ def monitor(ctx: click.Context, pid: int | None, name: str | None, interval: flo
 
 @cli.command()
 @click.argument("pid", type=int)
-@click.option("--manual", "-m", multiple=True, help="Load specific manuals (e.g., numactl, pytorch)")
+@click.option(
+    "--manual", "-m", multiple=True, help="Load specific manuals (e.g., numactl, pytorch)"
+)
 @click.pass_context
 def analyze(ctx: click.Context, pid: int, manual: tuple[str, ...]) -> None:
     config: SysPilotConfig = ctx.obj["config"]
     config.target_pid = pid
-    
+
     agent = SysPilotAgent(config)
-    
+
     if manual:
         console.print(f"[cyan]Loading manuals: {', '.join(manual)}[/cyan]")
         results = agent.load_manuals(list(manual))
@@ -328,16 +371,16 @@ def analyze(ctx: click.Context, pid: int, manual: tuple[str, ...]) -> None:
                 console.print(f"  [green]✓ Loaded: {manual_name}[/green]")
             else:
                 console.print(f"  [red]✗ Failed: {manual_name}[/red]")
-    
+
     manager = ProfilingManager()
     tuner = ApplicationTuner(config.tuning)
-    
+
     _register_default_skills(agent)
     _register_profiling_tools(agent, manager)
     _register_tuning_tools(agent, tuner)
-    
+
     console.print(f"[bold]Analyzing process {pid}...[/bold]")
-    
+
     result = asyncio.run(agent.analyze_target(pid=pid))
     console.print(Panel(result, title="Analysis Result"))
 
@@ -348,20 +391,20 @@ def analyze(ctx: click.Context, pid: int, manual: tuple[str, ...]) -> None:
 @click.pass_context
 def profile(ctx: click.Context, pid: int, collector: tuple[str, ...]) -> None:
     manager = ProfilingManager()
-    
+
     collectors = list(collector) if collector else None
     results = asyncio.run(manager.collect(collectors, pid))
-    
+
     for name, result in results.items():
         table = Table(title=f"{name.upper()} Profile")
         table.add_column("Metric", style="cyan")
         table.add_column("Value", style="green")
-        
+
         for key, value in result.data.items():
             if isinstance(value, dict):
                 value = json.dumps(value, indent=2)
             table.add_row(str(key), str(value))
-        
+
         console.print(table)
 
 
@@ -369,57 +412,67 @@ def profile(ctx: click.Context, pid: int, collector: tuple[str, ...]) -> None:
 def manuals() -> None:
     """List available tuning manuals."""
     from pathlib import Path
-    
+
     # Same discovery logic as Agent
     manual_candidates = [
         Path(__file__).resolve().parents[1] / "manual",
         Path("manual"),
         Path("~/.syspilot/manual").expanduser(),
     ]
-    
+
     manual_dir = None
     for p in manual_candidates:
         if p.exists() and p.is_dir():
             manual_dir = p
             break
-    
+
     if not manual_dir:
-        console.print("[yellow]No manuals directory found (checked source tree and ~/.syspilot/manual)[/yellow]")
+        console.print(
+            "[yellow]No manuals directory found (checked source tree and ~/.syspilot/manual)[/yellow]"
+        )
         return
-    
+
     manuals_list = [p.stem for p in manual_dir.glob("*.md")]
-    
+
     if not manuals_list:
         console.print("[yellow]No manuals available[/yellow]")
         return
-    
+
     table = Table(title="Available Tuning Manuals")
     table.add_column("Manual", style="cyan")
     table.add_column("Path", style="green")
-    
+
     for manual_name in sorted(manuals_list):
         manual_path = manual_dir / f"{manual_name}.md"
         table.add_row(manual_name, str(manual_path))
-    
+
     console.print(table)
     console.print("\n[dim]Use --manual/-m with monitor, analyze, or tune commands[/dim]")
-    console.print("[dim]Examples: syspilot analyze 1234 --manual numactl | syspilot tune --pid 1234 --manual numactl[/dim]")
+    console.print(
+        "[dim]Examples: syspilot analyze 1234 --manual numactl | syspilot tune --pid 1234 --manual numactl[/dim]"
+    )
 
 
 @cli.command()
 def skills() -> None:
     registry = SkillRegistry()
-    
-    for skill_cls in [DynamicScriptSkill, StraceAnalyzerSkill, PerfAnalyzerSkill, EBPFSkill, DataProcessorSkill]:
+
+    for skill_cls in [
+        DynamicScriptSkill,
+        StraceAnalyzerSkill,
+        PerfAnalyzerSkill,
+        EBPFSkill,
+        DataProcessorSkill,
+    ]:
         registry.register(skill_cls())
-    
+
     table = Table(title="Available Skills")
     table.add_column("Name", style="cyan")
     table.add_column("Description", style="green")
-    
+
     for skill_info in registry.list_skills():
         table.add_row(skill_info["name"], skill_info["description"])
-    
+
     console.print(table)
 
 
@@ -427,20 +480,40 @@ def skills() -> None:
 @click.option("--pid", "-p", type=int, help="Target process ID (attach mode)")
 @click.option("--command", "-c", type=str, help="Command to run and tune (spawn mode)")
 @click.option(
+    "--ui-mode",
+    type=click.Choice(["tui", "plain"], case_sensitive=False),
+    default="tui",
+    show_default=True,
+    help="Tune UI mode (tui-first with safe fallback to plain)",
+)
+@click.option(
+    "--tui-bin",
+    type=click.Path(dir_okay=False, path_type=Path),
+    help="Override path to syspilot-tui binary (or set SYSPILOT_TUI_BIN)",
+)
+@click.option(
     "--workdir",
     type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
     help="Working directory for spawn mode command execution",
 )
-@click.option("--manual", "-m", multiple=True, help="Load specific manuals (e.g., numactl, pytorch)")
+@click.option(
+    "--manual", "-m", multiple=True, help="Load specific manuals (e.g., numactl, pytorch)"
+)
 @click.option("--max-iterations", default=5, help="Maximum tuning iterations")
 @click.option("--dry-run/--no-dry-run", default=True, help="Show changes without applying")
 @click.option("--timeout", default=120, help="Timeout per command run in seconds")
-@click.option("--parse-output/--no-parse-output", default=False, help="Use LLM to extract metrics from program output")
+@click.option(
+    "--parse-output/--no-parse-output",
+    default=False,
+    help="Use LLM to extract metrics from program output",
+)
 @click.pass_context
 def tune(
     ctx: click.Context,
     pid: int | None,
     command: str | None,
+    ui_mode: str,
+    tui_bin: Path | None,
     workdir: Path | None,
     manual: tuple[str, ...],
     max_iterations: int,
@@ -449,21 +522,42 @@ def tune(
     parse_output: bool,
 ) -> None:
     """Iteratively tune a running application.
-    
+
     Two modes:
       --pid: Attach to existing process and profile it
       --command: Spawn command, profile, get recommendations, respawn with tuning
-    
+
     Example (spawn mode):
       syspilot tune -c "./app --arg value" --workdir /path/to/app -m numactl
     """
+    requested_mode = TuneUIMode(ui_mode.lower())
+    plain_sink = make_output_sink(ui_mode=TuneUIMode.PLAIN, console=console)
+    sink: OutputSink = plain_sink
+
     if not pid and not command:
-        console.print("[red]Error: Must specify either --pid or --command[/red]")
+        sink.print("[red]Error: Must specify either --pid or --command[/red]")
         raise SystemExit(1)
-    
+
     if pid and command:
-        console.print("[red]Error: Cannot specify both --pid and --command[/red]")
+        sink.print("[red]Error: Cannot specify both --pid and --command[/red]")
         raise SystemExit(1)
+
+    tui_orchestrator: TuneTuiOrchestrator | None = None
+    tui_sink: SwitchableOutputSink | None = None
+    if requested_mode == TuneUIMode.TUI:
+        tui_orchestrator = TuneTuiOrchestrator(requested="tui", tui_bin_override=tui_bin)
+        started, warning = tui_orchestrator.try_start()
+        if warning:
+            plain_sink.print(f"[yellow]{warning}[/yellow]")
+        if started:
+            tui_sink = SwitchableOutputSink(
+                make_output_sink(ui_mode=TuneUIMode.TUI, console=console)
+            )
+            sink = _TuiAwareOutputSink(
+                sink=tui_sink,
+                orchestrator=tui_orchestrator,
+                plain_sink=plain_sink,
+            )
 
     config: SysPilotConfig = ctx.obj["config"]
     config.tuning.dry_run = dry_run
@@ -472,13 +566,13 @@ def tune(
     agent = SysPilotAgent(config)
 
     if manual:
-        console.print(f"[cyan]Loading manuals: {', '.join(manual)}[/cyan]")
+        sink.print(f"[cyan]Loading manuals: {', '.join(manual)}[/cyan]")
         results = agent.load_manuals(list(manual))
         for manual_name, success in results.items():
             if success:
-                console.print(f"  [green]✓ Loaded: {manual_name}[/green]")
+                sink.print(f"  [green]✓ Loaded: {manual_name}[/green]")
             else:
-                console.print(f"  [red]✗ Failed: {manual_name}[/red]")
+                sink.print(f"  [red]✗ Failed: {manual_name}[/red]")
 
     manager = ProfilingManager()
     tuner = ApplicationTuner(config.tuning)
@@ -487,11 +581,182 @@ def tune(
     _register_profiling_tools(agent, manager)
     _register_tuning_tools(agent, tuner)
 
-    if command:
-        _run_spawn_tune_loop(agent, command, manual, max_iterations, timeout, parse_output, workdir)
-    else:
-        assert pid is not None
-        _run_attach_tune_loop(agent, manager, tuner, pid, max_iterations, dry_run)
+    base_emitter = TuneEventEmitter()
+    event_emitter: _TuneEmitter = base_emitter
+    if tui_orchestrator is not None and tui_sink is not None:
+        event_emitter = _TuiForwardingEmitterAdapter(
+            emitter=base_emitter,
+            orchestrator=tui_orchestrator,
+        )
+
+    if isinstance(sink, _TuiAwareOutputSink):
+        sink.set_event_emitter(event_emitter)
+
+    logger_forward_handler: _TuiLogForwardHandler | None = None
+    syspilot_logger = logging.getLogger("syspilot")
+    if isinstance(sink, _TuiAwareOutputSink):
+        logger_forward_handler = _TuiLogForwardHandler(sink)
+        syspilot_logger.addHandler(logger_forward_handler)
+
+    try:
+        if command:
+            _run_spawn_tune_loop(
+                agent,
+                command,
+                manual,
+                max_iterations,
+                timeout,
+                parse_output,
+                workdir,
+                sink,
+                event_emitter,
+            )
+        else:
+            assert pid is not None
+            _run_attach_tune_loop(
+                agent,
+                manager,
+                tuner,
+                pid,
+                max_iterations,
+                dry_run,
+                sink,
+                event_emitter,
+            )
+    finally:
+        if logger_forward_handler is not None:
+            syspilot_logger.removeHandler(logger_forward_handler)
+        if tui_orchestrator is not None:
+            tui_orchestrator.close(wait_for_user=True)
+
+
+class _TuiAwareOutputSink:
+    def __init__(
+        self,
+        *,
+        sink: SwitchableOutputSink,
+        orchestrator: TuneTuiOrchestrator,
+        plain_sink: OutputSink,
+    ) -> None:
+        self._sink: SwitchableOutputSink = sink
+        self._orchestrator: TuneTuiOrchestrator = orchestrator
+        self._plain_sink: OutputSink = plain_sink
+        self._event_emitter: _TuneEmitter | None = None
+
+    def set_event_emitter(self, event_emitter: _TuneEmitter) -> None:
+        self._event_emitter = event_emitter
+
+    def is_tui_active(self) -> bool:
+        return self._orchestrator.using_tui
+
+    def _ensure_fallback(self) -> None:
+        warning = self._orchestrator.maybe_fallback_warning()
+        if not warning:
+            return
+        self._sink.switch(self._plain_sink)
+        self._plain_sink.print(f"[yellow]{warning}[/yellow]")
+
+    def _emit_log_line(self, message: str) -> None:
+        if not self._orchestrator.using_tui:
+            return
+
+        normalized = message.strip()
+        if not normalized:
+            return
+
+        _emit_tune_event(
+            self._event_emitter,
+            "log.line",
+            {"message": normalized},
+        )
+
+    def print(self, message: str = "") -> None:
+        self._ensure_fallback()
+        self._emit_log_line(message)
+        self._sink.print(message)
+
+    def panel(self, body: str, *, title: str) -> None:
+        self._ensure_fallback()
+        self._emit_log_line(title)
+        for line in body.splitlines():
+            self._emit_log_line(line)
+        self._sink.panel(body, title=title)
+
+    def table(
+        self,
+        *,
+        title: str,
+        columns: Sequence[tuple[str, str | None]],
+        rows: Sequence[Sequence[str]],
+    ) -> None:
+        self._ensure_fallback()
+        header = " | ".join(name for name, _ in columns)
+        if title:
+            self._emit_log_line(title)
+        self._emit_log_line(header)
+        for row in rows:
+            self._emit_log_line(" | ".join(str(value) for value in row))
+        self._sink.table(title=title, columns=columns, rows=rows)
+
+
+class _TuiForwardingEmitterAdapter:
+    def __init__(
+        self,
+        *,
+        emitter: TuneEventEmitter,
+        orchestrator: TuneTuiOrchestrator,
+    ) -> None:
+        self._emitter: TuneEventEmitter = emitter
+        self._orchestrator: TuneTuiOrchestrator = orchestrator
+
+    def publish(
+        self,
+        event_name: str,
+        payload: dict[str, object] | None = None,
+        *,
+        event_type: str | None = None,
+    ) -> bool:
+        ok = self._emitter.publish(event_name, payload, event_type=event_type)
+        self._orchestrator.forward_emitter(self._emitter)
+        return ok
+
+
+class _TuiLogForwardHandler(logging.Handler):
+    def __init__(self, sink: _TuiAwareOutputSink) -> None:
+        super().__init__(level=logging.INFO)
+        self._sink = sink
+        self.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if not self._sink.is_tui_active():
+            return
+
+        try:
+            message = self.format(record)
+        except Exception:
+            return
+
+        if record.levelno >= logging.ERROR:
+            message = f"[red]{message}[/red]"
+        elif record.levelno >= logging.WARNING:
+            message = f"[yellow]{message}[/yellow]"
+        elif record.levelno <= logging.DEBUG:
+            message = f"[dim]{message}[/dim]"
+
+        self._sink.print(message)
+
+
+def _emit_tune_event(
+    event_emitter: _TuneEmitter | None,
+    event_name: str,
+    payload: dict[str, object],
+) -> None:
+    if event_emitter is None:
+        return
+    try:
+        _ = event_emitter.publish(event_name, payload)
+    except Exception:
+        return
 
 
 def _run_attach_tune_loop(
@@ -501,6 +766,8 @@ def _run_attach_tune_loop(
     pid: int,
     max_iterations: int,
     dry_run: bool,
+    sink: OutputSink,
+    event_emitter: _TuneEmitter | None = None,
 ) -> None:
     agent.config.target_pid = pid
 
@@ -510,20 +777,65 @@ def _run_attach_tune_loop(
         max_iterations=max_iterations,
     )
 
-    console.print(Panel(
+    sink.panel(
         f"[bold green]SysPilot Tuning Engine (Attach Mode)[/bold green]\n"
         f"Target: PID {pid}\n"
         f"Max Iterations: {max_iterations}\n"
         f"Dry Run: {dry_run}\n"
         f"Manuals: {len(agent.context.loaded_manuals)} loaded",
         title="Starting",
-    ))
+    )
+
+    _emit_tune_event(
+        event_emitter,
+        "run.started",
+        {
+            "mode": "attach",
+            "pid": pid,
+            "max_iterations": max_iterations,
+            "dry_run": dry_run,
+        },
+    )
+    _emit_tune_event(
+        event_emitter,
+        "phase.started",
+        {"mode": "attach", "phase": "attach.tuning_loop"},
+    )
 
     try:
         result = asyncio.run(agent.run_tuning_loop(engine, max_iterations))
-        console.print(Panel(result, title="Tuning Results"))
+        sink.panel(result, title="Tuning Results")
+        _emit_tune_event(
+            event_emitter,
+            "phase.finished",
+            {"mode": "attach", "phase": "attach.tuning_loop", "status": "success"},
+        )
+        _emit_tune_event(
+            event_emitter,
+            "run.finished",
+            {"mode": "attach", "status": "success"},
+        )
     except KeyboardInterrupt:
-        console.print("\n[yellow]Stopping tuning...[/yellow]")
+        _emit_tune_event(
+            event_emitter,
+            "error",
+            {
+                "mode": "attach",
+                "phase": "attach.tuning_loop",
+                "message": "Keyboard interrupt",
+            },
+        )
+        _emit_tune_event(
+            event_emitter,
+            "phase.finished",
+            {"mode": "attach", "phase": "attach.tuning_loop", "status": "interrupted"},
+        )
+        _emit_tune_event(
+            event_emitter,
+            "run.finished",
+            {"mode": "attach", "status": "interrupted"},
+        )
+        sink.print("\n[yellow]Stopping tuning...[/yellow]")
         agent.stop()
 
 
@@ -883,8 +1195,12 @@ def _discover_related_processes(root_pid: int, max_targets: int = 4) -> dict[str
     )
 
     worker_snapshots = [item for item in snapshots if int(item.get("pid", -1)) != root_pid]
-    heavy_workers = [item for item in worker_snapshots if float(item.get("cpu_percent", 0.0)) >= 1.0]
-    selected_workers = heavy_workers[: max_targets - 1] if heavy_workers else worker_snapshots[: max_targets - 1]
+    heavy_workers = [
+        item for item in worker_snapshots if float(item.get("cpu_percent", 0.0)) >= 1.0
+    ]
+    selected_workers = (
+        heavy_workers[: max_targets - 1] if heavy_workers else worker_snapshots[: max_targets - 1]
+    )
 
     target_pids = [root_pid]
     target_pids.extend(int(item.get("pid", root_pid)) for item in selected_workers)
@@ -942,9 +1258,10 @@ If no metrics found, return: {{"no_metrics": true}}
 RESPOND WITH ONLY THE JSON OBJECT, NO EXPLANATION:"""
 
     response = await agent.step(prompt)
-    
+
     import re
-    json_match = re.search(r'\{[^{}]*\}', response.content, re.DOTALL)
+
+    json_match = re.search(r"\{[^{}]*\}", response.content, re.DOTALL)
     if json_match:
         try:
             parsed = json.loads(json_match.group())
@@ -1048,10 +1365,16 @@ async def _run_live_profiling_pipeline(
                 if profile_summary:
                     ebpf_summary = profile_summary
                 if profile_error:
-                    ebpf_summary = f"{ebpf_summary} ({profile_error})" if ebpf_summary else profile_error
+                    ebpf_summary = (
+                        f"{ebpf_summary} ({profile_error})" if ebpf_summary else profile_error
+                    )
 
                 profile_success = bool(ebpf_profile.get("success", False))
-                if not profile_success and template_name == "syscall_count" and ebpf_data.get("bcc_available"):
+                if (
+                    not profile_success
+                    and template_name == "syscall_count"
+                    and ebpf_data.get("bcc_available")
+                ):
                     fallback_profile = await agent._execute_tool(
                         "skill_ebpf",
                         {
@@ -1068,7 +1391,11 @@ async def _run_live_profiling_pipeline(
                         fallback_error = str(fallback_profile.get("error", "")).strip()
                         fallback_text = fallback_summary
                         if fallback_error:
-                            fallback_text = f"{fallback_text} ({fallback_error})" if fallback_text else fallback_error
+                            fallback_text = (
+                                f"{fallback_text} ({fallback_error})"
+                                if fallback_text
+                                else fallback_error
+                            )
                         if fallback_text:
                             ebpf_summary = f"{ebpf_summary} | fallback: {fallback_text}"
     except Exception as e:
@@ -1128,7 +1455,9 @@ async def _run_live_profiling_pipeline(
                         if isinstance(refined, dict):
                             per_pid_runtime_maps[str(target_pid)] = refined
                     except json.JSONDecodeError:
-                        key_findings.append(f"status parsing returned invalid JSON for pid {target_pid}")
+                        key_findings.append(
+                            f"status parsing returned invalid JSON for pid {target_pid}"
+                        )
         except Exception as e:
             key_findings.append(f"dynamic status pipeline failed for pid {target_pid}: {e}")
 
@@ -1196,13 +1525,40 @@ async def _run_spawn_tune_loop_async(
     timeout: int,
     parse_output: bool = False,
     workdir: str | None = None,
+    sink: OutputSink | None = None,
+    event_emitter: _TuneEmitter | None = None,
 ) -> None:
+    if sink is None:
+        sink = make_output_sink(ui_mode=TuneUIMode.PLAIN, console=console)
+
     cmd_parts = shlex.split(command)
     if not cmd_parts:
-        console.print("[red]Spawn command is empty after parsing[/red]")
+        _emit_tune_event(
+            event_emitter,
+            "error",
+            {"mode": "spawn", "phase": "spawn.command_parse", "message": "empty command"},
+        )
+        _emit_tune_event(
+            event_emitter,
+            "run.finished",
+            {"mode": "spawn", "status": "invalid_input"},
+        )
+        sink.print("[red]Spawn command is empty after parsing[/red]")
         return
 
-    console.print(Panel(
+    _emit_tune_event(
+        event_emitter,
+        "run.started",
+        {
+            "mode": "spawn",
+            "command": command,
+            "workdir": workdir or "",
+            "max_iterations": max_iterations,
+            "timeout_s": timeout,
+        },
+    )
+
+    sink.panel(
         f"[bold green]SysPilot Tuning Engine (Spawn Mode)[/bold green]\n"
         f"Command: {command}\n"
         f"Workdir: {workdir or '(current)'}\n"
@@ -1210,7 +1566,7 @@ async def _run_spawn_tune_loop_async(
         f"Timeout: {timeout}s\n"
         f"Manuals: {len(agent.context.loaded_manuals)} loaded",
         title="Starting",
-    ))
+    )
 
     manual_content = ""
     if manuals and agent.context.loaded_manuals:
@@ -1219,21 +1575,56 @@ async def _run_spawn_tune_loop_async(
                 manual_content += f"\n\n### {manual_name} Manual (excerpt)\n"
                 manual_content += agent.context.loaded_manuals[manual_name][:3000]
 
-    console.print("\n[bold cyan]Step 1: Initial Baseline Run[/bold cyan]")
+    sink.print("\n[bold cyan]Step 1: Initial Baseline Run[/bold cyan]")
+    _emit_tune_event(
+        event_emitter,
+        "phase.started",
+        {"mode": "spawn", "phase": "spawn.baseline"},
+    )
     baseline_time, baseline_stdout, baseline_stderr, baseline_rc = _run_command(
         cmd_parts,
         timeout,
         workdir=workdir,
     )
     if baseline_rc != 0:
-        console.print(f"[red]Baseline run failed (rc={baseline_rc})[/red]")
-        console.print(f"[dim]stderr: {baseline_stderr[:500]}[/dim]")
+        _emit_tune_event(
+            event_emitter,
+            "error",
+            {
+                "mode": "spawn",
+                "phase": "spawn.baseline",
+                "message": f"baseline run failed (rc={baseline_rc})",
+            },
+        )
+        _emit_tune_event(
+            event_emitter,
+            "phase.finished",
+            {"mode": "spawn", "phase": "spawn.baseline", "status": "failed"},
+        )
+        _emit_tune_event(
+            event_emitter,
+            "run.finished",
+            {"mode": "spawn", "status": "failed", "returncode": baseline_rc},
+        )
+        sink.print(f"[red]Baseline run failed (rc={baseline_rc})[/red]")
+        sink.print(f"[dim]stderr: {baseline_stderr[:500]}[/dim]")
         return
 
-    console.print(f"  Wall time: {baseline_time:.2f}s")
-    console.print(f"  Output: {len(baseline_stdout)} bytes")
+    _emit_tune_event(
+        event_emitter,
+        "phase.finished",
+        {
+            "mode": "spawn",
+            "phase": "spawn.baseline",
+            "status": "success",
+            "wall_time_s": baseline_time,
+            "cmd_diff": "baseline",
+        },
+    )
 
-    initial_command_parts = list(cmd_parts)
+    sink.print(f"  Wall time: {baseline_time:.2f}s")
+    sink.print(f"  Output: {len(baseline_stdout)} bytes")
+
     current_command_parts = list(cmd_parts)
     current_env_overrides: dict[str, str] = {}
     current_time = baseline_time
@@ -1256,7 +1647,16 @@ async def _run_spawn_tune_loop_async(
     min_improvement_pct = 1.0
 
     for iteration in range(1, max_iterations + 1):
-        console.print(f"\n[bold cyan]Step 2.{iteration}: Iteration Profiling[/bold cyan]")
+        _emit_tune_event(
+            event_emitter,
+            "phase.started",
+            {
+                "mode": "spawn",
+                "phase": "spawn.iteration",
+                "iteration": iteration,
+            },
+        )
+        sink.print(f"\n[bold cyan]Step 2.{iteration}: Iteration Profiling[/bold cyan]")
         profiling_artifacts = await _run_live_profiling_pipeline(
             agent,
             current_command_parts,
@@ -1265,34 +1665,65 @@ async def _run_spawn_tune_loop_async(
             env_overrides=current_env_overrides,
         )
 
-        console.print(f"  Profiling run PID: {profiling_artifacts['pid']}")
-        console.print(f"  Profiling run wall time: {profiling_artifacts['wall_time']:.2f}s")
-        console.print(f"  Agent tool calls used: {profiling_artifacts.get('tool_calls_used', 0)}")
-        if profiling_artifacts["returncode"] != 0:
-            console.print(f"  [yellow]Profiling command return code: {profiling_artifacts['returncode']}[/yellow]")
+        sink.print(f"  Profiling run PID: {profiling_artifacts['pid']}")
+        sink.print(f"  Profiling run wall time: {profiling_artifacts['wall_time']:.2f}s")
+        sink.print(f"  Agent tool calls used: {profiling_artifacts.get('tool_calls_used', 0)}")
 
         profiling_text = profiling_artifacts.get("profiling_text", "")
         profiling_json = profiling_artifacts.get("profiling_json", {})
+        profile_tools: list[str] = []
+        profile_json_payload: dict[str, Any] = {}
+        if isinstance(profiling_json, dict):
+            profile_json_payload = dict(profiling_json)
+            raw_tools = profiling_json.get("tools_used")
+            if isinstance(raw_tools, list):
+                profile_tools = [str(tool) for tool in raw_tools if str(tool).strip()]
+
+        _emit_tune_event(
+            event_emitter,
+            "profile.snapshot",
+            {
+                "mode": "spawn",
+                "iteration": iteration,
+                "profile_tools": profile_tools,
+                "profile_json": profile_json_payload,
+                "profile_summary": profiling_text,
+                "metrics": {
+                    "pid": profiling_artifacts["pid"],
+                    "wall_time_s": profiling_artifacts["wall_time"],
+                    "returncode": profiling_artifacts["returncode"],
+                    "tool_calls_used": profiling_artifacts.get("tool_calls_used", 0),
+                },
+            },
+        )
+        if profiling_artifacts["returncode"] != 0:
+            sink.print(
+                f"  [yellow]Profiling command return code: {profiling_artifacts['returncode']}[/yellow]"
+            )
 
         if profiling_json:
-            console.print(f"  Refined profiling JSON: {profiling_json}")
+            sink.print(f"  Refined profiling JSON: {profiling_json}")
         else:
             snippet = profiling_text[:500] + ("..." if len(profiling_text) > 500 else "")
-            console.print(f"  Refined profiling summary: {snippet}")
+            sink.print(f"  Refined profiling summary: {snippet}")
 
-        target_pids = profiling_json.get("target_pids", []) if isinstance(profiling_json, dict) else []
-        primary_pid = profiling_json.get("primary_pid") if isinstance(profiling_json, dict) else None
+        target_pids = (
+            profiling_json.get("target_pids", []) if isinstance(profiling_json, dict) else []
+        )
+        primary_pid = (
+            profiling_json.get("primary_pid") if isinstance(profiling_json, dict) else None
+        )
         if target_pids:
-            console.print(f"  Profiling targets: {target_pids} (primary={primary_pid})")
+            sink.print(f"  Profiling targets: {target_pids} (primary={primary_pid})")
 
         history_text = "\n".join(iteration_summaries[-6:]) if iteration_summaries else "(none)"
         tried_commands = [list(parts) for parts, _ in list(seen_trials)[-12:]]
 
-        console.print(f"\n[bold cyan]Step 3.{iteration}: Agent Tuning Analysis[/bold cyan]")
+        sink.print(f"\n[bold cyan]Step 3.{iteration}: Agent Tuning Analysis[/bold cyan]")
         prompt = f"""Analyze this spawn-mode workload and propose the next manual-driven optimization actions.
 
 ## Current Command
-{' '.join(current_command_parts)}
+{" ".join(current_command_parts)}
 
 ## Current Wall Time
 {current_time:.2f}s
@@ -1338,30 +1769,71 @@ async def _run_spawn_tune_loop_async(
 """
 
         response = await agent.step(prompt)
-        console.print(f"\n[dim]{response.content}[/dim]")
+        sink.print(f"\n[dim]{response.content}[/dim]")
 
         recommendation = _parse_spawn_actions(response.content)
         if not recommendation["valid"]:
-            console.print("\n[yellow]Agent recommendation was not actionable[/yellow]")
-            console.print(f"  Reason: {recommendation['error']}")
+            _emit_tune_event(
+                event_emitter,
+                "warning.raised",
+                {
+                    "mode": "spawn",
+                    "iteration": iteration,
+                    "message": recommendation["error"],
+                },
+            )
+            _emit_tune_event(
+                event_emitter,
+                "phase.finished",
+                {
+                    "mode": "spawn",
+                    "phase": "spawn.iteration",
+                    "iteration": iteration,
+                    "status": "no_actionable_recommendation",
+                },
+            )
+            sink.print("\n[yellow]Agent recommendation was not actionable[/yellow]")
+            sink.print(f"  Reason: {recommendation['error']}")
             break
 
         if recommendation["skipped_actions"]:
-            console.print("  Skipped invalid actions:")
+            sink.print("  Skipped invalid actions:")
             for item in recommendation["skipped_actions"]:
-                console.print(f"    - {item}")
+                sink.print(f"    - {item}")
 
         summary = recommendation["summary"] or "No actionable tuning recommendation returned."
-        console.print(f"  Decision summary: {summary}")
+        _emit_tune_event(
+            event_emitter,
+            "recommendation.ready",
+            {
+                "mode": "spawn",
+                "iteration": iteration,
+                "summary": summary,
+                "manual_citation": recommendation["manual_citation"],
+                "evidence": recommendation["evidence"][:5],
+                "action_count": len(recommendation["actions"]),
+            },
+        )
+        sink.print(f"  Decision summary: {summary}")
         if recommendation["manual_citation"]:
-            console.print(f"  Manual citation: {recommendation['manual_citation']}")
+            sink.print(f"  Manual citation: {recommendation['manual_citation']}")
         if recommendation["evidence"]:
             for evidence_item in recommendation["evidence"][:5]:
-                console.print(f"  Evidence: {evidence_item}")
+                sink.print(f"  Evidence: {evidence_item}")
 
         actions = recommendation["actions"]
         if not actions:
-            console.print("\n[yellow]Agent recommended no actionable tuning[/yellow]")
+            _emit_tune_event(
+                event_emitter,
+                "phase.finished",
+                {
+                    "mode": "spawn",
+                    "phase": "spawn.iteration",
+                    "iteration": iteration,
+                    "status": "no_actions",
+                },
+            )
+            sink.print("\n[yellow]Agent recommended no actionable tuning[/yellow]")
             break
 
         candidate_plans = _build_spawn_candidates(
@@ -1375,13 +1847,45 @@ async def _run_spawn_tune_loop_async(
             if _command_key(candidate["cmd"], candidate["env_overrides"]) not in seen_trials
         ]
         if not candidate_plans:
-            console.print("\n[yellow]No new executable tuning actions remained after validation[/yellow]")
+            _emit_tune_event(
+                event_emitter,
+                "phase.progress",
+                {
+                    "mode": "spawn",
+                    "phase": "spawn.iteration",
+                    "iteration": iteration,
+                    "status": "no_new_candidates",
+                },
+            )
+            sink.print(
+                "\n[yellow]No new executable tuning actions remained after validation[/yellow]"
+            )
             stagnation_iterations += 1
             if stagnation_iterations >= convergence_patience:
+                _emit_tune_event(
+                    event_emitter,
+                    "phase.finished",
+                    {
+                        "mode": "spawn",
+                        "phase": "spawn.iteration",
+                        "iteration": iteration,
+                        "status": "converged",
+                    },
+                )
                 break
+            _emit_tune_event(
+                event_emitter,
+                "phase.finished",
+                {
+                    "mode": "spawn",
+                    "phase": "spawn.iteration",
+                    "iteration": iteration,
+                    "status": "no_new_candidates",
+                },
+            )
             continue
 
-        console.print(
+        sink.print(
             f"\n[bold cyan]Step 4.{iteration}: Candidate Search ({len(candidate_plans)} plan(s), max {max_iterations})[/bold cyan]"
         )
 
@@ -1401,14 +1905,26 @@ async def _run_spawn_tune_loop_async(
             skipped_execution_actions = candidate["skipped_actions"]
 
             seen_trials.add(_command_key(trial_cmd, trial_env))
+            _emit_tune_event(
+                event_emitter,
+                "progress.update",
+                {
+                    "mode": "spawn",
+                    "phase": "spawn.candidate_search",
+                    "iteration": iteration,
+                    "current_trial": idx,
+                    "total_trials": len(candidate_plans),
+                    "candidate_label": trial_label,
+                },
+            )
 
-            console.print(f"  Trial {idx}/{len(candidate_plans)}: {trial_label}")
-            console.print(f"    Running: {' '.join(trial_cmd)}")
+            sink.print(f"  Trial {idx}/{len(candidate_plans)}: {trial_label}")
+            sink.print(f"    Running: {' '.join(trial_cmd)}")
             if trial_env:
-                console.print(f"    Environment overrides: {trial_env}")
+                sink.print(f"    Environment overrides: {trial_env}")
             if skipped_execution_actions:
                 for item in skipped_execution_actions:
-                    console.print(f"    Skipped: {item}")
+                    sink.print(f"    Skipped: {item}")
 
             trial_time, trial_stdout, trial_stderr, trial_rc = _run_command(
                 trial_cmd,
@@ -1418,17 +1934,47 @@ async def _run_spawn_tune_loop_async(
             )
 
             if trial_rc != 0:
-                console.print(f"    [yellow]Trial failed (rc={trial_rc})[/yellow]")
-                console.print(f"    [dim]stderr: {trial_stderr[:240]}[/dim]")
+                _emit_tune_event(
+                    event_emitter,
+                    "candidate.evaluated",
+                    {
+                        "mode": "spawn",
+                        "iteration": iteration,
+                        "candidate_id": idx,
+                        "label": trial_label,
+                        "verdict": "failed",
+                        "returncode": trial_rc,
+                        "wall_time_s": trial_time,
+                        "cmd_diff": trial_label,
+                    },
+                )
+                sink.print(f"    [yellow]Trial failed (rc={trial_rc})[/yellow]")
+                sink.print(f"    [dim]stderr: {trial_stderr[:240]}[/dim]")
                 non_improving_trials += 1
                 if non_improving_trials >= convergence_patience and successful_trials > 0:
-                    console.print("  Candidate search converged after non-improving trials")
+                    sink.print("  Candidate search converged after non-improving trials")
                     break
                 continue
 
             successful_trials += 1
-            current_change_pct = ((current_time - trial_time) / current_time) * 100 if current_time > 0 else 0
-            console.print(f"    Wall time: {trial_time:.2f}s ({current_change_pct:+.1f}% vs current)")
+            current_change_pct = (
+                ((current_time - trial_time) / current_time) * 100 if current_time > 0 else 0
+            )
+            _emit_tune_event(
+                event_emitter,
+                "candidate.evaluated",
+                {
+                    "mode": "spawn",
+                    "iteration": iteration,
+                    "candidate_id": idx,
+                    "label": trial_label,
+                    "verdict": "improved" if trial_time < iteration_best_time else "not_improved",
+                    "wall_time_s": trial_time,
+                    "change_pct_vs_current": current_change_pct,
+                    "cmd_diff": trial_label,
+                },
+            )
+            sink.print(f"    Wall time: {trial_time:.2f}s ({current_change_pct:+.1f}% vs current)")
 
             if trial_time < iteration_best_time:
                 iteration_best_time = trial_time
@@ -1445,25 +1991,41 @@ async def _run_spawn_tune_loop_async(
                 non_improving_trials += 1
 
             if non_improving_trials >= convergence_patience and successful_trials > 0:
-                console.print("  Candidate search converged after non-improving trials")
+                sink.print("  Candidate search converged after non-improving trials")
                 break
 
         if successful_trials == 0:
-            console.print("  [yellow]No candidate completed successfully in this iteration[/yellow]")
+            _emit_tune_event(
+                event_emitter,
+                "phase.finished",
+                {
+                    "mode": "spawn",
+                    "phase": "spawn.iteration",
+                    "iteration": iteration,
+                    "status": "no_successful_trials",
+                },
+            )
+            sink.print("  [yellow]No candidate completed successfully in this iteration[/yellow]")
             stagnation_iterations += 1
             if stagnation_iterations >= convergence_patience:
                 break
             continue
 
         if iteration_best_time < current_time:
-            improvement_pct = ((current_time - iteration_best_time) / current_time) * 100 if current_time > 0 else 0
+            improvement_pct = (
+                ((current_time - iteration_best_time) / current_time) * 100
+                if current_time > 0
+                else 0
+            )
             current_time = iteration_best_time
             current_stdout = iteration_best_stdout
             current_stderr = iteration_best_stderr
             current_command_parts = list(iteration_best_cmd)
             current_env_overrides = dict(iteration_best_env)
-            console.print(f"  Accepted candidate: {iteration_best_label}")
-            console.print(f"  New current wall time: {current_time:.2f}s ({improvement_pct:+.1f}% vs previous)")
+            sink.print(f"  Accepted candidate: {iteration_best_label}")
+            sink.print(
+                f"  New current wall time: {current_time:.2f}s ({improvement_pct:+.1f}% vs previous)"
+            )
 
             if current_time < best_time:
                 best_time = current_time
@@ -1477,16 +2039,47 @@ async def _run_spawn_tune_loop_async(
                 stagnation_iterations = 0
             else:
                 stagnation_iterations += 1
+            _emit_tune_event(
+                event_emitter,
+                "phase.finished",
+                {
+                    "mode": "spawn",
+                    "phase": "spawn.iteration",
+                    "iteration": iteration,
+                    "status": "improved",
+                    "improvement_pct": improvement_pct,
+                },
+            )
         else:
-            console.print("  No candidate outperformed the current configuration")
+            sink.print("  No candidate outperformed the current configuration")
             stagnation_iterations += 1
+            _emit_tune_event(
+                event_emitter,
+                "phase.finished",
+                {
+                    "mode": "spawn",
+                    "phase": "spawn.iteration",
+                    "iteration": iteration,
+                    "status": "no_improvement",
+                },
+            )
 
         iteration_summaries.append(
             f"iter {iteration}: cmd={' '.join(current_command_parts)} wall={current_time:.2f}s"
         )
 
         if stagnation_iterations >= convergence_patience:
-            console.print("  Iterative loop converged after non-improving iterations")
+            sink.print("  Iterative loop converged after non-improving iterations")
+            _emit_tune_event(
+                event_emitter,
+                "phase.progress",
+                {
+                    "mode": "spawn",
+                    "phase": "spawn.iteration",
+                    "iteration": iteration,
+                    "status": "converged",
+                },
+            )
             break
 
     action_label = best_label
@@ -1494,52 +2087,62 @@ async def _run_spawn_tune_loop_async(
     tuned_stdout = best_stdout
     tuned_stderr = best_stderr
     if action_label == "(none)":
-        console.print("  No tuned candidate outperformed baseline; keeping baseline configuration")
+        sink.print("  No tuned candidate outperformed baseline; keeping baseline configuration")
     else:
-        console.print(f"  Selected best candidate: {action_label}")
-        console.print(f"  Best command: {' '.join(best_command_parts)}")
+        sink.print(f"  Selected best candidate: {action_label}")
+        sink.print(f"  Best command: {' '.join(best_command_parts)}")
         if best_env_overrides:
-            console.print(f"  Best environment overrides: {best_env_overrides}")
+            sink.print(f"  Best environment overrides: {best_env_overrides}")
 
     baseline_metrics: dict[str, Any] = {}
     tuned_metrics: dict[str, Any] = {}
 
     if parse_output:
-        console.print("\n[bold cyan]Step 5: Extracting Metrics from Output[/bold cyan]")
-        console.print("  Parsing baseline output...")
+        sink.print("\n[bold cyan]Step 5: Extracting Metrics from Output[/bold cyan]")
+        sink.print("  Parsing baseline output...")
         baseline_metrics = await _extract_metrics_from_output(
             agent,
             baseline_stdout,
             "baseline run without tuning actions",
         )
-        console.print(f"  Baseline metrics: {baseline_metrics}")
+        sink.print(f"  Baseline metrics: {baseline_metrics}")
 
-        console.print("  Parsing tuned output...")
+        sink.print("  Parsing tuned output...")
         tuned_metrics = await _extract_metrics_from_output(
             agent,
             tuned_stdout,
             f"tuned run with actions: {action_label}",
         )
-        console.print(f"  Tuned metrics: {tuned_metrics}")
+        sink.print(f"  Tuned metrics: {tuned_metrics}")
 
     comparison_step = 6 if parse_output else 5
-    console.print(f"\n[bold cyan]Step {comparison_step}: Results Comparison[/bold cyan]")
+    sink.print(f"\n[bold cyan]Step {comparison_step}: Results Comparison[/bold cyan]")
 
     speedup = baseline_time / tuned_time if tuned_time > 0 else 0
-    improvement_pct = ((baseline_time - tuned_time) / baseline_time) * 100 if baseline_time > 0 else 0
-
-    table = Table(title="Performance Comparison")
-    table.add_column("Metric", style="cyan")
-    table.add_column("Baseline", style="white")
-    table.add_column("Tuned", style="green")
-    table.add_column("Change", style="yellow")
-
-    table.add_row(
-        "Wall Time",
-        f"{baseline_time:.2f}s",
-        f"{tuned_time:.2f}s",
-        f"{improvement_pct:+.1f}% ({speedup:.2f}x)"
+    improvement_pct = (
+        ((baseline_time - tuned_time) / baseline_time) * 100 if baseline_time > 0 else 0
     )
+    _emit_tune_event(
+        event_emitter,
+        "result.comparison",
+        {
+            "mode": "spawn",
+            "baseline_time_s": baseline_time,
+            "tuned_time_s": tuned_time,
+            "improvement_pct": improvement_pct,
+            "speedup": speedup,
+            "action_label": action_label,
+        },
+    )
+
+    table_rows: list[list[str]] = [
+        [
+            "Wall Time",
+            f"{baseline_time:.2f}s",
+            f"{tuned_time:.2f}s",
+            f"{improvement_pct:+.1f}% ({speedup:.2f}x)",
+        ]
+    ]
 
     if parse_output and baseline_metrics and tuned_metrics:
         if not baseline_metrics.get("no_metrics") and not tuned_metrics.get("no_metrics"):
@@ -1549,34 +2152,60 @@ async def _run_spawn_tune_loop_async(
                     continue
                 base_val = baseline_metrics.get(key)
                 tuned_val = tuned_metrics.get(key)
-                
-                if isinstance(base_val, (int, float)) and isinstance(tuned_val, (int, float)) and base_val != 0:
+
+                if (
+                    isinstance(base_val, (int, float))
+                    and isinstance(tuned_val, (int, float))
+                    and base_val != 0
+                ):
                     change_pct = ((tuned_val - base_val) / abs(base_val)) * 100
                     change_str = f"{change_pct:+.1f}%"
                 else:
                     change_str = ""
-                
+
                 base_str = f"{base_val}" if base_val is not None else "-"
                 tuned_str = f"{tuned_val}" if tuned_val is not None else "-"
 
                 display_key = key.replace("_", " ").title()
-                table.add_row(display_key, base_str, tuned_str, change_str)
+                table_rows.append([display_key, base_str, tuned_str, change_str])
 
-    table.add_row(
-        "Applied actions",
-        "(none)",
-        action_label,
-        ""
+    table_rows.append(["Applied actions", "(none)", action_label, ""])
+
+    sink.table(
+        title="Performance Comparison",
+        columns=[
+            ("Metric", "cyan"),
+            ("Baseline", "white"),
+            ("Tuned", "green"),
+            ("Change", "yellow"),
+        ],
+        rows=table_rows,
     )
 
-    console.print(table)
-
     if improvement_pct > 5:
-        console.print(f"\n[bold green]✓ Success! {improvement_pct:.1f}% improvement with actions: {action_label}[/bold green]")
+        sink.print(
+            f"\n[bold green]✓ Success! {improvement_pct:.1f}% improvement with actions: {action_label}[/bold green]"
+        )
+        run_status = "improved"
     elif improvement_pct > 0:
-        console.print(f"\n[yellow]Modest improvement ({improvement_pct:.1f}%)[/yellow]")
+        sink.print(f"\n[yellow]Modest improvement ({improvement_pct:.1f}%)[/yellow]")
+        run_status = "modest_improvement"
     else:
-        console.print(f"\n[red]No improvement or regression ({improvement_pct:.1f}%)[/red]")
+        sink.print(f"\n[red]No improvement or regression ({improvement_pct:.1f}%)[/red]")
+        run_status = "no_improvement"
+
+    _emit_tune_event(
+        event_emitter,
+        "run.finished",
+        {
+            "mode": "spawn",
+            "status": run_status,
+            "baseline_time_s": baseline_time,
+            "tuned_time_s": tuned_time,
+            "improvement_pct": improvement_pct,
+            "action_label": action_label,
+        },
+    )
 
 
 def _run_spawn_tune_loop(
@@ -1587,6 +2216,8 @@ def _run_spawn_tune_loop(
     timeout: int,
     parse_output: bool = False,
     workdir: Path | None = None,
+    sink: OutputSink | None = None,
+    event_emitter: _TuneEmitter | None = None,
 ) -> None:
     workdir_str = str(workdir) if workdir else None
     asyncio.run(
@@ -1598,6 +2229,8 @@ def _run_spawn_tune_loop(
             timeout=timeout,
             parse_output=parse_output,
             workdir=workdir_str,
+            sink=sink,
+            event_emitter=event_emitter,
         )
     )
 

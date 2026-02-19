@@ -91,6 +91,7 @@ syspilot.yaml
 config
 log
 node_modules
+ui/ratatui/target/
 
 # OpenCode
 .sisyphus
