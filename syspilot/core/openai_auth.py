@@ -35,9 +35,11 @@ def opencode_openai_auth_file() -> Path:
 
 def create_pkce_verifier_and_challenge() -> tuple[str, str]:
     verifier = base64.urlsafe_b64encode(secrets.token_bytes(64)).decode("utf-8").rstrip("=")
-    challenge = base64.urlsafe_b64encode(
-        hashlib.sha256(verifier.encode("utf-8")).digest()
-    ).decode("utf-8").rstrip("=")
+    challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("utf-8")).digest())
+        .decode("utf-8")
+        .rstrip("=")
+    )
     return verifier, challenge
 
 
@@ -138,6 +140,9 @@ def wait_for_callback_code(
         return None, False
 
     browser_opened = open_browser(authorize_url) if authorize_url else False
+    if authorize_url and not browser_opened:
+        server.server_close()
+        return None, False
 
     deadline = time.time() + max(timeout_seconds, 1)
     server.timeout = 0.25

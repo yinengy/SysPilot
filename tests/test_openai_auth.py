@@ -1,5 +1,9 @@
 from urllib.parse import parse_qs, urlparse
 
+import pytest
+
+import syspilot.core.openai_auth as openai_auth
+
 from syspilot.core.openai_auth import (
     AUTHORIZE_URL,
     CLIENT_ID,
@@ -49,3 +53,45 @@ def test_parse_authorization_input_from_compact_format():
 
 def test_default_auth_path_points_to_syspilot_directory():
     assert str(syspilot_openai_auth_file()).endswith("/.syspilot/auth/openai.json")
+
+
+def test_wait_for_callback_code_skips_wait_when_browser_cannot_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DummyServer:
+        timeout: float | None
+        handle_calls: int
+        closed: bool
+
+        def __init__(self) -> None:
+            self.timeout = None
+            self.handle_calls = 0
+            self.closed = False
+
+        def handle_request(self) -> None:
+            self.handle_calls += 1
+
+        def server_close(self) -> None:
+            self.closed = True
+
+    server = DummyServer()
+
+    def _make_server(*_args: object, **_kwargs: object) -> DummyServer:
+        return server
+
+    def _open_browser(_url: str) -> bool:
+        return False
+
+    monkeypatch.setattr(openai_auth, "HTTPServer", _make_server)
+    monkeypatch.setattr(openai_auth, "open_browser", _open_browser)
+
+    code, opened = openai_auth.wait_for_callback_code(
+        state="state123",
+        timeout_seconds=30,
+        authorize_url="https://example.com/authorize",
+    )
+
+    assert code is None
+    assert opened is False
+    assert server.handle_calls == 0
+    assert server.closed is True

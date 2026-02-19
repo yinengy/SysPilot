@@ -209,6 +209,7 @@ syspilot auth login
 ```
 
 This is implemented directly in SysPilot and does not require installing OpenCode.
+If automatic browser launch is unavailable (for example on headless SSH sessions), SysPilot now falls back to manual URL-paste flow immediately instead of waiting for callback timeout.
 
 Then configure SysPilot with provider `openai_auth`:
 
