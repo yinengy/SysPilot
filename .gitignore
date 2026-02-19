@@ -91,3 +91,6 @@ syspilot.yaml
 config
 log
 node_modules
+
+# OpenCode
+.sisyphus

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import re
 import shlex
 import subprocess
 import sys
@@ -10,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import click
+import psutil
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
@@ -52,6 +55,7 @@ def _register_default_skills(agent: SysPilotAgent) -> None:
                 "output": result.output,
                 "summary": result.summary,
                 "error": result.error,
+                "data": result.data,
             }
         
         agent.register_tool(
@@ -368,9 +372,9 @@ def manuals() -> None:
     
     # Same discovery logic as Agent
     manual_candidates = [
-        Path(__file__).parent.parent.parent / "manual",
-        Path("~/.syspilot/manual").expanduser(),
+        Path(__file__).resolve().parents[1] / "manual",
         Path("manual"),
+        Path("~/.syspilot/manual").expanduser(),
     ]
     
     manual_dir = None
@@ -422,6 +426,11 @@ def skills() -> None:
 @cli.command()
 @click.option("--pid", "-p", type=int, help="Target process ID (attach mode)")
 @click.option("--command", "-c", type=str, help="Command to run and tune (spawn mode)")
+@click.option(
+    "--workdir",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
+    help="Working directory for spawn mode command execution",
+)
 @click.option("--manual", "-m", multiple=True, help="Load specific manuals (e.g., numactl, pytorch)")
 @click.option("--max-iterations", default=5, help="Maximum tuning iterations")
 @click.option("--dry-run/--no-dry-run", default=True, help="Show changes without applying")
@@ -432,6 +441,7 @@ def tune(
     ctx: click.Context,
     pid: int | None,
     command: str | None,
+    workdir: Path | None,
     manual: tuple[str, ...],
     max_iterations: int,
     dry_run: bool,
@@ -445,7 +455,7 @@ def tune(
       --command: Spawn command, profile, get recommendations, respawn with tuning
     
     Example (spawn mode):
-      syspilot tune -c "/tmp/llama.cpp/build/bin/llama-bench -m model.gguf -p 512 -n 128" -m numactl
+      syspilot tune -c "./app --arg value" --workdir /path/to/app -m numactl
     """
     if not pid and not command:
         console.print("[red]Error: Must specify either --pid or --command[/red]")
@@ -478,7 +488,7 @@ def tune(
     _register_tuning_tools(agent, tuner)
 
     if command:
-        _run_spawn_tune_loop(agent, command, manual, max_iterations, timeout, parse_output)
+        _run_spawn_tune_loop(agent, command, manual, max_iterations, timeout, parse_output, workdir)
     else:
         assert pid is not None
         _run_attach_tune_loop(agent, manager, tuner, pid, max_iterations, dry_run)
@@ -517,15 +527,27 @@ def _run_attach_tune_loop(
         agent.stop()
 
 
-def _run_command(cmd: list[str], timeout: int) -> tuple[float, str, str, int]:
+def _run_command(
+    cmd: list[str],
+    timeout: int,
+    workdir: str | None = None,
+    env_overrides: dict[str, str] | None = None,
+) -> tuple[float, str, str, int]:
     """Run command and return (wall_time, stdout, stderr, returncode)."""
     t0 = time.monotonic()
     try:
+        env = None
+        if env_overrides:
+            env = os.environ.copy()
+            env.update({k: str(v) for k, v in env_overrides.items()})
+
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
             timeout=timeout,
+            cwd=workdir,
+            env=env,
         )
         wall = time.monotonic() - t0
         return wall, result.stdout, result.stderr, result.returncode
@@ -533,24 +555,357 @@ def _run_command(cmd: list[str], timeout: int) -> tuple[float, str, str, int]:
         return timeout, "", "Command timed out", -1
 
 
-def _parse_numactl_recommendation(response: str) -> list[str]:
-    import re
-    
-    for line in response.splitlines():
-        if "RECOMMENDED_NUMACTL:" in line:
-            val = line.split("RECOMMENDED_NUMACTL:")[-1].strip()
-            val = re.sub(r'[\*\`\#]+', '', val).strip()
-            if val.upper() not in ("NONE", ""):
-                return shlex.split(val)
-    
-    for line in response.splitlines():
-        match = re.search(r'(--interleave=\S+|--cpunodebind=\S+|--membind=\S+|--preferred=\S+|--physcpubind=\S+)', line)
-        if match:
-            flag = match.group(1)
-            flag = re.sub(r'[\*\`\#\,\.]+$', '', flag)
-            return [flag]
-    
+def _extract_json_object(text: str) -> dict[str, Any] | None:
+    candidate = text.strip()
+    if not candidate:
+        return None
+
+    try:
+        parsed = json.loads(candidate)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    match = re.search(r"\{.*\}", candidate, re.DOTALL)
+    if not match:
+        return None
+
+    try:
+        parsed = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _to_token_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return shlex.split(value)
+
+    if isinstance(value, list):
+        tokens: list[str] = []
+        for item in value:
+            token = str(item).strip()
+            if token:
+                tokens.append(token)
+        return tokens
+
     return []
+
+
+def _parse_spawn_actions(response: str) -> dict[str, Any]:
+    parsed = _extract_json_object(response)
+    if not parsed:
+        return {
+            "valid": False,
+            "error": "Agent response did not contain a valid JSON object",
+            "summary": "",
+            "manual_citation": "",
+            "evidence": [],
+            "actions": [],
+            "skipped_actions": [],
+        }
+
+    summary = str(parsed.get("summary", "")).strip()
+    manual_citation = str(parsed.get("manual_citation", "")).strip()
+    evidence_raw = parsed.get("evidence", [])
+
+    evidence: list[str] = []
+    if isinstance(evidence_raw, list):
+        for item in evidence_raw:
+            value = str(item).strip()
+            if value:
+                evidence.append(value)
+
+    actions_raw = parsed.get("actions", [])
+    if not isinstance(actions_raw, list):
+        return {
+            "valid": False,
+            "error": "Field 'actions' must be a list",
+            "summary": summary,
+            "manual_citation": manual_citation,
+            "evidence": evidence,
+            "actions": [],
+            "skipped_actions": [],
+        }
+
+    supported_types = {"numactl", "env_var", "command_prefix", "command"}
+    normalized_actions: list[dict[str, Any]] = []
+    skipped_actions: list[str] = []
+
+    for idx, action in enumerate(actions_raw):
+        if not isinstance(action, dict):
+            skipped_actions.append(f"action[{idx}] is not an object")
+            continue
+
+        config_type = str(action.get("config_type", "")).strip().lower()
+        if config_type not in supported_types:
+            skipped_actions.append(f"action[{idx}] has unsupported config_type '{config_type}'")
+            continue
+
+        parameter = str(action.get("parameter", "")).strip()
+        reason = str(action.get("reason", "")).strip()
+        action_manual_citation = str(action.get("manual_citation", manual_citation)).strip()
+
+        if "new_value" not in action:
+            skipped_actions.append(f"action[{idx}] is missing new_value")
+            continue
+
+        if config_type == "env_var" and (not parameter or "=" in parameter or " " in parameter):
+            skipped_actions.append(f"action[{idx}] has invalid env var name '{parameter}'")
+            continue
+
+        normalized_actions.append(
+            {
+                "config_type": config_type,
+                "parameter": parameter,
+                "new_value": action.get("new_value"),
+                "reason": reason,
+                "manual_citation": action_manual_citation,
+            }
+        )
+
+    if normalized_actions and (not manual_citation or not evidence):
+        return {
+            "valid": False,
+            "error": "Actionable recommendations require non-empty manual_citation and evidence",
+            "summary": summary,
+            "manual_citation": manual_citation,
+            "evidence": evidence,
+            "actions": [],
+            "skipped_actions": skipped_actions,
+        }
+
+    return {
+        "valid": True,
+        "error": "",
+        "summary": summary,
+        "manual_citation": manual_citation,
+        "evidence": evidence,
+        "actions": normalized_actions,
+        "skipped_actions": skipped_actions,
+    }
+
+
+def _build_spawn_execution_plan(
+    base_command: list[str],
+    actions: list[dict[str, Any]],
+) -> tuple[list[str], dict[str, str], list[str], list[str]]:
+    if not base_command:
+        return [], {}, [], ["base command was empty"]
+
+    prefix_tokens: list[str] = []
+    command_tokens = list(base_command)
+    command_replaced = False
+    env_overrides: dict[str, str] = {}
+    applied: list[str] = []
+    skipped: list[str] = []
+
+    for idx, action in enumerate(actions):
+        config_type = str(action.get("config_type", "")).strip().lower()
+        parameter = str(action.get("parameter", "")).strip()
+        new_value = action.get("new_value")
+
+        if config_type == "env_var":
+            if new_value is None:
+                skipped.append(f"action[{idx}] env_var '{parameter}' missing new_value")
+                continue
+            env_value = str(new_value)
+            env_overrides[parameter] = env_value
+            applied.append(f"env {parameter}={env_value}")
+            continue
+
+        tokens = _to_token_list(new_value)
+        if not tokens:
+            skipped.append(f"action[{idx}] produced no command tokens")
+            continue
+
+        if config_type == "command":
+            if command_replaced:
+                skipped.append(f"action[{idx}] additional command rewrite skipped")
+                continue
+            if Path(tokens[0]).name != Path(base_command[0]).name:
+                skipped.append(
+                    f"action[{idx}] command replacement must keep executable '{base_command[0]}'"
+                )
+                continue
+            command_tokens = tokens
+            command_replaced = True
+            applied.append(f"command {' '.join(tokens)}")
+            continue
+
+        if config_type == "numactl":
+            if tokens[0] == "numactl":
+                tokens = tokens[1:]
+            if not tokens:
+                skipped.append(f"action[{idx}] numactl flags were empty")
+                continue
+            prefix_tokens.extend(["numactl", *tokens])
+            applied.append(f"numactl {' '.join(tokens)}")
+            continue
+
+        if config_type == "command_prefix":
+            prefix_tokens.extend(tokens)
+            applied.append(f"prefix {' '.join(tokens)}")
+            continue
+
+        skipped.append(f"action[{idx}] unsupported at execution time")
+
+    return prefix_tokens + command_tokens, env_overrides, applied, skipped
+
+
+def _command_key(
+    command_parts: list[str],
+    env_overrides: dict[str, str],
+) -> tuple[tuple[str, ...], tuple[tuple[str, str], ...]]:
+    return (
+        tuple(command_parts),
+        tuple(sorted((k, str(v)) for k, v in env_overrides.items())),
+    )
+
+
+def _build_spawn_candidates(
+    base_command: list[str],
+    actions: list[dict[str, Any]],
+    max_candidates: int,
+) -> list[dict[str, Any]]:
+    if max_candidates < 1:
+        return []
+
+    shared_actions: list[dict[str, Any]] = []
+    command_actions: list[dict[str, Any]] = []
+
+    for action in actions:
+        if str(action.get("config_type", "")).strip().lower() == "command":
+            command_actions.append(action)
+        else:
+            shared_actions.append(action)
+
+    candidate_action_sets: list[list[dict[str, Any]]] = []
+    if command_actions:
+        candidate_action_sets.extend([shared_actions + [action] for action in command_actions])
+    elif shared_actions:
+        candidate_action_sets.append(shared_actions)
+
+    candidates: list[dict[str, Any]] = []
+    seen: set[tuple[tuple[str, ...], tuple[tuple[str, str], ...]]] = set()
+
+    for action_set in candidate_action_sets:
+        tuned_cmd, env_overrides, applied_actions, skipped_actions = _build_spawn_execution_plan(
+            base_command,
+            action_set,
+        )
+        if not tuned_cmd:
+            continue
+
+        if tuned_cmd == base_command and not env_overrides:
+            continue
+
+        key = _command_key(tuned_cmd, env_overrides)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        label = ", ".join(applied_actions) if applied_actions else "(none)"
+        candidates.append(
+            {
+                "cmd": tuned_cmd,
+                "env_overrides": env_overrides,
+                "label": label,
+                "skipped_actions": skipped_actions,
+            }
+        )
+        if len(candidates) >= max_candidates:
+            break
+
+    return candidates
+
+
+def _discover_related_processes(root_pid: int, max_targets: int = 4) -> dict[str, Any]:
+    if max_targets < 1:
+        max_targets = 1
+
+    try:
+        root_proc = psutil.Process(root_pid)
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return {
+            "root_pid": root_pid,
+            "target_pids": [root_pid],
+            "primary_pid": root_pid,
+            "workers": [],
+            "all_processes": [],
+        }
+
+    processes = [root_proc]
+    try:
+        processes.extend(root_proc.children(recursive=True))
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        pass
+
+    unique_by_pid: dict[int, psutil.Process] = {}
+    for proc in processes:
+        unique_by_pid[proc.pid] = proc
+    processes = list(unique_by_pid.values())
+
+    for proc in processes:
+        try:
+            proc.cpu_percent(interval=None)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+    time.sleep(0.2)
+
+    snapshots: list[dict[str, Any]] = []
+    for proc in processes:
+        try:
+            with proc.oneshot():
+                snapshots.append(
+                    {
+                        "pid": proc.pid,
+                        "ppid": proc.ppid(),
+                        "name": proc.name(),
+                        "status": proc.status(),
+                        "cpu_percent": float(proc.cpu_percent(interval=None)),
+                        "rss_mb": round(proc.memory_info().rss / (1024 * 1024), 3),
+                        "cmdline": proc.cmdline(),
+                    }
+                )
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+    snapshots.sort(
+        key=lambda item: (
+            float(item.get("cpu_percent", 0.0)),
+            float(item.get("rss_mb", 0.0)),
+        ),
+        reverse=True,
+    )
+
+    worker_snapshots = [item for item in snapshots if int(item.get("pid", -1)) != root_pid]
+    heavy_workers = [item for item in worker_snapshots if float(item.get("cpu_percent", 0.0)) >= 1.0]
+    selected_workers = heavy_workers[: max_targets - 1] if heavy_workers else worker_snapshots[: max_targets - 1]
+
+    target_pids = [root_pid]
+    target_pids.extend(int(item.get("pid", root_pid)) for item in selected_workers)
+
+    deduped_targets: list[int] = []
+    seen_targets: set[int] = set()
+    for target_pid in target_pids:
+        if target_pid in seen_targets:
+            continue
+        seen_targets.add(target_pid)
+        deduped_targets.append(target_pid)
+
+    primary_pid = selected_workers[0]["pid"] if selected_workers else root_pid
+
+    return {
+        "root_pid": root_pid,
+        "target_pids": deduped_targets,
+        "primary_pid": int(primary_pid),
+        "workers": selected_workers,
+        "all_processes": snapshots,
+    }
 
 
 async def _extract_metrics_from_output(
@@ -604,44 +959,178 @@ async def _run_live_profiling_pipeline(
     agent: SysPilotAgent,
     command_parts: list[str],
     timeout: int,
+    workdir: str | None = None,
+    env_overrides: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     started_at = time.monotonic()
+    env = None
+    if env_overrides:
+        env = os.environ.copy()
+        env.update({k: str(v) for k, v in env_overrides.items()})
+
     proc = await asyncio.create_subprocess_exec(
         *command_parts,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        cwd=workdir,
+        env=env,
     )
     pid = proc.pid
     agent.context.target_pid = pid
 
     await asyncio.sleep(1.0)
 
-    profiling_prompt = f"""Run an evidence-first profiling pipeline for PID {pid}.
+    process_targets = _discover_related_processes(pid, max_targets=4)
+    target_pids = process_targets["target_pids"]
+    primary_pid = process_targets["primary_pid"]
 
-You MUST use tools in this order:
-1) collect_profile with pid={pid} and collectors ["cpu", "memory", "process", "numa"]
-2) skill_ebpf action="check_availability"
-3) if bpftrace is available, run skill_ebpf action="run_template" with template_name="numa_page_migrations" pid={pid} duration=2
-   otherwise, if BCC is available, run skill_ebpf action="run_template" with template_name="bcc_syscall_latency" pid={pid} duration=2
-4) skill_data_processor action="capture" with command="cat /proc/{pid}/numa_maps"
-5) skill_data_processor action="process" on that capture using a Python script that summarizes per-node pages and dominant node
+    tools_used: list[str] = []
+    key_findings: list[str] = []
+    per_pid_runtime_maps: dict[str, dict[str, Any]] = {}
+    collect_summaries: list[str] = []
+    agent_tool_calls = 0
 
-Then return ONLY one JSON object with keys:
-- pipeline_used: true
-- tools_used: list of tool names invoked
-- collect_profile_summary: short string
-- ebpf_summary: short string
-- refined_numa_maps: object with per_node_pages and dominant_node
-- key_findings: list of concise findings
+    for target_pid in target_pids:
+        try:
+            collect_result = await agent._execute_tool(
+                "collect_profile",
+                {
+                    "collectors": ["cpu", "memory", "process", "numa"],
+                    "pid": target_pid,
+                },
+            )
+            agent_tool_calls += 1
+            tools_used.append(f"collect_profile:{target_pid}")
 
-Do not recommend tuning flags yet. This step is profiling-only.
-"""
+            if isinstance(collect_result, dict):
+                summaries: list[str] = []
+                for collector_name, payload in collect_result.items():
+                    if isinstance(payload, dict) and "summary" in payload:
+                        summaries.append(f"{collector_name}: {payload['summary']}")
+                if summaries:
+                    collect_summaries.append(f"pid {target_pid}: " + " | ".join(summaries))
+        except Exception as e:
+            key_findings.append(f"collect_profile failed for pid {target_pid}: {e}")
 
-    tool_count_before = sum(1 for m in agent._message_history if m.role == "tool")
-    profiling_response = await agent.step(profiling_prompt)
-    profiling_text = profiling_response.content
-    tool_count_after = sum(1 for m in agent._message_history if m.role == "tool")
-    agent_tool_calls = tool_count_after - tool_count_before
+    ebpf_summary = ""
+    ebpf_data: dict[str, Any] = {}
+    try:
+        ebpf_check = await agent._execute_tool("skill_ebpf", {"action": "check_availability"})
+        agent_tool_calls += 1
+        tools_used.append("skill_ebpf.check_availability")
+        if isinstance(ebpf_check, dict):
+            ebpf_summary = str(ebpf_check.get("summary", ""))
+            raw_data = ebpf_check.get("data", {})
+            if isinstance(raw_data, dict):
+                ebpf_data = raw_data
+
+        template_name = ""
+        if ebpf_data.get("bpftrace_available"):
+            template_name = "syscall_count"
+        elif ebpf_data.get("bcc_available"):
+            template_name = "bcc_syscall_latency"
+
+        if template_name:
+            ebpf_profile = await agent._execute_tool(
+                "skill_ebpf",
+                {
+                    "action": "run_template",
+                    "template_name": template_name,
+                    "pid": primary_pid,
+                    "duration": 2,
+                },
+            )
+            agent_tool_calls += 1
+            tools_used.append(f"skill_ebpf.run_template:{template_name}:{primary_pid}")
+            if isinstance(ebpf_profile, dict):
+                profile_summary = str(ebpf_profile.get("summary", "")).strip()
+                profile_error = str(ebpf_profile.get("error", "")).strip()
+                if profile_summary:
+                    ebpf_summary = profile_summary
+                if profile_error:
+                    ebpf_summary = f"{ebpf_summary} ({profile_error})" if ebpf_summary else profile_error
+
+                profile_success = bool(ebpf_profile.get("success", False))
+                if not profile_success and template_name == "syscall_count" and ebpf_data.get("bcc_available"):
+                    fallback_profile = await agent._execute_tool(
+                        "skill_ebpf",
+                        {
+                            "action": "run_template",
+                            "template_name": "bcc_syscall_latency",
+                            "pid": primary_pid,
+                            "duration": 2,
+                        },
+                    )
+                    agent_tool_calls += 1
+                    tools_used.append(f"skill_ebpf.run_template:bcc_syscall_latency:{primary_pid}")
+                    if isinstance(fallback_profile, dict):
+                        fallback_summary = str(fallback_profile.get("summary", "")).strip()
+                        fallback_error = str(fallback_profile.get("error", "")).strip()
+                        fallback_text = fallback_summary
+                        if fallback_error:
+                            fallback_text = f"{fallback_text} ({fallback_error})" if fallback_text else fallback_error
+                        if fallback_text:
+                            ebpf_summary = f"{ebpf_summary} | fallback: {fallback_text}"
+    except Exception as e:
+        key_findings.append(f"ebpf profiling failed: {e}")
+
+    processor_script = (
+        "import json\n"
+        "data = {}\n"
+        "line_count = 0\n"
+        "for line in raw_data.splitlines():\n"
+        "    line_count += 1\n"
+        "    if ':' not in line:\n"
+        "        continue\n"
+        "    key, value = line.split(':', 1)\n"
+        "    key = key.strip()\n"
+        "    value = value.strip()\n"
+        "    if key in {'Name', 'State', 'Threads', 'Cpus_allowed_list', 'Mems_allowed_list', 'VmRSS', 'voluntary_ctxt_switches', 'nonvoluntary_ctxt_switches'}:\n"
+        "        data[key] = value\n"
+        "data['line_count'] = line_count\n"
+        "print(json.dumps(data))\n"
+    )
+
+    for target_pid in target_pids:
+        try:
+            capture_result = await agent._execute_tool(
+                "skill_data_processor",
+                {
+                    "action": "capture",
+                    "command": f"cat /proc/{target_pid}/status",
+                },
+            )
+            agent_tool_calls += 1
+            tools_used.append(f"skill_data_processor.capture:{target_pid}")
+
+            capture_id = None
+            if isinstance(capture_result, dict):
+                capture_data = capture_result.get("data", {})
+                if isinstance(capture_data, dict):
+                    capture_id = capture_data.get("capture_id")
+
+            if capture_id:
+                process_result = await agent._execute_tool(
+                    "skill_data_processor",
+                    {
+                        "action": "process",
+                        "capture_id": capture_id,
+                        "script": processor_script,
+                    },
+                )
+                agent_tool_calls += 1
+                tools_used.append(f"skill_data_processor.process:{target_pid}")
+
+                if isinstance(process_result, dict):
+                    output = process_result.get("output", "")
+                    try:
+                        refined = json.loads(output.strip()) if output else {}
+                        if isinstance(refined, dict):
+                            per_pid_runtime_maps[str(target_pid)] = refined
+                    except json.JSONDecodeError:
+                        key_findings.append(f"status parsing returned invalid JSON for pid {target_pid}")
+        except Exception as e:
+            key_findings.append(f"dynamic status pipeline failed for pid {target_pid}: {e}")
 
     try:
         stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
@@ -657,140 +1146,35 @@ Do not recommend tuning flags yet. This step is profiling-only.
 
     wall = time.monotonic() - started_at
 
-    profiling_json: dict[str, Any] = {}
-    try:
-        import re
-        m = re.search(r"\{.*\}", profiling_text, re.DOTALL)
-        if m:
-            parsed = json.loads(m.group())
-            if isinstance(parsed, dict):
-                profiling_json = parsed
-    except Exception:
-        profiling_json = {}
+    workers = process_targets.get("workers", [])
+    if workers:
+        heavy_workers = ", ".join(
+            f"pid {worker.get('pid')} cpu={worker.get('cpu_percent')}% rss={worker.get('rss_mb')}MB"
+            for worker in workers[:3]
+        )
+        key_findings.append(f"worker-heavy profiling targets: {heavy_workers}")
 
-    if agent_tool_calls <= 0 or not profiling_json:
-        tools_used: list[str] = []
-        fallback_json: dict[str, Any] = {
-            "pipeline_used": True,
-            "tools_used": tools_used,
-            "collect_profile_summary": "",
-            "ebpf_summary": "",
-            "refined_numa_maps": {},
-            "key_findings": [],
-        }
+    if not key_findings:
+        key_findings.append("profiling pipeline executed")
 
-        try:
-            collect_result = await agent._execute_tool(
-                "collect_profile",
-                {
-                    "collectors": ["cpu", "memory", "process", "numa"],
-                    "pid": pid,
-                },
-            )
-            tools_used.append("collect_profile")
-            if isinstance(collect_result, dict):
-                summaries = []
-                for collector_name, payload in collect_result.items():
-                    if isinstance(payload, dict) and "summary" in payload:
-                        summaries.append(f"{collector_name}: {payload['summary']}")
-                fallback_json["collect_profile_summary"] = " | ".join(summaries)[:1200]
+    refined_runtime_maps = per_pid_runtime_maps.get(str(primary_pid), {})
+    if not refined_runtime_maps and per_pid_runtime_maps:
+        first_key = next(iter(per_pid_runtime_maps))
+        refined_runtime_maps = per_pid_runtime_maps[first_key]
 
-                numa_payload = collect_result.get("numa", {})
-                if isinstance(numa_payload, dict):
-                    numa_data = numa_payload.get("data", {})
-                    if isinstance(numa_data, dict):
-                        maps = numa_data.get("numa_maps_summary", {})
-                        if isinstance(maps, dict):
-                            fallback_json["refined_numa_maps"] = maps
-        except Exception as e:
-            fallback_json["key_findings"].append(f"collect_profile failed: {e}")
-
-        try:
-            ebpf_check = await agent._execute_tool("skill_ebpf", {"action": "check_availability"})
-            tools_used.append("skill_ebpf.check_availability")
-            if isinstance(ebpf_check, dict):
-                fallback_json["ebpf_summary"] = ebpf_check.get("summary", "")
-                ebpf_data = ebpf_check.get("data", {})
-                if isinstance(ebpf_data, dict):
-                    template_name = None
-                    if ebpf_data.get("bpftrace_available"):
-                        template_name = "numa_page_migrations"
-                    elif ebpf_data.get("bcc_available"):
-                        template_name = "bcc_syscall_latency"
-
-                    if template_name:
-                        ebpf_profile = await agent._execute_tool(
-                            "skill_ebpf",
-                            {
-                                "action": "run_template",
-                                "template_name": template_name,
-                                "pid": pid,
-                                "duration": 2,
-                            },
-                        )
-                        tools_used.append(f"skill_ebpf.run_template:{template_name}")
-                        if isinstance(ebpf_profile, dict) and ebpf_profile.get("summary"):
-                            fallback_json["ebpf_summary"] = ebpf_profile["summary"]
-        except Exception as e:
-            fallback_json["key_findings"].append(f"ebpf profiling failed: {e}")
-
-        try:
-            capture_result = await agent._execute_tool(
-                "skill_data_processor",
-                {
-                    "action": "capture",
-                    "command": f"cat /proc/{pid}/numa_maps",
-                },
-            )
-            tools_used.append("skill_data_processor.capture")
-
-            capture_id = None
-            if isinstance(capture_result, dict):
-                data = capture_result.get("data", {})
-                if isinstance(data, dict):
-                    capture_id = data.get("capture_id")
-
-            if capture_id:
-                processor_script = (
-                    "import json, re\n"
-                    "totals = {}\n"
-                    "line_count = 0\n"
-                    "for line in raw_data.splitlines():\n"
-                    "    line_count += 1\n"
-                    "    for m in re.finditer(r'N(\\d+)=(\\d+)', line):\n"
-                    "        node = f'node{m.group(1)}'\n"
-                    "        totals[node] = totals.get(node, 0) + int(m.group(2))\n"
-                    "dominant = max(totals, key=totals.get) if totals else None\n"
-                    "print(json.dumps({'line_count': line_count, 'per_node_pages': totals, 'dominant_node': dominant}))\n"
-                )
-                process_result = await agent._execute_tool(
-                    "skill_data_processor",
-                    {
-                        "action": "process",
-                        "capture_id": capture_id,
-                        "script": processor_script,
-                    },
-                )
-                tools_used.append("skill_data_processor.process")
-                if isinstance(process_result, dict):
-                    output = process_result.get("output", "")
-                    try:
-                        refined = json.loads(output.strip()) if output else {}
-                        if isinstance(refined, dict):
-                            fallback_json["refined_numa_maps"] = refined
-                    except Exception:
-                        fallback_json["key_findings"].append("dynamic processing output was not valid JSON")
-        except Exception as e:
-            fallback_json["key_findings"].append(f"dynamic script pipeline failed: {e}")
-
-        if not fallback_json["key_findings"]:
-            fallback_json["key_findings"] = [
-                "profiling pipeline executed",
-                "raw numa_maps processed through dynamic script",
-            ]
-
-        profiling_json = fallback_json
-        profiling_text = json.dumps(fallback_json)
+    profiling_json: dict[str, Any] = {
+        "pipeline_used": True,
+        "tools_used": tools_used,
+        "target_pids": target_pids,
+        "primary_pid": primary_pid,
+        "collect_profile_summary": " | ".join(collect_summaries)[:1800],
+        "ebpf_summary": ebpf_summary,
+        "refined_runtime_maps": refined_runtime_maps,
+        "per_pid_runtime_maps": per_pid_runtime_maps,
+        "process_tree_targets": process_targets,
+        "key_findings": key_findings,
+    }
+    profiling_text = json.dumps(profiling_json)
 
     return {
         "pid": pid,
@@ -811,149 +1195,352 @@ async def _run_spawn_tune_loop_async(
     max_iterations: int,
     timeout: int,
     parse_output: bool = False,
+    workdir: str | None = None,
 ) -> None:
     cmd_parts = shlex.split(command)
-    
+    if not cmd_parts:
+        console.print("[red]Spawn command is empty after parsing[/red]")
+        return
+
     console.print(Panel(
         f"[bold green]SysPilot Tuning Engine (Spawn Mode)[/bold green]\n"
         f"Command: {command}\n"
+        f"Workdir: {workdir or '(current)'}\n"
         f"Max Iterations: {max_iterations}\n"
         f"Timeout: {timeout}s\n"
         f"Manuals: {len(agent.context.loaded_manuals)} loaded",
         title="Starting",
     ))
 
-    console.print("\n[bold cyan]Step 1: Baseline Run (no tuning)[/bold cyan]")
-    baseline_time, baseline_stdout, baseline_stderr, baseline_rc = _run_command(cmd_parts, timeout)
-    
+    manual_content = ""
+    if manuals and agent.context.loaded_manuals:
+        for manual_name in manuals:
+            if manual_name in agent.context.loaded_manuals:
+                manual_content += f"\n\n### {manual_name} Manual (excerpt)\n"
+                manual_content += agent.context.loaded_manuals[manual_name][:3000]
+
+    console.print("\n[bold cyan]Step 1: Initial Baseline Run[/bold cyan]")
+    baseline_time, baseline_stdout, baseline_stderr, baseline_rc = _run_command(
+        cmd_parts,
+        timeout,
+        workdir=workdir,
+    )
     if baseline_rc != 0:
         console.print(f"[red]Baseline run failed (rc={baseline_rc})[/red]")
         console.print(f"[dim]stderr: {baseline_stderr[:500]}[/dim]")
         return
-    
+
     console.print(f"  Wall time: {baseline_time:.2f}s")
     console.print(f"  Output: {len(baseline_stdout)} bytes")
 
-    console.print("\n[bold cyan]Step 2: Live Profiling Pipeline (tools + eBPF + dynamic scripts)[/bold cyan]")
-    profiling_artifacts = await _run_live_profiling_pipeline(agent, cmd_parts, timeout)
-    console.print(f"  Profiling run PID: {profiling_artifacts['pid']}")
-    console.print(f"  Profiling run wall time: {profiling_artifacts['wall_time']:.2f}s")
-    console.print(f"  Agent tool calls used: {profiling_artifacts.get('tool_calls_used', 0)}")
-    if profiling_artifacts["returncode"] != 0:
-        console.print(f"  [yellow]Profiling command return code: {profiling_artifacts['returncode']}[/yellow]")
+    initial_command_parts = list(cmd_parts)
+    current_command_parts = list(cmd_parts)
+    current_env_overrides: dict[str, str] = {}
+    current_time = baseline_time
+    current_stdout = baseline_stdout
+    current_stderr = baseline_stderr
 
-    profiling_text = profiling_artifacts.get("profiling_text", "")
-    profiling_json = profiling_artifacts.get("profiling_json", {})
+    best_time = baseline_time
+    best_stdout = baseline_stdout
+    best_stderr = baseline_stderr
+    best_label = "(none)"
+    best_command_parts = list(cmd_parts)
+    best_env_overrides: dict[str, str] = {}
 
-    if profiling_json:
-        console.print(f"  Refined profiling JSON: {profiling_json}")
-    else:
-        snippet = profiling_text[:500] + ("..." if len(profiling_text) > 500 else "")
-        console.print(f"  Refined profiling summary: {snippet}")
+    seen_trials: set[tuple[tuple[str, ...], tuple[tuple[str, str], ...]]] = {
+        _command_key(current_command_parts, current_env_overrides)
+    }
+    iteration_summaries: list[str] = []
+    stagnation_iterations = 0
+    convergence_patience = 2
+    min_improvement_pct = 1.0
 
-    console.print("\n[bold cyan]Step 3: Agent Tuning Analysis[/bold cyan]")
-    
-    manual_content = ""
-    if manuals and agent.context.loaded_manuals:
-        for m in manuals:
-            if m in agent.context.loaded_manuals:
-                manual_content += f"\n\n### {m} Manual (excerpt)\n"
-                manual_content += agent.context.loaded_manuals[m][:3000]
-    
-    prompt = f"""Analyze this NUMA workload and recommend numactl settings. Be CONCISE.
+    for iteration in range(1, max_iterations + 1):
+        console.print(f"\n[bold cyan]Step 2.{iteration}: Iteration Profiling[/bold cyan]")
+        profiling_artifacts = await _run_live_profiling_pipeline(
+            agent,
+            current_command_parts,
+            timeout,
+            workdir=workdir,
+            env_overrides=current_env_overrides,
+        )
 
-## Command
-{command}
+        console.print(f"  Profiling run PID: {profiling_artifacts['pid']}")
+        console.print(f"  Profiling run wall time: {profiling_artifacts['wall_time']:.2f}s")
+        console.print(f"  Agent tool calls used: {profiling_artifacts.get('tool_calls_used', 0)}")
+        if profiling_artifacts["returncode"] != 0:
+            console.print(f"  [yellow]Profiling command return code: {profiling_artifacts['returncode']}[/yellow]")
 
-This is llama-bench (memory bandwidth-bound LLM inference).
+        profiling_text = profiling_artifacts.get("profiling_text", "")
+        profiling_json = profiling_artifacts.get("profiling_json", {})
 
-## Baseline: {baseline_time:.2f}s wall time
+        if profiling_json:
+            console.print(f"  Refined profiling JSON: {profiling_json}")
+        else:
+            snippet = profiling_text[:500] + ("..." if len(profiling_text) > 500 else "")
+            console.print(f"  Refined profiling summary: {snippet}")
 
-## Refined Profiling Evidence (from tools/eBPF/dynamic scripts)
+        target_pids = profiling_json.get("target_pids", []) if isinstance(profiling_json, dict) else []
+        primary_pid = profiling_json.get("primary_pid") if isinstance(profiling_json, dict) else None
+        if target_pids:
+            console.print(f"  Profiling targets: {target_pids} (primary={primary_pid})")
+
+        history_text = "\n".join(iteration_summaries[-6:]) if iteration_summaries else "(none)"
+        tried_commands = [list(parts) for parts, _ in list(seen_trials)[-12:]]
+
+        console.print(f"\n[bold cyan]Step 3.{iteration}: Agent Tuning Analysis[/bold cyan]")
+        prompt = f"""Analyze this spawn-mode workload and propose the next manual-driven optimization actions.
+
+## Current Command
+{' '.join(current_command_parts)}
+
+## Current Wall Time
+{current_time:.2f}s
+
+## Current Program Output (excerpt)
+{current_stdout[:2500] if current_stdout else "(no stdout)"}
+
+## Prior Iterations (latest first)
+{history_text}
+
+## Already Tried Command Forms
+{json.dumps(tried_commands)}
+
+## Refined Profiling Evidence
 {json.dumps(profiling_json, indent=2) if profiling_json else profiling_text[:2500]}
 
 ## Loaded Manual Evidence
 {manual_content if manual_content else "(No manual content provided)"}
 
-## Key Facts
-- LLM inference is memory bandwidth-bound (reads full model weights per token)
-- 24 threads span both NUMA nodes (12 per node)
-- Use the profiling evidence above to determine whether first-touch imbalance is present
+## Rules
+- Use only profiling evidence and loaded manuals.
+- Re-profile is performed each iteration; propose next-step actions for this iteration.
+- Avoid recommending exact commands already tried.
+- If evidence is insufficient, return no actions.
+- Return JSON only (no markdown, no prose).
+- Provide up to {max_iterations} candidates ordered best-first.
 
-## Manual Guidance
-Use the loaded manual content above and cite one concrete policy rule in your rationale.
-
-## YOUR RESPONSE (keep it SHORT)
-
-1. One sentence: why this workload needs NUMA tuning
-2. One sentence: which manual rule you used
-3. One line with your recommendation:
-
-RECOMMENDED_NUMACTL: --interleave=all
+## JSON Schema
+{{
+  "summary": "short decision summary",
+  "manual_citation": "one concrete rule from loaded manual(s)",
+  "evidence": ["concise evidence item", "..."],
+  "actions": [
+    {{
+      "config_type": "numactl | env_var | command_prefix | command",
+      "parameter": "required only for env_var",
+      "new_value": "string or token list; for command use full rewritten command",
+      "reason": "why this action follows from evidence",
+      "manual_citation": "manual rule supporting this action"
+    }}
+  ]
+}}
 """
 
-    response = await agent.step(prompt)
-    console.print(f"\n[dim]{response.content}[/dim]")
-    
-    numactl_flags = _parse_numactl_recommendation(response.content)
-    
-    if not numactl_flags:
-        console.print("\n[yellow]Agent recommended no NUMA tuning[/yellow]")
-        return
+        response = await agent.step(prompt)
+        console.print(f"\n[dim]{response.content}[/dim]")
 
-    console.print(f"\n[bold cyan]Step 4: Tuned Run (numactl {' '.join(numactl_flags)})[/bold cyan]")
-    tuned_cmd = ["numactl"] + numactl_flags + cmd_parts
-    console.print(f"  Running: {' '.join(tuned_cmd)}")
-    
-    tuned_time, tuned_stdout, tuned_stderr, tuned_rc = _run_command(tuned_cmd, timeout)
-    
-    if tuned_rc != 0:
-        console.print(f"[red]Tuned run failed (rc={tuned_rc})[/red]")
-        console.print(f"[dim]stderr: {tuned_stderr[:500]}[/dim]")
-        return
-    
-    console.print(f"  Wall time: {tuned_time:.2f}s")
+        recommendation = _parse_spawn_actions(response.content)
+        if not recommendation["valid"]:
+            console.print("\n[yellow]Agent recommendation was not actionable[/yellow]")
+            console.print(f"  Reason: {recommendation['error']}")
+            break
+
+        if recommendation["skipped_actions"]:
+            console.print("  Skipped invalid actions:")
+            for item in recommendation["skipped_actions"]:
+                console.print(f"    - {item}")
+
+        summary = recommendation["summary"] or "No actionable tuning recommendation returned."
+        console.print(f"  Decision summary: {summary}")
+        if recommendation["manual_citation"]:
+            console.print(f"  Manual citation: {recommendation['manual_citation']}")
+        if recommendation["evidence"]:
+            for evidence_item in recommendation["evidence"][:5]:
+                console.print(f"  Evidence: {evidence_item}")
+
+        actions = recommendation["actions"]
+        if not actions:
+            console.print("\n[yellow]Agent recommended no actionable tuning[/yellow]")
+            break
+
+        candidate_plans = _build_spawn_candidates(
+            current_command_parts,
+            actions,
+            max_candidates=max_iterations,
+        )
+        candidate_plans = [
+            candidate
+            for candidate in candidate_plans
+            if _command_key(candidate["cmd"], candidate["env_overrides"]) not in seen_trials
+        ]
+        if not candidate_plans:
+            console.print("\n[yellow]No new executable tuning actions remained after validation[/yellow]")
+            stagnation_iterations += 1
+            if stagnation_iterations >= convergence_patience:
+                break
+            continue
+
+        console.print(
+            f"\n[bold cyan]Step 4.{iteration}: Candidate Search ({len(candidate_plans)} plan(s), max {max_iterations})[/bold cyan]"
+        )
+
+        iteration_best_time = current_time
+        iteration_best_stdout = current_stdout
+        iteration_best_stderr = current_stderr
+        iteration_best_label = "(none)"
+        iteration_best_cmd = list(current_command_parts)
+        iteration_best_env = dict(current_env_overrides)
+        successful_trials = 0
+        non_improving_trials = 0
+
+        for idx, candidate in enumerate(candidate_plans, start=1):
+            trial_cmd = candidate["cmd"]
+            trial_env = candidate["env_overrides"]
+            trial_label = candidate["label"]
+            skipped_execution_actions = candidate["skipped_actions"]
+
+            seen_trials.add(_command_key(trial_cmd, trial_env))
+
+            console.print(f"  Trial {idx}/{len(candidate_plans)}: {trial_label}")
+            console.print(f"    Running: {' '.join(trial_cmd)}")
+            if trial_env:
+                console.print(f"    Environment overrides: {trial_env}")
+            if skipped_execution_actions:
+                for item in skipped_execution_actions:
+                    console.print(f"    Skipped: {item}")
+
+            trial_time, trial_stdout, trial_stderr, trial_rc = _run_command(
+                trial_cmd,
+                timeout,
+                workdir=workdir,
+                env_overrides=trial_env,
+            )
+
+            if trial_rc != 0:
+                console.print(f"    [yellow]Trial failed (rc={trial_rc})[/yellow]")
+                console.print(f"    [dim]stderr: {trial_stderr[:240]}[/dim]")
+                non_improving_trials += 1
+                if non_improving_trials >= convergence_patience and successful_trials > 0:
+                    console.print("  Candidate search converged after non-improving trials")
+                    break
+                continue
+
+            successful_trials += 1
+            current_change_pct = ((current_time - trial_time) / current_time) * 100 if current_time > 0 else 0
+            console.print(f"    Wall time: {trial_time:.2f}s ({current_change_pct:+.1f}% vs current)")
+
+            if trial_time < iteration_best_time:
+                iteration_best_time = trial_time
+                iteration_best_stdout = trial_stdout
+                iteration_best_stderr = trial_stderr
+                iteration_best_label = trial_label
+                iteration_best_cmd = trial_cmd
+                iteration_best_env = trial_env
+                if current_change_pct >= min_improvement_pct:
+                    non_improving_trials = 0
+                else:
+                    non_improving_trials += 1
+            else:
+                non_improving_trials += 1
+
+            if non_improving_trials >= convergence_patience and successful_trials > 0:
+                console.print("  Candidate search converged after non-improving trials")
+                break
+
+        if successful_trials == 0:
+            console.print("  [yellow]No candidate completed successfully in this iteration[/yellow]")
+            stagnation_iterations += 1
+            if stagnation_iterations >= convergence_patience:
+                break
+            continue
+
+        if iteration_best_time < current_time:
+            improvement_pct = ((current_time - iteration_best_time) / current_time) * 100 if current_time > 0 else 0
+            current_time = iteration_best_time
+            current_stdout = iteration_best_stdout
+            current_stderr = iteration_best_stderr
+            current_command_parts = list(iteration_best_cmd)
+            current_env_overrides = dict(iteration_best_env)
+            console.print(f"  Accepted candidate: {iteration_best_label}")
+            console.print(f"  New current wall time: {current_time:.2f}s ({improvement_pct:+.1f}% vs previous)")
+
+            if current_time < best_time:
+                best_time = current_time
+                best_stdout = current_stdout
+                best_stderr = current_stderr
+                best_label = iteration_best_label
+                best_command_parts = list(current_command_parts)
+                best_env_overrides = dict(current_env_overrides)
+
+            if improvement_pct >= min_improvement_pct:
+                stagnation_iterations = 0
+            else:
+                stagnation_iterations += 1
+        else:
+            console.print("  No candidate outperformed the current configuration")
+            stagnation_iterations += 1
+
+        iteration_summaries.append(
+            f"iter {iteration}: cmd={' '.join(current_command_parts)} wall={current_time:.2f}s"
+        )
+
+        if stagnation_iterations >= convergence_patience:
+            console.print("  Iterative loop converged after non-improving iterations")
+            break
+
+    action_label = best_label
+    tuned_time = best_time
+    tuned_stdout = best_stdout
+    tuned_stderr = best_stderr
+    if action_label == "(none)":
+        console.print("  No tuned candidate outperformed baseline; keeping baseline configuration")
+    else:
+        console.print(f"  Selected best candidate: {action_label}")
+        console.print(f"  Best command: {' '.join(best_command_parts)}")
+        if best_env_overrides:
+            console.print(f"  Best environment overrides: {best_env_overrides}")
 
     baseline_metrics: dict[str, Any] = {}
     tuned_metrics: dict[str, Any] = {}
-    
+
     if parse_output:
         console.print("\n[bold cyan]Step 5: Extracting Metrics from Output[/bold cyan]")
         console.print("  Parsing baseline output...")
         baseline_metrics = await _extract_metrics_from_output(
             agent,
             baseline_stdout,
-            "baseline run without numactl",
+            "baseline run without tuning actions",
         )
         console.print(f"  Baseline metrics: {baseline_metrics}")
-        
+
         console.print("  Parsing tuned output...")
         tuned_metrics = await _extract_metrics_from_output(
             agent,
             tuned_stdout,
-            f"tuned run with numactl {' '.join(numactl_flags)}",
+            f"tuned run with actions: {action_label}",
         )
         console.print(f"  Tuned metrics: {tuned_metrics}")
 
     comparison_step = 6 if parse_output else 5
     console.print(f"\n[bold cyan]Step {comparison_step}: Results Comparison[/bold cyan]")
-    
+
     speedup = baseline_time / tuned_time if tuned_time > 0 else 0
     improvement_pct = ((baseline_time - tuned_time) / baseline_time) * 100 if baseline_time > 0 else 0
-    
+
     table = Table(title="Performance Comparison")
     table.add_column("Metric", style="cyan")
     table.add_column("Baseline", style="white")
     table.add_column("Tuned", style="green")
     table.add_column("Change", style="yellow")
-    
+
     table.add_row(
         "Wall Time",
         f"{baseline_time:.2f}s",
         f"{tuned_time:.2f}s",
         f"{improvement_pct:+.1f}% ({speedup:.2f}x)"
     )
-    
+
     if parse_output and baseline_metrics and tuned_metrics:
         if not baseline_metrics.get("no_metrics") and not tuned_metrics.get("no_metrics"):
             all_keys = set(baseline_metrics.keys()) | set(tuned_metrics.keys())
@@ -971,21 +1558,21 @@ RECOMMENDED_NUMACTL: --interleave=all
                 
                 base_str = f"{base_val}" if base_val is not None else "-"
                 tuned_str = f"{tuned_val}" if tuned_val is not None else "-"
-                
+
                 display_key = key.replace("_", " ").title()
                 table.add_row(display_key, base_str, tuned_str, change_str)
-    
+
     table.add_row(
-        "numactl flags",
+        "Applied actions",
         "(none)",
-        " ".join(numactl_flags),
+        action_label,
         ""
     )
-    
+
     console.print(table)
-    
+
     if improvement_pct > 5:
-        console.print(f"\n[bold green]✓ Success! {improvement_pct:.1f}% improvement with numactl {' '.join(numactl_flags)}[/bold green]")
+        console.print(f"\n[bold green]✓ Success! {improvement_pct:.1f}% improvement with actions: {action_label}[/bold green]")
     elif improvement_pct > 0:
         console.print(f"\n[yellow]Modest improvement ({improvement_pct:.1f}%)[/yellow]")
     else:
@@ -999,7 +1586,9 @@ def _run_spawn_tune_loop(
     max_iterations: int,
     timeout: int,
     parse_output: bool = False,
+    workdir: Path | None = None,
 ) -> None:
+    workdir_str = str(workdir) if workdir else None
     asyncio.run(
         _run_spawn_tune_loop_async(
             agent=agent,
@@ -1008,6 +1597,7 @@ def _run_spawn_tune_loop(
             max_iterations=max_iterations,
             timeout=timeout,
             parse_output=parse_output,
+            workdir=workdir_str,
         )
     )
 

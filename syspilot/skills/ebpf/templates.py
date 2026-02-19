@@ -16,12 +16,9 @@ tracepoint:raw_syscalls:sys_enter
 
 interval:s:{duration}
 {{
-    exit();
-}}
-
-END
-{{
     print(@syscalls);
+    clear(@syscalls);
+    exit();
 }}
 '''
 

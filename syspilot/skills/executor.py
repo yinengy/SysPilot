@@ -134,11 +134,31 @@ class ScriptExecutor:
             script_path = f.name
         
         try:
-            cmd = ["sudo", "-n", "bpftrace", script_path]
-            return await self._run_command(
-                cmd,
-                script,
-                timeout_override=duration_seconds + 5,
+            timeout_budget = duration_seconds + 5
+            command_attempts: list[list[str]] = [["bpftrace", script_path]]
+            if os.geteuid() != 0:
+                command_attempts.append(["sudo", "-n", "bpftrace", script_path])
+
+            failures: list[str] = []
+            for cmd in command_attempts:
+                result = await self._run_command(
+                    cmd,
+                    script,
+                    timeout_override=timeout_budget,
+                )
+                if result.success:
+                    return result
+
+                cmd_label = " ".join(cmd[:3])
+                err = result.error or result.summary
+                failures.append(f"{cmd_label}: {err}")
+
+            return SkillResult(
+                success=False,
+                output="",
+                summary="bpftrace execution failed",
+                execution_time_seconds=timeout_budget,
+                error=" | ".join(failures),
             )
         finally:
             os.unlink(script_path)

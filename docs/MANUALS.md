@@ -39,6 +39,9 @@ syspilot monitor --pid 1234 --manual numactl --manual pytorch
 
 # Analyze with manual loaded
 syspilot analyze 1234 --manual numactl
+
+# Spawn-mode tuning with working directory + manual policy
+syspilot tune --command "./parallel_vlc ../config/transformer.json 0-11 12-23" --workdir /home/yyan/vlc/examples/Torch/build --manual vlcs --parse-output
 ```
 
 ### Programmatic Usage
@@ -82,6 +85,12 @@ Deep learning framework optimization for CPU/GPU training.
 - Target detection: `torch` imports, `libtorch.so`, CUDA libraries
 - Key resources: GPU devices, CPU threads, VRAM, DataLoader workers
 - Tuning: OMP_NUM_THREADS, batch size, mixed precision, multi-GPU
+
+### VLCs
+Virtual Library Contexts CPU-affinity tuning for manager/worker process workloads.
+- Target detection: `parallel_vlc` command and core-range arguments (e.g., `0-11 12-23`)
+- Key resources: disjoint core partitions, worker-process hotspots, NUMA locality
+- Tuning: iterative core-range rebalancing with process-tree-aware profiling evidence
 
 ## Creating New Manuals
 
@@ -175,6 +184,16 @@ You have access to the following technical manuals for tuning:
 - Agent uses summaries, not full content, in tool calls
 - Future: Auto-discovery will load manuals dynamically
 
+### Spawn-Mode Manual Policy Loop
+
+In spawn mode, manuals are used as policy constraints each iteration:
+
+1. Run current configuration and collect profiling evidence
+2. Re-profile process tree (parent + heavy worker children)
+3. Ask agent for structured manual-cited actions (`summary`, `manual_citation`, `evidence`, `actions`)
+4. Execute bounded candidate search
+5. Keep best-so-far config and stop by convergence or max iterations
+
 ## Future Enhancements
 
 ### Planned Features
@@ -200,6 +219,18 @@ You have access to the following technical manuals for tuning:
    - Expected improvement benchmarks
 
 ## Testing
+
+### Profiling and eBPF Test Strategy
+
+- Keep profiling/eBPF tests deterministic and runnable without root privileges.
+- Mock tooling availability checks (`bpftrace`, `bcc`) and executor methods instead of invoking kernel probes in unit tests.
+- Cover bpftrace-unavailable paths explicitly (explicit BCC templates and non-BCC failure behavior), plus hard-failure paths (missing PID, invalid script, dangerous script patterns).
+- Cover profiling manager edge cases such as unknown collector names, collector failures, and empty result summarization.
+
+```bash
+# Focused profiling/eBPF unit tests
+pytest tests/test_profiling_manager.py tests/test_ebpf_skill.py
+```
 
 ```bash
 # Test manual loading

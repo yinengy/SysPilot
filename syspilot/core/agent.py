@@ -162,12 +162,11 @@ Available tools will be provided for each interaction."""
         
         # Robust manual directory discovery
         manual_candidates = [
-            # Source tree: syspilot/core/agent.py -> ../../../manual
-            Path(__file__).parent.parent.parent / "manual",
-            # User config: ~/.syspilot/manual
-            Path("~/.syspilot/manual").expanduser(),
+            Path(__file__).resolve().parents[2] / "manual",
             # Current directory
             Path("manual"),
+            # User config: ~/.syspilot/manual
+            Path("~/.syspilot/manual").expanduser(),
         ]
         
         self._manual_dir = manual_candidates[0] # Default

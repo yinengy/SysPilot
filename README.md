@@ -64,6 +64,10 @@ If eBPF profiling fails with `Operation not permitted`, run SysPilot with elevat
 sudo -E python3 -m syspilot.cli tune --command "..." --manual numactl
 ```
 
+Runtime behavior notes:
+- SysPilot tries direct `bpftrace` first, then `sudo -n bpftrace` if needed.
+- If privileges are still insufficient, SysPilot records explicit eBPF errors and continues with non-eBPF profiling evidence.
+
 For stricter hosts, check kernel controls:
 
 ```bash
@@ -113,16 +117,18 @@ Use this when you want SysPilot to manage the entire lifecycle: launch, baseline
 ```bash
 syspilot tune \
   --command "/path/to/app --args" \
+  --workdir /path/to/working/dir \
   --manual numactl \
   --max-iterations 5 \
   --parse-output
 ```
 
 **Features:**
-- Runs baseline benchmark automatically
-- Runs evidence-first profiling pipeline (collectors + eBPF + dynamic script refinement)
-- Agent analyzes performance and recommends flags (e.g., `numactl --interleave=all`)
-- Runs tuned command and compares results side-by-side
+- Runs initial baseline benchmark automatically
+- Runs iterative loop: re-profile current config -> generate new actions -> run candidate(s) -> accept best improvement
+- Uses process-tree-aware profiling (manager + heavy child workers) to avoid parent-only blind spots
+- Stops by convergence (non-improving iteration patience) or `--max-iterations`
+- Compares baseline vs best-found configuration side-by-side
 - `--parse-output` uses LLM to extract app-specific metrics (e.g., tokens/sec) from stdout
 
 ## Debugging LLM Conversations
