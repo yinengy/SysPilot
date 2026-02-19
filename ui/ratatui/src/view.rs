@@ -13,10 +13,15 @@ use crate::{
 
 pub fn draw(f: &mut Frame, state: &AppState) {
     let area = f.area();
+    let frame = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(area);
+
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
-        .split(area);
+        .split(frame[0]);
 
     let top_cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -51,6 +56,18 @@ pub fn draw(f: &mut Frame, state: &AppState) {
 
     render_decision_and_details(f, top_cols[2], state);
     render_logs(f, bottom[1], state);
+    render_footer(f, frame[1]);
+}
+
+fn render_footer(f: &mut Frame, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let text =
+        "F2: toggle mouse capture (disable for drag-select copy) | Ctrl+C: exit";
+    let p = Paragraph::new(text).style(Style::default().fg(Color::Gray));
+    f.render_widget(p, area);
 }
 
 fn panel_block(title: &str, focused: bool) -> Block {
