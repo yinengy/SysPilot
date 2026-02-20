@@ -79,7 +79,7 @@ def test_plain_mode_emits_key_markers_for_spawn_flow() -> None:
 
     assert result.exit_code == 0
     assert "SysPilot Tuning Engine (Spawn Mode)" in result.output
-    assert "Step 1: Initial Baseline Run" in result.output
+    assert "Round 0 Step 0: Initial Baseline Run" in result.output
     assert "Agent recommended no actionable tuning" in result.output
     assert "Performance Comparison" in result.output
     assert "Applied actions" in result.output

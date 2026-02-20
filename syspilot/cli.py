@@ -786,6 +786,8 @@ def _run_attach_tune_loop(
         title="Starting",
     )
 
+    loaded_manual_names = sorted(agent.context.loaded_manuals.keys())
+
     _emit_tune_event(
         event_emitter,
         "run.started",
@@ -794,6 +796,7 @@ def _run_attach_tune_loop(
             "pid": pid,
             "max_iterations": max_iterations,
             "dry_run": dry_run,
+            "loaded_manuals": loaded_manual_names,
         },
     )
     _emit_tune_event(
@@ -865,6 +868,27 @@ def _run_command(
         return wall, result.stdout, result.stderr, result.returncode
     except subprocess.TimeoutExpired:
         return timeout, "", "Command timed out", -1
+
+
+def _event_output_payload(
+    stdout: str,
+    stderr: str,
+    max_chars: int = 8000,
+) -> dict[str, Any]:
+    stdout_text = stdout or ""
+    stderr_text = stderr or ""
+
+    stdout_truncated = len(stdout_text) > max_chars
+    stderr_truncated = len(stderr_text) > max_chars
+
+    return {
+        "stdout": stdout_text[:max_chars],
+        "stderr": stderr_text[:max_chars],
+        "stdout_len": len(stdout_text),
+        "stderr_len": len(stderr_text),
+        "stdout_truncated": stdout_truncated,
+        "stderr_truncated": stderr_truncated,
+    }
 
 
 def _extract_json_object(text: str) -> dict[str, Any] | None:
@@ -1546,6 +1570,8 @@ async def _run_spawn_tune_loop_async(
         sink.print("[red]Spawn command is empty after parsing[/red]")
         return
 
+    loaded_manual_names = sorted(agent.context.loaded_manuals.keys())
+
     _emit_tune_event(
         event_emitter,
         "run.started",
@@ -1555,6 +1581,7 @@ async def _run_spawn_tune_loop_async(
             "workdir": workdir or "",
             "max_iterations": max_iterations,
             "timeout_s": timeout,
+            "loaded_manuals": loaded_manual_names,
         },
     )
 
@@ -1575,16 +1602,44 @@ async def _run_spawn_tune_loop_async(
                 manual_content += f"\n\n### {manual_name} Manual (excerpt)\n"
                 manual_content += agent.context.loaded_manuals[manual_name][:3000]
 
-    sink.print("\n[bold cyan]Step 1: Initial Baseline Run[/bold cyan]")
+    sink.print("\n[bold cyan]Round 0 Step 0: Initial Baseline Run[/bold cyan]")
     _emit_tune_event(
         event_emitter,
         "phase.started",
+        {"mode": "spawn", "phase": "spawn.baseline"},
+    )
+    _emit_tune_event(
+        event_emitter,
+        "exec.started",
         {"mode": "spawn", "phase": "spawn.baseline"},
     )
     baseline_time, baseline_stdout, baseline_stderr, baseline_rc = _run_command(
         cmd_parts,
         timeout,
         workdir=workdir,
+    )
+    _emit_tune_event(
+        event_emitter,
+        "exec.finished",
+        {
+            "mode": "spawn",
+            "phase": "spawn.baseline",
+            "returncode": baseline_rc,
+            "wall_time_s": baseline_time,
+        },
+    )
+    baseline_status = "success" if baseline_rc == 0 else "failed"
+    _emit_tune_event(
+        event_emitter,
+        "baseline.finished",
+        {
+            "mode": "spawn",
+            "phase": "spawn.baseline",
+            "status": baseline_status,
+            "returncode": baseline_rc,
+            "wall_time_s": baseline_time,
+            **_event_output_payload(baseline_stdout, baseline_stderr),
+        },
     )
     if baseline_rc != 0:
         _emit_tune_event(
@@ -1656,13 +1711,42 @@ async def _run_spawn_tune_loop_async(
                 "iteration": iteration,
             },
         )
-        sink.print(f"\n[bold cyan]Step 2.{iteration}: Iteration Profiling[/bold cyan]")
+        sink.print(f"\n[bold cyan]Round {iteration} Step 1: Iteration Profiling[/bold cyan]")
+        _emit_tune_event(
+            event_emitter,
+            "profile.started",
+            {
+                "mode": "spawn",
+                "phase": "spawn.profiling",
+                "iteration": iteration,
+            },
+        )
+        _emit_tune_event(
+            event_emitter,
+            "exec.started",
+            {
+                "mode": "spawn",
+                "phase": "spawn.profiling",
+                "iteration": iteration,
+            },
+        )
         profiling_artifacts = await _run_live_profiling_pipeline(
             agent,
             current_command_parts,
             timeout,
             workdir=workdir,
             env_overrides=current_env_overrides,
+        )
+        _emit_tune_event(
+            event_emitter,
+            "exec.finished",
+            {
+                "mode": "spawn",
+                "phase": "spawn.profiling",
+                "iteration": iteration,
+                "returncode": profiling_artifacts["returncode"],
+                "wall_time_s": profiling_artifacts["wall_time"],
+            },
         )
 
         sink.print(f"  Profiling run PID: {profiling_artifacts['pid']}")
@@ -1696,6 +1780,22 @@ async def _run_spawn_tune_loop_async(
                 },
             },
         )
+        _emit_tune_event(
+            event_emitter,
+            "profile.finished",
+            {
+                "mode": "spawn",
+                "phase": "spawn.profiling",
+                "iteration": iteration,
+                "status": ("success" if profiling_artifacts["returncode"] == 0 else "failed"),
+                "returncode": profiling_artifacts["returncode"],
+                "wall_time_s": profiling_artifacts["wall_time"],
+                **_event_output_payload(
+                    profiling_artifacts.get("stdout", ""),
+                    profiling_artifacts.get("stderr", ""),
+                ),
+            },
+        )
         if profiling_artifacts["returncode"] != 0:
             sink.print(
                 f"  [yellow]Profiling command return code: {profiling_artifacts['returncode']}[/yellow]"
@@ -1719,7 +1819,7 @@ async def _run_spawn_tune_loop_async(
         history_text = "\n".join(iteration_summaries[-6:]) if iteration_summaries else "(none)"
         tried_commands = [list(parts) for parts, _ in list(seen_trials)[-12:]]
 
-        sink.print(f"\n[bold cyan]Step 3.{iteration}: Agent Tuning Analysis[/bold cyan]")
+        sink.print(f"\n[bold cyan]Round {iteration} Step 2: Agent Tuning Analysis[/bold cyan]")
         prompt = f"""Analyze this spawn-mode workload and propose the next manual-driven optimization actions.
 
 ## Current Command
@@ -1889,7 +1989,7 @@ async def _run_spawn_tune_loop_async(
             continue
 
         sink.print(
-            f"\n[bold cyan]Step 4.{iteration}: Candidate Search ({len(candidate_plans)} plan(s), max {max_iterations})[/bold cyan]"
+            f"\n[bold cyan]Round {iteration} Step 3: Candidate Search ({len(candidate_plans)} plan(s), max {max_iterations})[/bold cyan]"
         )
 
         iteration_best_time = current_time
@@ -1929,11 +2029,51 @@ async def _run_spawn_tune_loop_async(
                 for item in skipped_execution_actions:
                     sink.print(f"    Skipped: {item}")
 
+            _emit_tune_event(
+                event_emitter,
+                "exec.started",
+                {
+                    "mode": "spawn",
+                    "phase": "spawn.candidate",
+                    "iteration": iteration,
+                    "candidate_id": idx,
+                    "label": trial_label,
+                },
+            )
             trial_time, trial_stdout, trial_stderr, trial_rc = _run_command(
                 trial_cmd,
                 timeout,
                 workdir=workdir,
                 env_overrides=trial_env,
+            )
+            _emit_tune_event(
+                event_emitter,
+                "exec.finished",
+                {
+                    "mode": "spawn",
+                    "phase": "spawn.candidate",
+                    "iteration": iteration,
+                    "candidate_id": idx,
+                    "label": trial_label,
+                    "returncode": trial_rc,
+                    "wall_time_s": trial_time,
+                },
+            )
+            _emit_tune_event(
+                event_emitter,
+                "progress.finished",
+                {
+                    "mode": "spawn",
+                    "phase": "spawn.candidate_search",
+                    "iteration": iteration,
+                    "current_trial": idx,
+                    "total_trials": len(candidate_plans),
+                    "candidate_id": idx,
+                    "candidate_label": trial_label,
+                    "returncode": trial_rc,
+                    "wall_time_s": trial_time,
+                    **_event_output_payload(trial_stdout, trial_stderr),
+                },
             )
 
             if trial_rc != 0:
@@ -2101,7 +2241,7 @@ async def _run_spawn_tune_loop_async(
     tuned_metrics: dict[str, Any] = {}
 
     if parse_output:
-        sink.print("\n[bold cyan]Step 5: Extracting Metrics from Output[/bold cyan]")
+        sink.print("\n[bold cyan]Round final: Extracting Metrics from Output[/bold cyan]")
         sink.print("  Parsing baseline output...")
         baseline_metrics = await _extract_metrics_from_output(
             agent,
@@ -2118,8 +2258,7 @@ async def _run_spawn_tune_loop_async(
         )
         sink.print(f"  Tuned metrics: {tuned_metrics}")
 
-    comparison_step = 6 if parse_output else 5
-    sink.print(f"\n[bold cyan]Step {comparison_step}: Results Comparison[/bold cyan]")
+    sink.print("\n[bold cyan]Round final Step 4: Results Comparison[/bold cyan]")
 
     speedup = baseline_time / tuned_time if tuned_time > 0 else 0
     improvement_pct = (

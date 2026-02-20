@@ -95,32 +95,15 @@ fn render_log_line(env: &TuneEventEnvelope) -> LogLine {
 
 fn is_run_phase_event(env: &TuneEventEnvelope) -> bool {
     let event_name = env.event.as_str();
-    if event_name.starts_with("run.") {
-        return true;
-    }
-
-    if event_name == "profile.snapshot"
+    event_name == "run.started"
+        || event_name == "baseline.finished"
+        || event_name == "profile.started"
+        || event_name == "profile.finished"
         || event_name == "recommendation.ready"
         || event_name == "progress.update"
+        || event_name == "progress.finished"
         || event_name == "candidate.evaluated"
         || event_name == "result.comparison"
-    {
-        return true;
-    }
-
-    if !event_name.starts_with("phase.") {
-        return false;
-    }
-
-    let phase_name = env
-        .payload
-        .get("phase")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    phase_name.contains("baseline")
-        || phase_name.contains("iteration")
-        || phase_name.contains("run")
-        || phase_name.contains("attach")
 }
 
 fn is_candidate_or_evidence_event(env: &TuneEventEnvelope) -> bool {

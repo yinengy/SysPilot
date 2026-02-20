@@ -45,6 +45,15 @@ fn reducer_ingests_fixture_and_updates_state() {
     assert_eq!(state.parse_error_count, 0);
     assert_eq!(state.all_events.len(), 9);
     assert!(state.progress_events.len() >= 3);
+    let progress_events: Vec<&str> = state.progress_events.iter().map(|event| event.event.as_str()).collect();
+    assert_eq!(
+        progress_events,
+        vec![
+            "run.started",
+            "recommendation.ready",
+            "candidate.evaluated",
+        ]
+    );
     assert!(state.action_events.len() >= 2);
     assert!(state.evidence_events.len() >= 2);
     assert!(state.log_lines.len() >= 1);

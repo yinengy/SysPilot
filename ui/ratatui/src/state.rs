@@ -104,6 +104,11 @@ pub struct AppState {
     pub selected_actions: usize,
     pub selected_evidence: usize,
     pub selected_logs: usize,
+    pub profiling_scroll_start: usize,
+    pub actions_scroll_start: usize,
+    pub evidence_scroll_start: usize,
+    pub progress_scroll_lines: usize,
+    pub logs_scroll_lines: usize,
     pub details_scroll: usize,
 
     pub parse_error_count: u64,
@@ -128,6 +133,11 @@ impl AppState {
             selected_actions: 0,
             selected_evidence: 0,
             selected_logs: 0,
+            profiling_scroll_start: 0,
+            actions_scroll_start: 0,
+            evidence_scroll_start: 0,
+            progress_scroll_lines: 0,
+            logs_scroll_lines: 0,
             details_scroll: 0,
             parse_error_count: 0,
         }

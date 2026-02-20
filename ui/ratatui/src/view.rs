@@ -1,3 +1,9 @@
+use std::{
+    collections::{HashMap, HashSet},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use chrono::DateTime;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -26,8 +32,8 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     let top_cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
+            Constraint::Percentage(33),
+            Constraint::Percentage(17),
             Constraint::Percentage(50),
         ])
         .split(rows[0]);
@@ -86,18 +92,7 @@ fn render_loop_state(f: &mut Frame, area: Rect, state: &AppState) {
     let focused = state.focused == Panel::Overview;
     let mut lines = Vec::new();
 
-    lines.push(Line::from(format!(
-        "run_id: {}",
-        state.run_id.as_deref().unwrap_or("-")
-    )));
-    lines.push(Line::from(format!(
-        "schema: {}",
-        state.schema_version.as_deref().unwrap_or("-")
-    )));
-
     let run_started = latest_by_name(state, "run.started");
-    let run_finished = latest_by_name(state, "run.finished");
-    let phase_event = latest_phase_event(state);
 
     if let Some(started) = run_started {
         lines.push(Line::from(format!(
@@ -106,19 +101,26 @@ fn render_loop_state(f: &mut Frame, area: Rect, state: &AppState) {
         )));
         let cmd = payload_str(started, "command").unwrap_or("-");
         lines.push(Line::from(format!("cmd: {}", truncate(cmd, 52))));
-    }
 
-    if let Some(phase) = phase_event {
-        let phase_name = payload_str(phase, "phase").unwrap_or("-");
-        lines.push(Line::from(format!("phase: {}", phase_name)));
-    }
-
-    if let Some(done) = run_finished {
-        let status = payload_str(done, "status").unwrap_or("-");
-        lines.push(Line::from(format!("state: {status}")));
+        let loaded_manuals = payload_str_list(started, "loaded_manuals");
+        if loaded_manuals.is_empty() {
+            lines.push(Line::from("manuals: (none)"));
+        } else {
+            lines.push(Line::from(format!(
+                "manuals: {}",
+                truncate(&loaded_manuals.join(", "), 52)
+            )));
+        }
     } else {
-        lines.push(Line::from("state: running"));
+        lines.push(Line::from("mode: -"));
+        lines.push(Line::from("cmd: -"));
+        lines.push(Line::from("manuals: -"));
     }
+
+    let app_running = app_execution_running(state);
+    let spinner = app_execution_spinner(app_running);
+    let state_label = if app_running { "running" } else { "idle" };
+    lines.push(Line::from(format!("state: {spinner} {state_label}")));
 
     let p = Paragraph::new(Text::from(lines))
         .block(panel_block("Loop State", focused))
@@ -128,74 +130,84 @@ fn render_loop_state(f: &mut Frame, area: Rect, state: &AppState) {
 
 fn render_run_phase(f: &mut Frame, area: Rect, state: &AppState) {
     let focused = state.focused == Panel::Progress;
-    let mut lines = Vec::new();
+    let block = panel_block("Run Phase", focused);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
 
-    if let Some(started) = latest_by_name(state, "run.started") {
-        let cmd = payload_str(started, "command").unwrap_or("-");
-        lines.push(Line::from(format!("running: {}", truncate(cmd, 66))));
-        let timeout = payload_u64(started, "timeout_s").unwrap_or(0);
-        if timeout > 0 {
-            lines.push(Line::from(format!("timeout: {timeout}s")));
-        }
+    if inner.height == 0 || inner.width == 0 {
+        return;
     }
 
-    if let Some(base) = latest_baseline_result(state) {
-        if let Some(wall) = payload_f64(base, "wall_time_s") {
-            lines.push(Line::from(format!("baseline wall: {wall:.2}s")));
-        }
+    let content_width = inner.width.max(1) as usize;
+    let header_messages = run_phase_header_messages(state);
+    let header_rows = header_messages
+        .iter()
+        .map(|message| wrapped_line_count(message, content_width))
+        .sum::<usize>()
+        .min(inner.height as usize);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(header_rows as u16), Constraint::Min(0)])
+        .split(inner);
+
+    if header_rows > 0 {
+        let header_lines: Vec<Line<'static>> = header_messages.into_iter().map(Line::from).collect();
+        let header = Paragraph::new(Text::from(header_lines)).wrap(Wrap { trim: false });
+        f.render_widget(header, layout[0]);
     }
 
-    if let Some(result) = latest_by_name(state, "result.comparison") {
-        let baseline = payload_f64(result, "baseline_time_s").unwrap_or(0.0);
-        let tuned = payload_f64(result, "tuned_time_s").unwrap_or(0.0);
-        let improvement = payload_f64(result, "improvement_pct").unwrap_or(0.0);
-        lines.push(Line::from(format!("result: {baseline:.2}s -> {tuned:.2}s")));
-        lines.push(Line::from(format!("improvement: {improvement:+.1}%")));
+    let entries_area = layout[1];
+    if entries_area.height == 0 || entries_area.width == 0 {
+        return;
     }
 
-    if let Some((round, stage)) = current_round_and_stage(state) {
-        lines.push(Line::from(format!("current: round {round} {stage}")));
-    }
+    let entry_messages = run_phase_entry_messages(state);
+    let mut entry_lines = Vec::new();
 
-    lines.push(Line::from("-"));
-
-    let max_rows = area.height.saturating_sub(2) as usize;
-    let reserved = lines.len();
-    let body_rows = max_rows.saturating_sub(reserved);
-    let len = state.progress_events.len();
-    let (start, end) = visible_window(len, state.selected_progress, body_rows);
-
-    if len == 0 {
-        lines.push(Line::from("(no run events)"));
+    if entry_messages.is_empty() {
+        entry_lines.push(Line::from("(no run events)"));
     } else {
-        for (i, event) in state
-            .progress_events
-            .iter()
-            .enumerate()
-            .skip(start)
-            .take(end - start)
-        {
-            let selected = i == state.selected_progress;
+        for (index, message) in entry_messages.iter().enumerate() {
+            let selected = index == state.selected_progress;
             let style = if selected {
                 Style::default().add_modifier(Modifier::REVERSED)
             } else {
                 Style::default()
             };
+            entry_lines.push(Line::styled(message.clone(), style));
+        }
+    }
 
+    let entry_width = entries_area.width.max(1) as usize;
+    let max_scroll = max_wrapped_scroll_lines(&entry_messages, entry_width, entries_area.height as usize);
+    let scroll_y = state
+        .progress_scroll_lines
+        .min(max_scroll)
+        .min(u16::MAX as usize) as u16;
+
+    let entries = Paragraph::new(Text::from(entry_lines))
+        .wrap(Wrap { trim: false })
+        .scroll((scroll_y, 0));
+    f.render_widget(entries, entries_area);
+}
+
+pub(crate) fn run_phase_header_messages(_state: &AppState) -> Vec<String> {
+    Vec::new()
+}
+
+pub(crate) fn run_phase_entry_messages(state: &AppState) -> Vec<String> {
+    state
+        .progress_events
+        .iter()
+        .map(|event| {
             let mut suffix = String::new();
             if let Some(status) = payload_str(event, "status") {
                 suffix = format!(" [{status}]");
             }
-            if let Some(wall_time_s) = event_wall_time_s(event) {
-                suffix.push_str(&format!(" ({wall_time_s:.2}s)"));
-            }
-            lines.push(Line::styled(format!("{}{}", run_event_label(event), suffix), style));
-        }
-    }
-
-    let p = Paragraph::new(Text::from(lines))
-        .block(panel_block("Run Phase", focused));
-    f.render_widget(p, area);
+            format!("{}{}", run_event_label(event), suffix)
+        })
+        .collect()
 }
 
 fn render_profiling_phase(f: &mut Frame, area: Rect, state: &AppState) {
@@ -207,7 +219,8 @@ fn render_profiling_phase(f: &mut Frame, area: Rect, state: &AppState) {
     } else {
         let max_rows = area.height.saturating_sub(2) as usize;
         let len = state.profiling_events.len();
-        let (start, end) = visible_window(len, state.selected_profiling, max_rows);
+        let start = clamped_index_window_start(state.profiling_scroll_start, len, max_rows);
+        let end = (start + max_rows).min(len);
 
         for (idx, snapshot) in state
             .profiling_events
@@ -261,7 +274,8 @@ fn render_analysis_phase(f: &mut Frame, area: Rect, state: &AppState) {
     let reserved = lines.len();
     let body_rows = max_rows.saturating_sub(reserved);
     let len = state.action_events.len();
-    let (start, end) = visible_window(len, state.selected_actions, body_rows);
+    let start = clamped_index_window_start(state.actions_scroll_start, len, body_rows);
+    let end = (start + body_rows).min(len);
 
     if len == 0 {
         lines.push(Line::from("(no analysis events)"));
@@ -343,7 +357,14 @@ fn render_candidate_phase(f: &mut Frame, area: Rect, state: &AppState) {
 
     let mut legend_lines = Vec::new();
     let legend_rows = sections[1].height as usize;
-    let (start, end) = visible_window(runs.len(), state.selected_evidence, legend_rows);
+    let start = clamped_index_window_start(state.evidence_scroll_start, runs.len(), legend_rows);
+    let end = (start + legend_rows).min(runs.len());
+    let baseline_wall = runs
+        .iter()
+        .find(|run| run.round == 0)
+        .map(|run| run.wall_time_s)
+        .or_else(|| runs.first().map(|run| run.wall_time_s))
+        .unwrap_or(0.0);
     for idx in start..end {
         let run = &runs[idx];
         let selected = idx == state.selected_evidence;
@@ -351,12 +372,19 @@ fn render_candidate_phase(f: &mut Frame, area: Rect, state: &AppState) {
         if selected {
             style = style.add_modifier(Modifier::REVERSED);
         }
+        let improvement_pct = improvement_pct_vs_baseline(run.wall_time_s, baseline_wall);
+        let status_suffix = run
+            .profiling_status
+            .map(|status| format!(" | {status}"))
+            .unwrap_or_default();
         legend_lines.push(Line::styled(
             format!(
-                "S{idx} {:.2}s | round {} | {}",
+                "S{idx} {:.2}s | {:+.1}% | round {} c{}{}",
                 run.wall_time_s,
+                improvement_pct,
                 run.round,
-                truncate(&run.cmd_diff, 34)
+                run.candidate_id,
+                status_suffix
             ),
             style,
         ));
@@ -372,12 +400,15 @@ fn render_candidate_phase(f: &mut Frame, area: Rect, state: &AppState) {
 #[derive(Debug, Clone)]
 struct CandidateRunEntry {
     wall_time_s: f64,
-    cmd_diff: String,
     round: u64,
+    candidate_id: u64,
+    profiling_status: Option<&'static str>,
 }
 
 fn candidate_run_entries(state: &AppState) -> Vec<CandidateRunEntry> {
     let mut runs = Vec::new();
+    let selected_candidates = selected_candidates_for_profiling(state);
+    let (profiling_in_progress_round, completed_profiling_rounds) = profiling_state(state);
 
     for event in state.evidence_events.iter() {
         if event.event == "phase.finished" {
@@ -386,13 +417,17 @@ fn candidate_run_entries(state: &AppState) -> Vec<CandidateRunEntry> {
                 continue;
             }
             if let Some(wall_time_s) = payload_f64(event, "wall_time_s") {
-                let cmd_diff = payload_str(event, "cmd_diff")
-                    .unwrap_or("baseline")
-                    .to_string();
                 runs.push(CandidateRunEntry {
                     wall_time_s,
-                    cmd_diff,
                     round: 0,
+                    candidate_id: 0,
+                    profiling_status: candidate_profiling_status(
+                        0,
+                        None,
+                        &selected_candidates,
+                        profiling_in_progress_round,
+                        &completed_profiling_rounds,
+                    ),
                 });
             }
             continue;
@@ -400,14 +435,19 @@ fn candidate_run_entries(state: &AppState) -> Vec<CandidateRunEntry> {
 
         if event.event == "candidate.evaluated" {
             if let Some(wall_time_s) = payload_f64(event, "wall_time_s") {
-                let cmd_diff = payload_str(event, "cmd_diff")
-                    .or_else(|| payload_str(event, "label"))
-                    .unwrap_or("(candidate)")
-                    .to_string();
+                let round = payload_u64(event, "iteration").unwrap_or(0);
+                let candidate_id = payload_u64(event, "candidate_id");
                 runs.push(CandidateRunEntry {
                     wall_time_s,
-                    cmd_diff,
-                    round: payload_u64(event, "iteration").unwrap_or(0),
+                    round,
+                    candidate_id: candidate_id.unwrap_or(0),
+                    profiling_status: candidate_profiling_status(
+                        round,
+                        candidate_id,
+                        &selected_candidates,
+                        profiling_in_progress_round,
+                        &completed_profiling_rounds,
+                    ),
                 });
             }
         }
@@ -428,6 +468,122 @@ fn candidate_bar_style(round: u64) -> Style {
     }
 }
 
+fn improvement_pct_vs_baseline(wall_time_s: f64, baseline_wall_time_s: f64) -> f64 {
+    if baseline_wall_time_s <= 0.0 {
+        return 0.0;
+    }
+    ((baseline_wall_time_s - wall_time_s) / baseline_wall_time_s) * 100.0
+}
+
+fn selected_candidates_for_profiling(state: &AppState) -> HashMap<u64, u64> {
+    let mut selected = HashMap::new();
+    for event in state.all_events.iter() {
+        if event.event != "candidate.evaluated" {
+            continue;
+        }
+        if payload_str(event, "verdict") != Some("improved") {
+            continue;
+        }
+
+        let round = payload_u64(event, "iteration").unwrap_or(0);
+        let candidate_id = payload_u64(event, "candidate_id").unwrap_or(0);
+        if round > 0 && candidate_id > 0 {
+            selected.insert(round, candidate_id);
+        }
+    }
+    selected
+}
+
+fn profiling_state(state: &AppState) -> (Option<u64>, HashSet<u64>) {
+    let mut completed_rounds = HashSet::new();
+    for event in state.all_events.iter() {
+        if event.event != "profile.finished" {
+            continue;
+        }
+        if let Some(round) = payload_u64(event, "iteration") {
+            completed_rounds.insert(round);
+        }
+    }
+
+    if completed_rounds.is_empty() {
+        for event in state.all_events.iter() {
+            if event.event != "profile.snapshot" {
+                continue;
+            }
+            if let Some(round) = payload_u64(event, "iteration") {
+                completed_rounds.insert(round);
+            }
+        }
+    }
+
+    let mut active_round = state
+        .all_events
+        .iter()
+        .rev()
+        .find(|event| event.event == "profile.started" || event.event == "profile.finished")
+        .and_then(|event| {
+            if event.event == "profile.started" {
+                payload_u64(event, "iteration")
+            } else {
+                None
+            }
+        });
+
+    if active_round.is_none() {
+        active_round = state
+            .all_events
+            .iter()
+            .rev()
+            .find(|event| {
+                (event.event == "exec.started" || event.event == "exec.finished")
+                    && payload_str(event, "phase") == Some("spawn.profiling")
+            })
+            .and_then(|event| {
+                if event.event == "exec.started" {
+                    payload_u64(event, "iteration")
+                } else {
+                    None
+                }
+            });
+    }
+
+    (active_round, completed_rounds)
+}
+
+fn candidate_profiling_status(
+    round: u64,
+    candidate_id: Option<u64>,
+    selected_candidates: &HashMap<u64, u64>,
+    profiling_in_progress_round: Option<u64>,
+    completed_profiling_rounds: &HashSet<u64>,
+) -> Option<&'static str> {
+    if round == 0 {
+        if profiling_in_progress_round == Some(1) {
+            return Some("under profiling");
+        }
+        return Some("selected for profiling");
+    }
+
+    let candidate_id = candidate_id?;
+    if candidate_id == 0 {
+        return None;
+    }
+
+    let selected_candidate_id = selected_candidates.get(&round)?;
+    if *selected_candidate_id != candidate_id {
+        return None;
+    }
+
+    let next_round = round + 1;
+    if profiling_in_progress_round == Some(next_round) {
+        return Some("under profiling");
+    }
+    if completed_profiling_rounds.contains(&next_round) {
+        return Some("selected for profiling");
+    }
+    None
+}
+
 fn render_decision_and_details(f: &mut Frame, area: Rect, state: &AppState) {
     let focused = state.focused == Panel::Details;
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -446,13 +602,18 @@ fn render_decision_and_details(f: &mut Frame, area: Rect, state: &AppState) {
             }
         } else {
             if is_progress_event(state, env) {
-                lines.push(Line::from(format!("step: {}", run_event_label(env))));
+                lines.push(Line::from(format!("timeline: {}", run_event_label(env))));
+                let wall_time_display = event_wall_time_info(state, env)
+                    .map(|(value, _source)| format!("{value:.3}"))
+                    .unwrap_or_else(|| "n/a".to_string());
+                let offset_display = event_time_offset_s(state, env)
+                    .map(|value| format!("{value:.3}"))
+                    .unwrap_or_else(|| "n/a".to_string());
                 lines.push(Line::from(format!(
                     "wall_time_s: {}",
-                    event_wall_time_s(env)
-                        .map(|value| format!("{value:.3}"))
-                        .unwrap_or_else(|| "n/a".to_string())
+                    wall_time_display
                 )));
+                lines.push(Line::from(format!("time_offset_s: {}", offset_display)));
                 lines.push(Line::from("-"));
             }
             for line in pretty_payload_lines_without_outer_braces(&env.payload) {
@@ -501,17 +662,12 @@ fn render_logs(f: &mut Frame, area: Rect, state: &AppState) {
         text.lines.push(Line::from("(no logs)"));
     }
 
-    let selected_idx = if state.log_lines.is_empty() {
-        0
-    } else {
-        state.selected_logs.min(state.log_lines.len().saturating_sub(1))
-    };
-    let scroll_lines: usize = display_messages
-        .iter()
-        .take(selected_idx)
-        .map(|line| wrapped_line_count(line, content_width))
-        .sum();
-    let scroll_y = scroll_lines.min(u16::MAX as usize) as u16;
+    let max_scroll =
+        max_wrapped_scroll_lines(&display_messages, content_width, area.height.saturating_sub(2) as usize);
+    let scroll_y = state
+        .logs_scroll_lines
+        .min(max_scroll)
+        .min(u16::MAX as usize) as u16;
 
     let p = Paragraph::new(text)
         .block(panel_block("Logs", focused))
@@ -546,6 +702,7 @@ fn preferred_details_event(state: &AppState) -> Option<&TuneEventEnvelope> {
 
 fn details_event_for_panel(state: &AppState, panel: Panel) -> Option<&TuneEventEnvelope> {
     match panel {
+        Panel::Overview => latest_by_name(state, "run.started").or_else(|| state.last_event()),
         Panel::Progress => state.progress_events.get(state.selected_progress),
         Panel::Metrics => state.profiling_events.get(state.selected_profiling),
         Panel::Actions => state.action_events.get(state.selected_actions),
@@ -561,53 +718,52 @@ fn details_event_for_panel(state: &AppState, panel: Panel) -> Option<&TuneEventE
 
 fn run_event_label(event: &TuneEventEnvelope) -> String {
     match event.event.as_str() {
-        "run.started" => "step 1 baseline run start".to_string(),
-        "run.finished" => "step 5 run finished".to_string(),
-        "profile.snapshot" => {
+        "run.started" => "round 0 step 0 baseline run start".to_string(),
+        "baseline.finished" => "round 0 step 0 baseline run finish".to_string(),
+        "profile.started" => {
             let round = round_for_event(event);
-            format!("step 2 round {round} profiling")
+            format!("round {round} step 1 profiling start")
+        }
+        "profile.finished" => {
+            let round = round_for_event(event);
+            format!("round {round} step 1 profiling finish")
         }
         "recommendation.ready" => {
             let round = round_for_event(event);
-            format!("step 3 round {round} analysis")
+            format!("round {round} step 2 analysis")
         }
         "progress.update" => {
             let round = round_for_event(event);
             let current_trial = payload_u64(event, "current_trial").unwrap_or(0);
             let total_trials = payload_u64(event, "total_trials").unwrap_or(0);
             if current_trial > 0 && total_trials > 0 {
-                format!("step 4 round {round} candidate search {current_trial}/{total_trials}")
+                format!("round {round} step 3 candidate search {current_trial}/{total_trials}")
             } else {
-                format!("step 4 round {round} candidate search")
+                format!("round {round} step 3 candidate search")
+            }
+        }
+        "progress.finished" => {
+            let round = round_for_event(event);
+            let current_trial = payload_u64(event, "current_trial").unwrap_or(0);
+            let total_trials = payload_u64(event, "total_trials").unwrap_or(0);
+            if current_trial > 0 && total_trials > 0 {
+                format!(
+                    "round {round} step 3 candidate search {current_trial}/{total_trials} finish"
+                )
+            } else {
+                format!("round {round} step 3 candidate search finish")
             }
         }
         "candidate.evaluated" => {
             let round = round_for_event(event);
             let candidate_id = payload_u64(event, "candidate_id").unwrap_or(0);
             if candidate_id > 0 {
-                format!("step 4 round {round} candidate {candidate_id} evaluated")
+                format!("round {round} step 3 candidate {candidate_id} evaluated")
             } else {
-                format!("step 4 round {round} candidate evaluated")
+                format!("round {round} step 3 candidate evaluated")
             }
         }
-        "result.comparison" => "step 5 results comparison".to_string(),
-        "phase.progress" => {
-            let round = round_for_event(event);
-            let phase = payload_str(event, "phase").unwrap_or("phase");
-            let status = payload_str(event, "status").unwrap_or("progress");
-            format!("step 4 round {round} {phase} {status}")
-        }
-        "phase.started" | "phase.finished" => {
-            let round = round_for_event(event);
-            let phase = payload_str(event, "phase").unwrap_or("phase");
-            let state = if event.event == "phase.started" {
-                "start"
-            } else {
-                "finish"
-            };
-            let step = phase_step_number(phase);
-            format!("step {step} round {round} {phase} {state}")
-        }
+        "result.comparison" => "round final step 4 results comparison".to_string(),
         _ => event.event.clone(),
     }
 }
@@ -626,55 +782,6 @@ fn analysis_event_label(event: &TuneEventEnvelope) -> String {
     format!("round {round} {}", event.event)
 }
 
-fn current_round_and_stage(state: &AppState) -> Option<(u64, String)> {
-    let event = state
-        .all_events
-        .iter()
-        .rev()
-        .find(|entry| {
-            entry.event.starts_with("phase.")
-                || entry.event.starts_with("run.")
-                || entry.event == "profile.snapshot"
-                || entry.event == "recommendation.ready"
-                || entry.event == "progress.update"
-                || entry.event == "candidate.evaluated"
-                || entry.event == "result.comparison"
-        })?;
-
-    if event.event == "run.finished" {
-        return Some((round_for_event(event), "completed".to_string()));
-    }
-
-    if event.event == "run.started" {
-        return Some((0, "baseline running".to_string()));
-    }
-
-    if event.event == "profile.snapshot" {
-        return Some((round_for_event(event), "profiling".to_string()));
-    }
-
-    if event.event == "recommendation.ready" {
-        return Some((round_for_event(event), "analysis".to_string()));
-    }
-
-    if event.event == "progress.update" || event.event == "candidate.evaluated" {
-        return Some((round_for_event(event), "candidate search".to_string()));
-    }
-
-    if event.event == "result.comparison" {
-        return Some((round_for_event(event), "results comparison".to_string()));
-    }
-
-    let round = round_for_event(event);
-    let phase = payload_str(event, "phase").unwrap_or("phase");
-    let state_label = if event.event == "phase.started" {
-        "running"
-    } else {
-        "done"
-    };
-    Some((round, format!("{phase} {state_label}")))
-}
-
 fn round_for_event(event: &TuneEventEnvelope) -> u64 {
     if let Some(iteration) = payload_u64(event, "iteration") {
         return iteration;
@@ -685,22 +792,6 @@ fn round_for_event(event: &TuneEventEnvelope) -> u64 {
         return 0;
     }
     0
-}
-
-fn phase_step_number(phase: &str) -> u64 {
-    if phase.contains("baseline") {
-        return 1;
-    }
-    if phase.contains("iteration") {
-        return 2;
-    }
-    if phase.contains("candidate") {
-        return 4;
-    }
-    if phase.contains("result") {
-        return 5;
-    }
-    2
 }
 
 fn is_progress_event(state: &AppState, event: &TuneEventEnvelope) -> bool {
@@ -719,25 +810,47 @@ fn latest_non_log_event(state: &AppState) -> Option<&TuneEventEnvelope> {
         .find(|event| event.event_type != "log" && !event.event.starts_with("log."))
 }
 
-fn latest_phase_event(state: &AppState) -> Option<&TuneEventEnvelope> {
+fn app_execution_running(state: &AppState) -> bool {
     state
         .all_events
         .iter()
         .rev()
-        .find(|event| event.event.starts_with("phase."))
+        .find(|event| event.event == "exec.started" || event.event == "exec.finished")
+        .map(|event| event.event == "exec.started")
+        .unwrap_or(false)
 }
 
-fn latest_baseline_result(state: &AppState) -> Option<&TuneEventEnvelope> {
-    state.all_events.iter().rev().find(|event| {
-        event.event == "phase.finished"
-            && payload_str(event, "phase")
-                .map(|phase| phase.contains("baseline"))
-                .unwrap_or(false)
-    })
+fn app_execution_spinner(running: bool) -> char {
+    if !running {
+        return 'o';
+    }
+
+    const FRAMES: [char; 4] = ['|', '/', '-', '\\'];
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let frame = ((millis / 120) as usize) % FRAMES.len();
+    FRAMES[frame]
 }
 
 fn payload_str<'a>(event: &'a TuneEventEnvelope, key: &str) -> Option<&'a str> {
     event.payload.get(key).and_then(|value| value.as_str())
+}
+
+fn payload_str_list(event: &TuneEventEnvelope, key: &str) -> Vec<String> {
+    event
+        .payload
+        .get(key)
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str())
+                .map(|value| value.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn payload_f64(event: &TuneEventEnvelope, key: &str) -> Option<f64> {
@@ -748,16 +861,102 @@ fn payload_u64(event: &TuneEventEnvelope, key: &str) -> Option<u64> {
     event.payload.get(key).and_then(|value| value.as_u64())
 }
 
-fn event_wall_time_s(event: &TuneEventEnvelope) -> Option<f64> {
+fn event_wall_time_info(state: &AppState, event: &TuneEventEnvelope) -> Option<(f64, &'static str)> {
     if let Some(value) = payload_f64(event, "wall_time_s") {
-        return Some(value);
+        return Some((value, "payload"));
     }
 
-    event
+    if let Some(value) = event
         .payload
         .get("metrics")
         .and_then(|metrics| metrics.get("wall_time_s"))
         .and_then(|value| value.as_f64())
+    {
+        return Some((value, "metrics"));
+    }
+
+    if event.event == "progress.update" || event.event.ends_with(".started") {
+        return Some((0.0, "marker"));
+    }
+
+    if let Some(value) = derived_phase_wall_time_s(state, event) {
+        return Some((value, "derived"));
+    }
+
+    event_time_offset_s(state, event).map(|value| (value, "counter"))
+}
+
+fn derived_phase_wall_time_s(state: &AppState, event: &TuneEventEnvelope) -> Option<f64> {
+    match event.event.as_str() {
+        "phase.finished" => {
+            let start = state
+                .all_events
+                .iter()
+                .rev()
+                .find(|candidate| {
+                    candidate.seq < event.seq
+                        && candidate.event == "phase.started"
+                        && same_phase_key(candidate, event)
+                })?;
+            duration_between_events(start, event)
+        }
+        "phase.started" => {
+            let finish = state
+                .all_events
+                .iter()
+                .find(|candidate| {
+                    candidate.seq > event.seq
+                        && candidate.event == "phase.finished"
+                        && same_phase_key(candidate, event)
+                })?;
+            duration_between_events(event, finish)
+        }
+        "run.finished" => {
+            let start = state
+                .all_events
+                .iter()
+                .find(|candidate| candidate.event == "run.started")?;
+            duration_between_events(start, event)
+        }
+        "run.started" => {
+            let finish = state
+                .all_events
+                .iter()
+                .find(|candidate| candidate.event == "run.finished")?;
+            duration_between_events(event, finish)
+        }
+        _ => None,
+    }
+}
+
+fn event_time_offset_s(state: &AppState, event: &TuneEventEnvelope) -> Option<f64> {
+    let run_start = state
+        .all_events
+        .iter()
+        .find(|candidate| candidate.event == "run.started")?;
+    duration_between_events(run_start, event)
+}
+
+fn same_phase_key(lhs: &TuneEventEnvelope, rhs: &TuneEventEnvelope) -> bool {
+    payload_str(lhs, "phase") == payload_str(rhs, "phase")
+        && payload_u64(lhs, "iteration").unwrap_or(0)
+            == payload_u64(rhs, "iteration").unwrap_or(0)
+}
+
+fn duration_between_events(start: &TuneEventEnvelope, end: &TuneEventEnvelope) -> Option<f64> {
+    let start_s = parse_rfc3339_seconds(&start.ts)?;
+    let end_s = parse_rfc3339_seconds(&end.ts)?;
+    let diff = end_s - start_s;
+    if diff.is_sign_negative() {
+        None
+    } else {
+        Some(diff)
+    }
+}
+
+fn parse_rfc3339_seconds(ts: &str) -> Option<f64> {
+    let dt = DateTime::parse_from_rfc3339(ts).ok()?;
+    Some((dt.timestamp_millis() as f64) / 1000.0)
 }
 
 fn render_rich_log_line(message: &str, selected: bool) -> Line<'static> {
@@ -990,6 +1189,14 @@ fn wrapped_line_count(message: &str, width: usize) -> usize {
     count.max(1)
 }
 
+fn max_wrapped_scroll_lines(messages: &[String], width: usize, view_height: usize) -> usize {
+    let total_rows: usize = messages
+        .iter()
+        .map(|message| wrapped_line_count(message, width))
+        .sum();
+    total_rows.saturating_sub(view_height)
+}
+
 fn strip_supported_rich_tags(message: &str) -> String {
     let chars: Vec<char> = message.chars().collect();
     let mut output = String::new();
@@ -1083,12 +1290,9 @@ fn trim_leading_spaces(line: &str, count: usize) -> String {
     view.to_string()
 }
 
-fn visible_window(len: usize, selected: usize, max_rows: usize) -> (usize, usize) {
+fn clamped_index_window_start(start: usize, len: usize, max_rows: usize) -> usize {
     if len == 0 || max_rows == 0 || len <= max_rows {
-        return (0, len);
+        return 0;
     }
-    let selected = selected.min(len - 1);
-    let half = max_rows / 2;
-    let start = selected.saturating_sub(half).min(len - max_rows);
-    (start, start + max_rows)
+    start.min(len - max_rows)
 }
