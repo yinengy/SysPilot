@@ -1768,7 +1768,9 @@ async def _run_spawn_tune_loop_async(
 }}
 """
 
+        analysis_started_at = time.time()
         response = await agent.step(prompt)
+        analysis_wall_time_s = time.time() - analysis_started_at
         sink.print(f"\n[dim]{response.content}[/dim]")
 
         recommendation = _parse_spawn_actions(response.content)
@@ -1808,6 +1810,7 @@ async def _run_spawn_tune_loop_async(
             {
                 "mode": "spawn",
                 "iteration": iteration,
+                "wall_time_s": analysis_wall_time_s,
                 "summary": summary,
                 "manual_citation": recommendation["manual_citation"],
                 "evidence": recommendation["evidence"][:5],

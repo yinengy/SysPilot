@@ -186,6 +186,9 @@ fn render_run_phase(f: &mut Frame, area: Rect, state: &AppState) {
             if let Some(status) = payload_str(event, "status") {
                 suffix = format!(" [{status}]");
             }
+            if let Some(wall_time_s) = event_wall_time_s(event) {
+                suffix.push_str(&format!(" ({wall_time_s:.2}s)"));
+            }
             lines.push(Line::styled(format!("{}{}", run_event_label(event), suffix), style));
         }
     }
@@ -442,8 +445,18 @@ fn render_decision_and_details(f: &mut Frame, area: Rect, state: &AppState) {
                 }
             }
         } else {
+            if is_progress_event(state, env) {
+                lines.push(Line::from(format!("step: {}", run_event_label(env))));
+                lines.push(Line::from(format!(
+                    "wall_time_s: {}",
+                    event_wall_time_s(env)
+                        .map(|value| format!("{value:.3}"))
+                        .unwrap_or_else(|| "n/a".to_string())
+                )));
+                lines.push(Line::from("-"));
+            }
             for line in pretty_payload_lines_without_outer_braces(&env.payload) {
-                lines.push(Line::from(line));
+                lines.push(render_rich_log_line(&line, false));
             }
         }
     } else {
@@ -548,8 +561,42 @@ fn details_event_for_panel(state: &AppState, panel: Panel) -> Option<&TuneEventE
 
 fn run_event_label(event: &TuneEventEnvelope) -> String {
     match event.event.as_str() {
-        "run.started" => "round 0 baseline run start".to_string(),
-        "run.finished" => "final run finished".to_string(),
+        "run.started" => "step 1 baseline run start".to_string(),
+        "run.finished" => "step 5 run finished".to_string(),
+        "profile.snapshot" => {
+            let round = round_for_event(event);
+            format!("step 2 round {round} profiling")
+        }
+        "recommendation.ready" => {
+            let round = round_for_event(event);
+            format!("step 3 round {round} analysis")
+        }
+        "progress.update" => {
+            let round = round_for_event(event);
+            let current_trial = payload_u64(event, "current_trial").unwrap_or(0);
+            let total_trials = payload_u64(event, "total_trials").unwrap_or(0);
+            if current_trial > 0 && total_trials > 0 {
+                format!("step 4 round {round} candidate search {current_trial}/{total_trials}")
+            } else {
+                format!("step 4 round {round} candidate search")
+            }
+        }
+        "candidate.evaluated" => {
+            let round = round_for_event(event);
+            let candidate_id = payload_u64(event, "candidate_id").unwrap_or(0);
+            if candidate_id > 0 {
+                format!("step 4 round {round} candidate {candidate_id} evaluated")
+            } else {
+                format!("step 4 round {round} candidate evaluated")
+            }
+        }
+        "result.comparison" => "step 5 results comparison".to_string(),
+        "phase.progress" => {
+            let round = round_for_event(event);
+            let phase = payload_str(event, "phase").unwrap_or("phase");
+            let status = payload_str(event, "status").unwrap_or("progress");
+            format!("step 4 round {round} {phase} {status}")
+        }
         "phase.started" | "phase.finished" => {
             let round = round_for_event(event);
             let phase = payload_str(event, "phase").unwrap_or("phase");
@@ -558,7 +605,8 @@ fn run_event_label(event: &TuneEventEnvelope) -> String {
             } else {
                 "finish"
             };
-            format!("round {round} {phase} {state}")
+            let step = phase_step_number(phase);
+            format!("step {step} round {round} {phase} {state}")
         }
         _ => event.event.clone(),
     }
@@ -583,7 +631,15 @@ fn current_round_and_stage(state: &AppState) -> Option<(u64, String)> {
         .all_events
         .iter()
         .rev()
-        .find(|entry| entry.event.starts_with("phase.") || entry.event.starts_with("run."))?;
+        .find(|entry| {
+            entry.event.starts_with("phase.")
+                || entry.event.starts_with("run.")
+                || entry.event == "profile.snapshot"
+                || entry.event == "recommendation.ready"
+                || entry.event == "progress.update"
+                || entry.event == "candidate.evaluated"
+                || entry.event == "result.comparison"
+        })?;
 
     if event.event == "run.finished" {
         return Some((round_for_event(event), "completed".to_string()));
@@ -591,6 +647,22 @@ fn current_round_and_stage(state: &AppState) -> Option<(u64, String)> {
 
     if event.event == "run.started" {
         return Some((0, "baseline running".to_string()));
+    }
+
+    if event.event == "profile.snapshot" {
+        return Some((round_for_event(event), "profiling".to_string()));
+    }
+
+    if event.event == "recommendation.ready" {
+        return Some((round_for_event(event), "analysis".to_string()));
+    }
+
+    if event.event == "progress.update" || event.event == "candidate.evaluated" {
+        return Some((round_for_event(event), "candidate search".to_string()));
+    }
+
+    if event.event == "result.comparison" {
+        return Some((round_for_event(event), "results comparison".to_string()));
     }
 
     let round = round_for_event(event);
@@ -613,6 +685,26 @@ fn round_for_event(event: &TuneEventEnvelope) -> u64 {
         return 0;
     }
     0
+}
+
+fn phase_step_number(phase: &str) -> u64 {
+    if phase.contains("baseline") {
+        return 1;
+    }
+    if phase.contains("iteration") {
+        return 2;
+    }
+    if phase.contains("candidate") {
+        return 4;
+    }
+    if phase.contains("result") {
+        return 5;
+    }
+    2
+}
+
+fn is_progress_event(state: &AppState, event: &TuneEventEnvelope) -> bool {
+    state.progress_events.iter().any(|entry| entry.seq == event.seq)
 }
 
 fn latest_by_name<'a>(state: &'a AppState, name: &str) -> Option<&'a TuneEventEnvelope> {
@@ -654,6 +746,18 @@ fn payload_f64(event: &TuneEventEnvelope, key: &str) -> Option<f64> {
 
 fn payload_u64(event: &TuneEventEnvelope, key: &str) -> Option<u64> {
     event.payload.get(key).and_then(|value| value.as_u64())
+}
+
+fn event_wall_time_s(event: &TuneEventEnvelope) -> Option<f64> {
+    if let Some(value) = payload_f64(event, "wall_time_s") {
+        return Some(value);
+    }
+
+    event
+        .payload
+        .get("metrics")
+        .and_then(|metrics| metrics.get("wall_time_s"))
+        .and_then(|value| value.as_f64())
 }
 
 fn render_rich_log_line(message: &str, selected: bool) -> Line<'static> {

@@ -99,6 +99,15 @@ fn is_run_phase_event(env: &TuneEventEnvelope) -> bool {
         return true;
     }
 
+    if event_name == "profile.snapshot"
+        || event_name == "recommendation.ready"
+        || event_name == "progress.update"
+        || event_name == "candidate.evaluated"
+        || event_name == "result.comparison"
+    {
+        return true;
+    }
+
     if !event_name.starts_with("phase.") {
         return false;
     }
