@@ -642,16 +642,7 @@ fn render_logs(f: &mut Frame, area: Rect, state: &AppState) {
     let focused = state.focused == Panel::Logs;
     let mut text = Text::default();
     let content_width = area.width.saturating_sub(2).max(1) as usize;
-    let max_visible_chars = content_width.saturating_mul(6).max(180);
-
-    let display_messages: Vec<String> = state
-        .log_lines
-        .iter()
-        .map(|line| {
-            let normalized = humanize_json_quote_escapes(&line.message);
-            clip_log_message(&normalized, max_visible_chars)
-        })
-        .collect();
+    let display_messages = log_display_messages(state, content_width);
 
     for (i, message) in display_messages.iter().enumerate() {
         let selected = i == state.selected_logs;
@@ -811,13 +802,7 @@ fn latest_non_log_event(state: &AppState) -> Option<&TuneEventEnvelope> {
 }
 
 fn app_execution_running(state: &AppState) -> bool {
-    state
-        .all_events
-        .iter()
-        .rev()
-        .find(|event| event.event == "exec.started" || event.event == "exec.finished")
-        .map(|event| event.event == "exec.started")
-        .unwrap_or(false)
+    state.exec_running
 }
 
 fn app_execution_spinner(running: bool) -> char {
@@ -1009,7 +994,19 @@ fn render_rich_log_line(message: &str, selected: bool) -> Line<'static> {
     Line::from(spans)
 }
 
-fn clip_log_message(message: &str, max_visible: usize) -> String {
+pub(crate) fn log_display_messages(state: &AppState, content_width: usize) -> Vec<String> {
+    let max_visible_chars = content_width.saturating_mul(6).max(180);
+    state
+        .log_lines
+        .iter()
+        .map(|line| {
+            let normalized = humanize_json_quote_escapes(&line.message);
+            clip_log_message(&normalized, max_visible_chars)
+        })
+        .collect()
+}
+
+pub(crate) fn clip_log_message(message: &str, max_visible: usize) -> String {
     if max_visible == 0 {
         return "…".to_string();
     }
@@ -1057,12 +1054,8 @@ fn clip_log_message(message: &str, max_visible: usize) -> String {
     output
 }
 
-fn humanize_json_quote_escapes(message: &str) -> String {
-    let mut normalized = message.to_string();
-    while normalized.contains("\\\"") {
-        normalized = normalized.replace("\\\"", "\"");
-    }
-    normalized
+pub(crate) fn humanize_json_quote_escapes(message: &str) -> String {
+    message.replace("\\\"", "\"")
 }
 
 fn flush_log_span(spans: &mut Vec<Span<'static>>, current: &mut String, style: Style) {
@@ -1175,59 +1168,20 @@ fn parse_rich_tag(base: Style, tag: &str) -> Option<Style> {
     }
 }
 
-fn wrapped_line_count(message: &str, width: usize) -> usize {
-    let width = width.max(1);
-    let plain = strip_supported_rich_tags(message);
-    let mut count = 0usize;
-
-    for segment in plain.split('\n') {
-        let len = segment.chars().count();
-        let rows = if len == 0 { 1 } else { ((len - 1) / width) + 1 };
-        count += rows;
-    }
-
-    count.max(1)
+pub(crate) fn wrapped_line_count(message: &str, width: usize) -> usize {
+    let text = Text::from(vec![render_rich_log_line(message, false)]);
+    Paragraph::new(text)
+        .wrap(Wrap { trim: false })
+        .line_count(width.max(1) as u16)
+        .max(1)
 }
 
-fn max_wrapped_scroll_lines(messages: &[String], width: usize, view_height: usize) -> usize {
+pub(crate) fn max_wrapped_scroll_lines(messages: &[String], width: usize, view_height: usize) -> usize {
     let total_rows: usize = messages
         .iter()
         .map(|message| wrapped_line_count(message, width))
         .sum();
     total_rows.saturating_sub(view_height)
-}
-
-fn strip_supported_rich_tags(message: &str) -> String {
-    let chars: Vec<char> = message.chars().collect();
-    let mut output = String::new();
-    let mut idx = 0usize;
-
-    while idx < chars.len() {
-        if chars[idx] == '[' {
-            let mut end = idx + 1;
-            while end < chars.len() && chars[end] != ']' {
-                end += 1;
-            }
-
-            if end < chars.len() {
-                let tag: String = chars[idx + 1..end].iter().collect();
-                if let Some(stripped) = tag.strip_prefix('/') {
-                    if is_supported_close_tag(stripped) {
-                        idx = end + 1;
-                        continue;
-                    }
-                } else if parse_rich_tag(Style::default(), &tag).is_some() {
-                    idx = end + 1;
-                    continue;
-                }
-            }
-        }
-
-        output.push(chars[idx]);
-        idx += 1;
-    }
-
-    output
 }
 
 fn truncate(value: &str, limit: usize) -> String {

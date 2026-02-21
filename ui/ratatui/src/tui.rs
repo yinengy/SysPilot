@@ -2,7 +2,7 @@ use std::{
     io::{self, BufRead},
     sync::mpsc::{self, TryRecvError},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use ratatui::crossterm::{
@@ -23,8 +23,15 @@ use crate::{
     event::parse_event_line,
     reducer::{reduce, AppMsg},
     state::{AppState, Panel},
-    view::{draw, run_phase_entry_messages, run_phase_header_messages},
+    view::{
+        draw, log_display_messages, max_wrapped_scroll_lines, run_phase_entry_messages,
+        run_phase_header_messages, wrapped_line_count,
+    },
 };
+
+const ACTIVE_TICK_MS: u64 = 300;
+const IDLE_TICK_MS: u64 = 100;
+const SPINNER_FRAME_MS: u128 = 300;
 
 pub fn run() -> io::Result<()> {
     let mut tui = Tui::init()?;
@@ -33,19 +40,49 @@ pub fn run() -> io::Result<()> {
 
     let mut state = AppState::new();
     let mut mouse_tracker = MouseClickTracker::default();
-    let tick_rate = Duration::from_millis(100);
+    let mut needs_draw = true;
+    let mut last_spinner_frame = 0usize;
     loop {
+        let mut saw_stdin_event = false;
         loop {
             match rx.try_recv() {
-                Ok(msg) => reduce(&mut state, msg),
+                Ok(msg) => {
+                    reduce(&mut state, msg);
+                    saw_stdin_event = true;
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => break,
             }
         }
 
-        sync_logs_autofollow(&mut state);
+        if saw_stdin_event {
+            needs_draw = true;
+        }
 
-        tui.terminal.draw(|f| draw(f, &state))?;
+        if sync_logs_autofollow(&mut state) {
+            needs_draw = true;
+        }
+
+        if state.exec_running {
+            let spinner_frame = current_spinner_frame();
+            if spinner_frame != last_spinner_frame {
+                needs_draw = true;
+                last_spinner_frame = spinner_frame;
+            }
+        } else {
+            last_spinner_frame = 0;
+        }
+
+        if needs_draw {
+            tui.terminal.draw(|f| draw(f, &state))?;
+            needs_draw = false;
+        }
+
+        let tick_rate = if state.exec_running {
+            Duration::from_millis(ACTIVE_TICK_MS)
+        } else {
+            Duration::from_millis(IDLE_TICK_MS)
+        };
 
         if event::poll(tick_rate)? {
             match event::read()? {
@@ -53,9 +90,14 @@ pub fn run() -> io::Result<()> {
                     if handle_key(&mut state, &mut tui, key) {
                         break;
                     }
+                    needs_draw = true;
                 }
                 CEvent::Mouse(mouse) => {
                     handle_mouse(&mut state, &mut mouse_tracker, mouse);
+                    needs_draw = true;
+                }
+                CEvent::Resize(_, _) => {
+                    needs_draw = true;
                 }
                 _ => {}
             }
@@ -519,17 +561,7 @@ fn row_to_logs_index(
 }
 
 fn log_display_messages_for_hit(state: &AppState, content_width: usize) -> Vec<String> {
-    let max_visible_chars = content_width.saturating_mul(6).max(180);
-    state
-        .log_lines
-        .iter()
-        .map(|line| {
-            clip_log_message_for_hit(
-                &humanize_json_quote_escapes_for_hit(&line.message),
-                max_visible_chars,
-            )
-        })
-        .collect()
+    log_display_messages(state, content_width)
 }
 
 fn candidate_run_len(state: &AppState) -> usize {
@@ -618,51 +650,15 @@ fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
         && row < rect.y.saturating_add(rect.height)
 }
 
-fn humanize_json_quote_escapes_for_hit(message: &str) -> String {
-    let mut normalized = message.to_string();
-    while normalized.contains("\\\"") {
-        normalized = normalized.replace("\\\"", "\"");
-    }
-    normalized
-}
-
-fn clip_log_message_for_hit(message: &str, max_visible: usize) -> String {
-    if max_visible == 0 {
-        return "…".to_string();
-    }
-
-    let mut output = String::new();
-    let mut visible = 0usize;
-    for ch in message.chars() {
-        if visible >= max_visible {
-            output.push('…');
-            break;
-        }
-        output.push(ch);
-        visible += 1;
-    }
-    output
-}
-
 fn wrapped_line_count_for_hit(message: &str, width: usize) -> usize {
-    let width = width.max(1);
-    let mut count = 0usize;
-    for segment in message.split('\n') {
-        let len = segment.chars().count();
-        count += if len == 0 { 1 } else { ((len - 1) / width) + 1 };
-    }
-    count.max(1)
+    wrapped_line_count(message, width)
 }
 
 fn max_wrapped_scroll_for_hit(messages: &[String], width: usize, view_height: usize) -> usize {
     if width == 0 || view_height == 0 {
         return 0;
     }
-    let total_rows: usize = messages
-        .iter()
-        .map(|line| wrapped_line_count_for_hit(line, width))
-        .sum();
-    total_rows.saturating_sub(view_height)
+    max_wrapped_scroll_lines(messages, width, view_height)
 }
 
 fn set_focus(state: &mut AppState, next: Panel) {
@@ -747,24 +743,64 @@ fn ensure_selection_visible(state: &mut AppState) {
     }
 }
 
-fn sync_logs_autofollow(state: &mut AppState) {
+fn sync_logs_autofollow(state: &mut AppState) -> bool {
     if state.focused == Panel::Logs {
-        return;
+        return false;
     }
 
     let len = state.log_lines.len();
     if len == 0 {
+        let changed = state.selected_logs != 0
+            || state.logs_scroll_lines != 0
+            || state.logs_autofollow_len != 0
+            || state.logs_autofollow_width != 0
+            || state.logs_autofollow_height != 0;
         state.selected_logs = 0;
         state.logs_scroll_lines = 0;
-        return;
+        state.logs_autofollow_len = 0;
+        state.logs_autofollow_width = 0;
+        state.logs_autofollow_height = 0;
+        return changed;
     }
 
-    state.selected_logs = len - 1;
     let hit = compute_hit_layout(state, current_area_rect());
-    let width = hit.logs_entries.width.max(1) as usize;
-    let height = hit.logs_entries.height as usize;
-    let messages = log_display_messages_for_hit(state, width);
-    state.logs_scroll_lines = max_wrapped_scroll_for_hit(&messages, width, height);
+    let width = hit.logs_entries.width;
+    let height = hit.logs_entries.height;
+    let selected_latest = len - 1;
+
+    let dims_changed =
+        state.logs_autofollow_width != width || state.logs_autofollow_height != height;
+    let len_changed = state.logs_autofollow_len != len;
+    let selected_changed = state.selected_logs != selected_latest;
+
+    let mut changed = false;
+    if selected_changed {
+        state.selected_logs = selected_latest;
+        changed = true;
+    }
+
+    if len_changed || dims_changed || selected_changed {
+        let content_width = width.max(1) as usize;
+        let messages = log_display_messages_for_hit(state, content_width);
+        let new_scroll = max_wrapped_scroll_for_hit(&messages, content_width, height as usize);
+        if state.logs_scroll_lines != new_scroll {
+            state.logs_scroll_lines = new_scroll;
+            changed = true;
+        }
+    }
+
+    state.logs_autofollow_len = len;
+    state.logs_autofollow_width = width;
+    state.logs_autofollow_height = height;
+    changed
+}
+
+fn current_spinner_frame() -> usize {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    ((millis / SPINNER_FRAME_MS) as usize) % 4
 }
 
 fn ensure_wrapped_selection_visible(

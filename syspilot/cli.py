@@ -34,6 +34,7 @@ from syspilot.core.openai_auth import (
 )
 from syspilot.profiling import ProfilingManager
 from syspilot.skills import SkillRegistry
+from syspilot.ui.events import is_critical_event
 from syspilot.skills.builtin import (
     DynamicScriptSkill,
     StraceAnalyzerSkill,
@@ -46,7 +47,7 @@ from syspilot.tuning.engine import TuningEngine
 from syspilot.utils import setup_logging, find_process_by_name
 from syspilot.ui.emitter import TuneEventEmitter
 from syspilot.ui.output_sink import OutputSink, SwitchableOutputSink, TuneUIMode, make_output_sink
-from syspilot.ui.tui_sidecar import TuneTuiOrchestrator
+from syspilot.ui.tui_sidecar import TuneTuiOrchestrator, should_wait_for_user_on_close
 
 console = Console()
 
@@ -59,6 +60,13 @@ class _TuneEmitter(Protocol):
         *,
         event_type: str | None = None,
     ) -> bool: ...
+
+
+def _is_env_flag_enabled(name: str) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return False
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _register_default_skills(agent: SysPilotAgent) -> None:
@@ -626,8 +634,10 @@ def tune(
     finally:
         if logger_forward_handler is not None:
             syspilot_logger.removeHandler(logger_forward_handler)
+        if isinstance(event_emitter, _TuiForwardingEmitterAdapter):
+            event_emitter.flush()
         if tui_orchestrator is not None:
-            tui_orchestrator.close(wait_for_user=True)
+            tui_orchestrator.close(wait_for_user=should_wait_for_user_on_close())
 
 
 class _TuiAwareOutputSink:
@@ -708,6 +718,16 @@ class _TuiForwardingEmitterAdapter:
     ) -> None:
         self._emitter: TuneEventEmitter = emitter
         self._orchestrator: TuneTuiOrchestrator = orchestrator
+        self._pending_noncritical_count = 0
+        self._last_forward_ts = time.monotonic()
+
+    def _forward(self) -> None:
+        self._orchestrator.forward_emitter(self._emitter)
+        self._pending_noncritical_count = 0
+        self._last_forward_ts = time.monotonic()
+
+    def flush(self) -> None:
+        self._forward()
 
     def publish(
         self,
@@ -717,7 +737,17 @@ class _TuiForwardingEmitterAdapter:
         event_type: str | None = None,
     ) -> bool:
         ok = self._emitter.publish(event_name, payload, event_type=event_type)
-        self._orchestrator.forward_emitter(self._emitter)
+        if not ok:
+            return False
+
+        if is_critical_event(event_name):
+            self._forward()
+            return True
+
+        self._pending_noncritical_count += 1
+        now = time.monotonic()
+        if self._pending_noncritical_count >= 64 or (now - self._last_forward_ts) >= 0.25:
+            self._forward()
         return ok
 
 
@@ -1602,6 +1632,12 @@ async def _run_spawn_tune_loop_async(
                 manual_content += f"\n\n### {manual_name} Manual (excerpt)\n"
                 manual_content += agent.context.loaded_manuals[manual_name][:3000]
 
+    benchmark_deterministic = _is_env_flag_enabled("SYSPILOT_BENCH_DETERMINISTIC")
+    if benchmark_deterministic:
+        sink.print(
+            "[dim]Benchmark deterministic mode enabled: skipping agent tuning analysis.[/dim]"
+        )
+
     sink.print("\n[bold cyan]Round 0 Step 0: Initial Baseline Run[/bold cyan]")
     _emit_tune_event(
         event_emitter,
@@ -1868,12 +1904,26 @@ async def _run_spawn_tune_loop_async(
 }}
 """
 
-        analysis_started_at = time.time()
-        response = await agent.step(prompt)
-        analysis_wall_time_s = time.time() - analysis_started_at
-        sink.print(f"\n[dim]{response.content}[/dim]")
+        recommendation: dict[str, Any]
+        if benchmark_deterministic:
+            analysis_wall_time_s = 0.0
+            recommendation = {
+                "valid": True,
+                "error": "",
+                "summary": "Deterministic benchmark mode: skipped agent analysis.",
+                "manual_citation": "",
+                "evidence": ["SYSPILOT_BENCH_DETERMINISTIC=1"],
+                "actions": [],
+                "skipped_actions": [],
+            }
+            sink.print("\n[dim]Deterministic benchmark mode: no tuning actions generated.[/dim]")
+        else:
+            analysis_started_at = time.time()
+            response = await agent.step(prompt)
+            analysis_wall_time_s = time.time() - analysis_started_at
+            sink.print(f"\n[dim]{response.content}[/dim]")
 
-        recommendation = _parse_spawn_actions(response.content)
+            recommendation = _parse_spawn_actions(response.content)
         if not recommendation["valid"]:
             _emit_tune_event(
                 event_emitter,

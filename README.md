@@ -167,6 +167,11 @@ python3 scripts/bench_tune_ui_overhead.py \
 
 If TUI cannot run (for example non-TTY sessions or missing TUI binary), the benchmark exits non-zero and records a clear `failure_reason`/`failure_detail` in the JSON artifact.
 
+The harness enforces deterministic, noninteractive benchmarking by setting:
+
+- `SYSPILOT_BENCH_DETERMINISTIC=1` (skip agent tuning-analysis variance)
+- `SYSPILOT_TUI_WAIT_FOR_USER=0` (auto-close sidecar at run end)
+
 ## Debugging LLM Conversations
 
 Use debug mode to inspect every LLM request/response and tool-calling turn.

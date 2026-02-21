@@ -91,6 +91,7 @@ pub struct AppState {
 
     pub run_id: Option<String>,
     pub schema_version: Option<String>,
+    pub exec_running: bool,
 
     pub all_events: BoundedDeque<TuneEventEnvelope>,
     pub progress_events: BoundedDeque<TuneEventEnvelope>,
@@ -110,6 +111,9 @@ pub struct AppState {
     pub progress_scroll_lines: usize,
     pub logs_scroll_lines: usize,
     pub details_scroll: usize,
+    pub logs_autofollow_len: usize,
+    pub logs_autofollow_width: u16,
+    pub logs_autofollow_height: u16,
 
     pub parse_error_count: u64,
 }
@@ -122,6 +126,7 @@ impl AppState {
             pinned_seq: None,
             run_id: None,
             schema_version: None,
+            exec_running: false,
             all_events: BoundedDeque::new(200),
             progress_events: BoundedDeque::new(200),
             profiling_events: BoundedDeque::new(120),
@@ -139,6 +144,9 @@ impl AppState {
             progress_scroll_lines: 0,
             logs_scroll_lines: 0,
             details_scroll: 0,
+            logs_autofollow_len: 0,
+            logs_autofollow_width: 0,
+            logs_autofollow_height: 0,
             parse_error_count: 0,
         }
     }

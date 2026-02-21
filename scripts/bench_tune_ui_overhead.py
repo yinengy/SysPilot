@@ -2,7 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
+import os
+import pty
+import select
 import subprocess
 import sys
 import time
@@ -16,6 +20,9 @@ FALLBACK_MARKERS = (
     "continuing in --ui-mode plain",
 )
 RUN_OUTPUT_TAIL_CHARS = 1200
+PTY_CAPTURE_TAIL_BYTES = 20000
+PTY_READ_CHUNK_BYTES = 65536
+PTY_READ_POLL_S = 0.005
 
 
 @dataclass(frozen=True)
@@ -144,6 +151,130 @@ def _coerce_text(value: object | None) -> str:
     return str(value)
 
 
+def _append_tail_bytes(current: bytes, chunk: bytes, *, max_bytes: int) -> bytes:
+    merged = current + chunk
+    if len(merged) <= max_bytes:
+        return merged
+    return merged[-max_bytes:]
+
+
+def _run_once_with_pty(
+    *,
+    command: list[str],
+    env: dict[str, str],
+    process_timeout_s: int,
+    ui_mode: str,
+) -> tuple[float, str, str, int, list[str]]:
+    started = time.monotonic()
+    child_pid, master_fd = pty.fork()
+
+    if child_pid == 0:
+        try:
+            os.execvpe(command[0], command, env)
+        except Exception:
+            os._exit(127)
+
+    output_tail = b""
+    timed_out = False
+    child_status: int | None = None
+
+    def poll_child_status() -> int | None:
+        nonlocal child_status
+        if child_status is not None:
+            return child_status
+        waited_pid, status = os.waitpid(child_pid, os.WNOHANG)
+        if waited_pid == child_pid:
+            child_status = status
+        return child_status
+
+    try:
+        deadline = started + process_timeout_s
+        while True:
+            now = time.monotonic()
+            if now >= deadline and poll_child_status() is None:
+                timed_out = True
+                try:
+                    os.kill(child_pid, 9)
+                except ProcessLookupError:
+                    pass
+                _ = poll_child_status()
+
+            timeout = (
+                0.0
+                if poll_child_status() is not None
+                else min(
+                    PTY_READ_POLL_S,
+                    max(0.0, deadline - now),
+                )
+            )
+
+            ready, _, _ = select.select([master_fd], [], [], timeout)
+            if ready:
+                try:
+                    data = os.read(master_fd, PTY_READ_CHUNK_BYTES)
+                except OSError as exc:
+                    if exc.errno == errno.EIO:
+                        data = b""
+                    else:
+                        raise
+
+                if data:
+                    output_tail = _append_tail_bytes(
+                        output_tail,
+                        data,
+                        max_bytes=PTY_CAPTURE_TAIL_BYTES,
+                    )
+
+            if poll_child_status() is not None:
+                while True:
+                    ready, _, _ = select.select([master_fd], [], [], 0)
+                    if not ready:
+                        break
+                    try:
+                        data = os.read(master_fd, PTY_READ_CHUNK_BYTES)
+                    except OSError as exc:
+                        if exc.errno == errno.EIO:
+                            break
+                        raise
+                    if not data:
+                        break
+                    output_tail = _append_tail_bytes(
+                        output_tail,
+                        data,
+                        max_bytes=PTY_CAPTURE_TAIL_BYTES,
+                    )
+                break
+    finally:
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+        if child_status is None:
+            try:
+                _, child_status = os.waitpid(child_pid, 0)
+            except ChildProcessError:
+                child_status = 0
+
+    elapsed = time.monotonic() - started
+    if timed_out:
+        returncode = 124
+        timeout_message = (
+            f"Benchmark timeout: mode={ui_mode} exceeded {process_timeout_s}s "
+            "while waiting for syspilot tune"
+        )
+        output_tail = _append_tail_bytes(
+            output_tail,
+            f"\n{timeout_message}".encode("utf-8", errors="replace"),
+            max_bytes=PTY_CAPTURE_TAIL_BYTES,
+        )
+    else:
+        returncode = int(os.waitstatus_to_exitcode(child_status))
+
+    output_tail_text = output_tail.decode(errors="replace")
+    fallback_messages = extract_fallback_messages(stdout=output_tail_text, stderr="")
+    return elapsed, output_tail_text, "", returncode, fallback_messages
+
+
 def _build_tune_command(
     *,
     ui_mode: str,
@@ -185,17 +316,16 @@ def _run_once(
 
     started = time.monotonic()
     process_timeout_s = timeout_s + 120
+    child_env = os.environ.copy()
+    child_env["SYSPILOT_TUI_WAIT_FOR_USER"] = "0"
+    child_env["SYSPILOT_BENCH_DETERMINISTIC"] = "1"
     try:
-        completed = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=process_timeout_s,
+        elapsed, stdout, stderr, returncode, fallback_messages = _run_once_with_pty(
+            command=command,
+            env=child_env,
+            process_timeout_s=process_timeout_s,
+            ui_mode=ui_mode,
         )
-        elapsed = time.monotonic() - started
-        stdout = completed.stdout or ""
-        stderr = completed.stderr or ""
-        returncode = completed.returncode
     except subprocess.TimeoutExpired as exc:
         elapsed = time.monotonic() - started
         stdout = _coerce_text(exc.stdout)
@@ -207,8 +337,35 @@ def _run_once(
             "while waiting for syspilot tune"
         )
         returncode = 124
+        fallback_messages = extract_fallback_messages(stdout=stdout, stderr=stderr)
+    except Exception:
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=process_timeout_s,
+                env=child_env,
+            )
+            elapsed = time.monotonic() - started
+            stdout = completed.stdout or ""
+            stderr = completed.stderr or ""
+            returncode = completed.returncode
+        except subprocess.TimeoutExpired as exc:
+            elapsed = time.monotonic() - started
+            stdout = _coerce_text(exc.stdout)
+            stderr = _coerce_text(exc.stderr)
+            if stderr:
+                stderr = f"{stderr}\n"
+            stderr = (
+                f"{stderr}Benchmark timeout: mode={ui_mode} exceeded {process_timeout_s}s "
+                "while waiting for syspilot tune"
+            )
+            returncode = 124
+        fallback_messages = extract_fallback_messages(stdout=stdout, stderr=stderr)
 
-    fallback_messages = extract_fallback_messages(stdout=stdout, stderr=stderr)
+    if not fallback_messages:
+        fallback_messages = extract_fallback_messages(stdout=stdout, stderr=stderr)
     return ModeRunResult(
         elapsed_s=elapsed,
         returncode=returncode,
@@ -218,75 +375,82 @@ def _run_once(
     )
 
 
-def _run_mode_benchmark(
+def _run_paired_benchmark(
     *,
-    ui_mode: str,
     runs: int,
     warmup: int,
     workload_command: str,
     max_iterations: int,
     timeout_s: int,
-) -> ModeBenchmarkResult:
+) -> tuple[ModeBenchmarkResult, ModeBenchmarkResult]:
     total = warmup + runs
-    timings: list[float] = []
-    returncodes: list[int] = []
-    run_records: list[RunRecord] = []
-    fallback_messages: list[str] = []
 
-    for index in range(total):
-        result = _run_once(
-            ui_mode=ui_mode,
-            workload_command=workload_command,
-            max_iterations=max_iterations,
-            timeout_s=timeout_s,
-        )
-
-        if index >= warmup:
-            phase = "measured"
-            timings.append(result.elapsed_s)
-        else:
-            phase = "warmup"
-
-        returncodes.append(result.returncode)
-        for message in result.fallback_messages:
-            if message not in fallback_messages:
-                fallback_messages.append(message)
-
-        run_records.append(
-            {
-                "run_index": index + 1,
-                "phase": phase,
-                "elapsed_s": result.elapsed_s,
-                "returncode": result.returncode,
-                "fallback_detected": bool(result.fallback_messages),
-                "fallback_messages": result.fallback_messages,
-                "stdout_tail": _tail(result.stdout),
-                "stderr_tail": _tail(result.stderr),
-            }
-        )
-
-        if result.returncode != 0:
-            snippet = _tail(result.stderr or result.stdout, max_chars=800)
-            return {
-                "measured_times_s": timings,
-                "returncodes": returncodes,
-                "run_records": run_records,
-                "fallback_messages": fallback_messages,
-                "failed": True,
-                "failure_detail": (
-                    f"{ui_mode} run failed (run={index + 1}/{total}, "
-                    f"rc={result.returncode}): {snippet}"
-                ),
-            }
-
-    return {
-        "measured_times_s": timings,
-        "returncodes": returncodes,
-        "run_records": run_records,
-        "fallback_messages": fallback_messages,
+    plain: ModeBenchmarkResult = {
+        "measured_times_s": [],
+        "returncodes": [],
+        "run_records": [],
+        "fallback_messages": [],
         "failed": False,
         "failure_detail": None,
     }
+    tui: ModeBenchmarkResult = {
+        "measured_times_s": [],
+        "returncodes": [],
+        "run_records": [],
+        "fallback_messages": [],
+        "failed": False,
+        "failure_detail": None,
+    }
+
+    by_mode = {
+        "plain": plain,
+        "tui": tui,
+    }
+
+    for index in range(total):
+        phase = "measured" if index >= warmup else "warmup"
+        order = ("plain", "tui") if index % 2 == 0 else ("tui", "plain")
+
+        for ui_mode in order:
+            result = _run_once(
+                ui_mode=ui_mode,
+                workload_command=workload_command,
+                max_iterations=max_iterations,
+                timeout_s=timeout_s,
+            )
+
+            mode_result = by_mode[ui_mode]
+            mode_result["returncodes"].append(result.returncode)
+            for message in result.fallback_messages:
+                if message not in mode_result["fallback_messages"]:
+                    mode_result["fallback_messages"].append(message)
+
+            if phase == "measured":
+                mode_result["measured_times_s"].append(result.elapsed_s)
+
+            mode_result["run_records"].append(
+                {
+                    "run_index": index + 1,
+                    "phase": phase,
+                    "elapsed_s": result.elapsed_s,
+                    "returncode": result.returncode,
+                    "fallback_detected": bool(result.fallback_messages),
+                    "fallback_messages": result.fallback_messages,
+                    "stdout_tail": _tail(result.stdout),
+                    "stderr_tail": _tail(result.stderr),
+                }
+            )
+
+            if result.returncode != 0:
+                snippet = _tail(result.stderr or result.stdout, max_chars=800)
+                mode_result["failed"] = True
+                mode_result["failure_detail"] = (
+                    f"{ui_mode} run failed (run={index + 1}/{total}, rc={result.returncode}): "
+                    f"{snippet}"
+                )
+                return plain, tui
+
+    return plain, tui
 
 
 def _write_json(path: Path, payload: dict[str, object]) -> None:
@@ -383,16 +547,7 @@ def main() -> int:
     }
 
     try:
-        plain_result = _run_mode_benchmark(
-            ui_mode="plain",
-            runs=args.runs,
-            warmup=args.warmup,
-            workload_command=args.command,
-            max_iterations=args.max_iterations,
-            timeout_s=args.timeout,
-        )
-        tui_result = _run_mode_benchmark(
-            ui_mode="tui",
+        plain_result, tui_result = _run_paired_benchmark(
             runs=args.runs,
             warmup=args.warmup,
             workload_command=args.command,

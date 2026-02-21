@@ -15,6 +15,18 @@ from syspilot.ui.events import is_critical_event
 
 
 DEFAULT_TUI_BIN_ENV = "SYSPILOT_TUI_BIN"
+TUI_WAIT_FOR_USER_ENV = "SYSPILOT_TUI_WAIT_FOR_USER"
+TUI_STDIN_BATCH_MAX = 64
+
+
+def should_wait_for_user_on_close(*, default: bool = True) -> bool:
+    raw = os.environ.get(TUI_WAIT_FOR_USER_ENV)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return True
 
 
 def is_interactive_tty() -> bool:
@@ -195,6 +207,14 @@ class TuneTuiSidecar:
         except Exception:
             pass
 
+        if self.wait_for_exit(timeout_s=wait_timeout_s):
+            return
+
+        try:
+            self._proc.kill()
+        except Exception:
+            pass
+
         _ = self.wait_for_exit(timeout_s=wait_timeout_s)
 
     def _writer_loop(self) -> None:
@@ -218,7 +238,23 @@ class TuneTuiSidecar:
 
             try:
                 _ = proc.stdin.write(item)
+                saw_end = False
+                for _ in range(TUI_STDIN_BATCH_MAX - 1):
+                    try:
+                        extra = self._q.get_nowait()
+                    except queue.Empty:
+                        break
+                    if extra is None:
+                        saw_end = True
+                        break
+                    _ = proc.stdin.write(extra)
                 proc.stdin.flush()
+                if saw_end:
+                    try:
+                        proc.stdin.close()
+                    except Exception:
+                        pass
+                    return
             except (BrokenPipeError, ValueError, OSError):
                 self._disconnected.set()
                 try:
@@ -309,7 +345,8 @@ class TuneTuiOrchestrator:
         self._log_silencer.restore()
         if sidecar is None:
             return
-        sidecar.close()
+        wait_timeout_s = 0.5 if wait_for_user else 0.02
+        sidecar.close(wait_timeout_s=wait_timeout_s)
 
 
 class _SyspilotConsoleLogSilencer:

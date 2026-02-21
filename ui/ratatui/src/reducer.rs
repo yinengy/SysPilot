@@ -23,6 +23,12 @@ pub fn reduce(state: &mut AppState, msg: AppMsg) {
             state.all_events.push(env.clone());
 
             let event_name = env.event.as_str();
+            if event_name == "exec.started" {
+                state.exec_running = true;
+            } else if event_name == "exec.finished" {
+                state.exec_running = false;
+            }
+
             if is_run_phase_event(&env) {
                 state.progress_events.push(env.clone());
             }
