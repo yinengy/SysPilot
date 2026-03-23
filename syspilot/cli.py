@@ -960,6 +960,301 @@ def _to_token_list(value: Any) -> list[str]:
     return []
 
 
+_SPAWN_HELP_OPTION_CACHE: dict[str, set[str] | None] = {}
+
+_LLAMA_BENCH_OPTION_ALIASES: dict[str, str] = {
+    "-m": "model",
+    "--model": "model",
+    "-p": "n_prompt",
+    "--n-prompt": "n_prompt",
+    "-n": "n_gen",
+    "--n-gen": "n_gen",
+    "-pg": "pp_tg",
+    "-d": "n_depth",
+    "--n-depth": "n_depth",
+    "-embd": "embeddings",
+    "--embeddings": "embeddings",
+    "-r": "repetitions",
+    "--repetitions": "repetitions",
+    "-o": "output",
+    "--output": "output",
+    "-oe": "output_err",
+    "--output-err": "output_err",
+    "-t": "threads",
+    "--threads": "threads",
+    "-C": "cpu_mask",
+    "--cpu-mask": "cpu_mask",
+    "--cpu-strict": "cpu_strict",
+    "--poll": "poll",
+    "--numa": "numa",
+    "--prio": "prio",
+    "-b": "batch_size",
+    "--batch-size": "batch_size",
+    "-ub": "ubatch_size",
+    "--ubatch-size": "ubatch_size",
+    "-ctk": "cache_type_k",
+    "--cache-type-k": "cache_type_k",
+    "-ctv": "cache_type_v",
+    "--cache-type-v": "cache_type_v",
+    "-ngl": "n_gpu_layers",
+    "--n-gpu-layers": "n_gpu_layers",
+    "-ncmoe": "n_cpu_moe",
+    "--n-cpu-moe": "n_cpu_moe",
+    "-sm": "split_mode",
+    "--split-mode": "split_mode",
+    "-mg": "main_gpu",
+    "--main-gpu": "main_gpu",
+    "-nkvo": "no_kv_offload",
+    "--no-kv-offload": "no_kv_offload",
+    "-fa": "flash_attn",
+    "--flash-attn": "flash_attn",
+    "-dev": "device",
+    "--device": "device",
+    "-mmp": "mmap",
+    "--mmap": "mmap",
+    "-ts": "tensor_split",
+    "--tensor-split": "tensor_split",
+    "-ot": "override_tensors",
+    "--override-tensors": "override_tensors",
+    "-nopo": "no_op_offload",
+    "--no-op-offload": "no_op_offload",
+    "-rpc": "rpc",
+    "--rpc": "rpc",
+}
+
+_LLAMA_BENCH_FIXED_OPTION_KEYS = {
+    "model",
+    "n_prompt",
+    "n_gen",
+    "pp_tg",
+    "n_depth",
+    "embeddings",
+    "repetitions",
+    "output",
+    "output_err",
+}
+
+_LLAMA_BENCH_MUTABLE_OPTION_KEYS = {
+    "threads",
+    "cpu_mask",
+    "cpu_strict",
+    "poll",
+    "numa",
+    "prio",
+    "batch_size",
+    "ubatch_size",
+    "cache_type_k",
+    "cache_type_v",
+    "n_gpu_layers",
+    "n_cpu_moe",
+    "split_mode",
+    "main_gpu",
+    "no_kv_offload",
+    "flash_attn",
+    "device",
+    "mmap",
+    "tensor_split",
+    "override_tensors",
+    "no_op_offload",
+    "rpc",
+}
+
+_LLAMA_BENCH_SINGLE_VALUE_OPTION_KEYS = {
+    "threads",
+    "batch_size",
+    "ubatch_size",
+}
+
+
+def _looks_like_numeric_token(token: str) -> bool:
+    try:
+        float(token)
+    except ValueError:
+        return False
+    return True
+
+
+def _is_option_token(token: str) -> bool:
+    return token.startswith("-") and token != "-" and not _looks_like_numeric_token(token)
+
+
+def _is_benchmark_sweep_value(value: str) -> bool:
+    stripped = value.strip()
+    if not stripped:
+        return False
+    if "," in stripped:
+        return True
+    return bool(re.fullmatch(r"-?\d+\s*-\s*-?\d+(?:[+*]-?\d+)?", stripped))
+
+
+def _parse_cli_command_signature(
+    command_tokens: list[str],
+) -> tuple[dict[str, list[str]], list[str]]:
+    options: dict[str, list[str]] = {}
+    positionals: list[str] = []
+
+    idx = 1
+    while idx < len(command_tokens):
+        token = command_tokens[idx]
+        if not _is_option_token(token):
+            positionals.append(token)
+            idx += 1
+            continue
+
+        option_name = token
+        option_value = ""
+        if token.startswith("--") and "=" in token:
+            option_name, option_value = token.split("=", 1)
+        elif idx + 1 < len(command_tokens):
+            next_token = command_tokens[idx + 1]
+            if not _is_option_token(next_token) or _looks_like_numeric_token(next_token):
+                option_value = next_token
+                idx += 1
+
+        options.setdefault(option_name, []).append(option_value)
+        idx += 1
+
+    return options, positionals
+
+
+def _discover_supported_cli_options(executable: str) -> set[str] | None:
+    cached = _SPAWN_HELP_OPTION_CACHE.get(executable)
+    if executable in _SPAWN_HELP_OPTION_CACHE:
+        return cached
+
+    for help_flag in ("--help", "-h"):
+        try:
+            completed = subprocess.run(
+                [executable, help_flag],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+        except (FileNotFoundError, PermissionError, OSError, subprocess.TimeoutExpired):
+            continue
+
+        help_text = (completed.stdout or "") + "\n" + (completed.stderr or "")
+        if not help_text.strip():
+            continue
+
+        matches = re.findall(
+            r"(?<![A-Za-z0-9_-])(\-\-[A-Za-z0-9][A-Za-z0-9-]*|\-[A-Za-z][A-Za-z0-9-]*)",
+            help_text,
+        )
+        options = set(matches)
+        if options:
+            _SPAWN_HELP_OPTION_CACHE[executable] = options
+            return options
+
+    _SPAWN_HELP_OPTION_CACHE[executable] = None
+    return None
+
+
+def _validate_cli_options_against_help(command_tokens: list[str]) -> list[str]:
+    if not command_tokens:
+        return ["candidate command was empty"]
+
+    supported_options = _discover_supported_cli_options(command_tokens[0])
+    if not supported_options:
+        return []
+
+    candidate_options, _ = _parse_cli_command_signature(command_tokens)
+    executable_name = Path(command_tokens[0]).name
+
+    issues: list[str] = []
+    for option_name in sorted(candidate_options.keys()):
+        if option_name not in supported_options:
+            issues.append(
+                f"option '{option_name}' is not supported by executable '{executable_name}'"
+            )
+
+    return issues
+
+
+def _canonicalize_llama_bench_options(
+    option_map: dict[str, list[str]],
+) -> tuple[dict[str, list[str]], list[str]]:
+    canonical: dict[str, list[str]] = {}
+    unknown: list[str] = []
+
+    for option_name, values in option_map.items():
+        canonical_name = _LLAMA_BENCH_OPTION_ALIASES.get(option_name)
+        if not canonical_name:
+            unknown.append(option_name)
+            continue
+        canonical.setdefault(canonical_name, []).extend(values)
+
+    return canonical, unknown
+
+
+def _validate_llama_bench_fairness(
+    base_command: list[str],
+    candidate_command: list[str],
+) -> list[str]:
+    base_options, base_positionals = _parse_cli_command_signature(base_command)
+    candidate_options, candidate_positionals = _parse_cli_command_signature(candidate_command)
+
+    issues: list[str] = []
+
+    if candidate_positionals != base_positionals:
+        issues.append("must keep positional arguments unchanged for fair benchmark comparison")
+
+    base_canonical, _ = _canonicalize_llama_bench_options(base_options)
+    candidate_canonical, unknown_candidate_options = _canonicalize_llama_bench_options(
+        candidate_options
+    )
+
+    for option_name in sorted(unknown_candidate_options):
+        issues.append(f"uses unsupported llama-bench option '{option_name}'")
+
+    for fixed_key in sorted(_LLAMA_BENCH_FIXED_OPTION_KEYS):
+        baseline_values = base_canonical.get(fixed_key)
+        candidate_values = candidate_canonical.get(fixed_key)
+
+        if baseline_values is None:
+            if candidate_values is not None:
+                issues.append(f"must not add workload-defining option '{fixed_key}'")
+            continue
+
+        if candidate_values is None:
+            issues.append(f"must keep '{fixed_key}' fixed to baseline value(s)")
+            continue
+
+        if candidate_values != baseline_values:
+            issues.append(f"must keep '{fixed_key}' fixed to baseline value(s)")
+
+    for canonical_key in sorted(candidate_canonical.keys()):
+        if canonical_key in base_canonical:
+            continue
+        if canonical_key not in _LLAMA_BENCH_MUTABLE_OPTION_KEYS:
+            issues.append(f"must not add non-tuning option '{canonical_key}'")
+
+    for option_key in sorted(_LLAMA_BENCH_SINGLE_VALUE_OPTION_KEYS):
+        for option_value in candidate_canonical.get(option_key, []):
+            if _is_benchmark_sweep_value(option_value):
+                issues.append(f"must use a single concrete value for '{option_key}' per trial")
+                break
+
+    return issues
+
+
+def _validate_spawn_command_rewrite(
+    base_command: list[str],
+    candidate_command: list[str],
+) -> list[str]:
+    if not base_command or not candidate_command:
+        return ["command rewrite validation received an empty command"]
+
+    issues = _validate_cli_options_against_help(candidate_command)
+
+    executable_name = Path(base_command[0]).name
+    if executable_name == "llama-bench":
+        issues.extend(_validate_llama_bench_fairness(base_command, candidate_command))
+
+    return issues
+
+
 def _parse_spawn_actions(response: str) -> dict[str, Any]:
     parsed = _extract_json_object(response)
     if not parsed:
@@ -1096,6 +1391,13 @@ def _build_spawn_execution_plan(
                     f"action[{idx}] command replacement must keep executable '{base_command[0]}'"
                 )
                 continue
+
+            rewrite_issues = _validate_spawn_command_rewrite(base_command, tokens)
+            if rewrite_issues:
+                for issue in rewrite_issues:
+                    skipped.append(f"action[{idx}] {issue}")
+                continue
+
             command_tokens = tokens
             command_replaced = True
             applied.append(f"command {' '.join(tokens)}")
@@ -1883,6 +2185,8 @@ async def _run_spawn_tune_loop_async(
 - Use only profiling evidence and loaded manuals.
 - Re-profile is performed each iteration; propose next-step actions for this iteration.
 - Avoid recommending exact commands already tried.
+- Keep workload-defining arguments fixed (model/input/token counts/repetitions/output mode) so comparisons stay fair.
+- Recommend only options that are valid for the target executable.
 - If evidence is insufficient, return no actions.
 - Return JSON only (no markdown, no prose).
 - Provide up to {max_iterations} candidates ordered best-first.
