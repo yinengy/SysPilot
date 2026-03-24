@@ -45,6 +45,14 @@ def test_parse_authorization_input_from_full_redirect_url():
     assert state == "state456"
 
 
+def test_parse_authorization_input_from_fragment_redirect_url():
+    code, state = parse_authorization_input(
+        "http://localhost:1455/auth/callback#code=abc123&state=state456"
+    )
+    assert code == "abc123"
+    assert state == "state456"
+
+
 def test_parse_authorization_input_from_compact_format():
     code, state = parse_authorization_input("abc123#state456")
     assert code == "abc123"

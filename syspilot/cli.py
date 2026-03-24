@@ -242,18 +242,24 @@ def auth() -> None:
 
 
 @auth.command("login")
-@click.option("--manual", is_flag=True, help="Use manual redirect URL paste flow")
+@click.option(
+    "--auto/--manual",
+    "auto",
+    default=False,
+    show_default=True,
+    help="Use automatic browser callback flow (default: manual URL paste)",
+)
 @click.option(
     "--timeout", default=180, type=int, show_default=True, help="OAuth callback timeout seconds"
 )
 @click.option("--auth-file", type=click.Path(), help="Path to save OpenAI auth credentials")
-def auth_login(manual: bool, timeout: int, auth_file: str | None) -> None:
+def auth_login(auto: bool, timeout: int, auth_file: str | None) -> None:
     verifier, challenge = create_pkce_verifier_and_challenge()
     state = create_state()
     auth_url = build_authorization_url(state, challenge)
 
     code: str | None = None
-    if not manual:
+    if auto:
         code, opened = wait_for_callback_code(
             state=state,
             timeout_seconds=timeout,

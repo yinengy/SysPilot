@@ -72,24 +72,28 @@ def parse_authorization_input(value: str) -> tuple[str | None, str | None]:
 
     try:
         parsed = urlparse(raw)
-        code = None
-        state = None
-        if parsed.query:
-            query = dict(parse_qsl(parsed.query, keep_blank_values=True))
-            code = query.get("code")
-            state = query.get("state")
-            if code:
-                return code, state
+        query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        fragment = dict(parse_qsl(parsed.fragment, keep_blank_values=True))
+        code = query.get("code") or fragment.get("code")
+        state = query.get("state") or fragment.get("state")
+        if code:
+            return code, state
     except Exception:
         pass
 
-    if "#" in raw:
-        code, state = raw.split("#", 1)
-        return code or None, state or None
-
     if "code=" in raw:
         query = dict(parse_qsl(raw, keep_blank_values=True))
-        return query.get("code"), query.get("state")
+        code = query.get("code")
+        if code:
+            return code, query.get("state")
+
+    if "#" in raw:
+        before_hash, after_hash = raw.split("#", 1)
+        fragment = dict(parse_qsl(after_hash, keep_blank_values=True))
+        code = fragment.get("code")
+        if code:
+            return code, fragment.get("state")
+        return before_hash or None, after_hash or None
 
     return raw, None
 
