@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import cast
 
 from syspilot_contract.checker import dump_contract_yaml
 from syspilot_contract.compose_contracts import compose_contracts, derive_conflict_hypotheses
@@ -84,19 +85,19 @@ def _contract(name: str, control_name: str, role: str = "consume") -> LibraryCon
 
 def test_compose_order_independent() -> None:
     openmp = _contract("OpenMP", "OMP_NUM_THREADS")
-    numactl = _contract("numactl", "NUMACTL_THREADS", role="reserve")
+    openblas = _contract("OpenBLAS", "OPENBLAS_NUM_THREADS")
 
-    first = compose_contracts("openmp_numactl", [openmp, numactl])
-    second = compose_contracts("openmp_numactl", [numactl, openmp])
+    first = compose_contracts("openmp_openblas", [openmp, openblas])
+    second = compose_contracts("openmp_openblas", [openblas, openmp])
 
     assert dump_contract_yaml(first) == dump_contract_yaml(second)
 
 
 def test_composer_derives_hypotheses_from_shared_resource() -> None:
     openmp = _contract("OpenMP", "OMP_NUM_THREADS")
-    numactl = _contract("numactl", "NUMACTL_THREADS", role="reserve")
+    openblas = _contract("OpenBLAS", "OPENBLAS_NUM_THREADS", role="reserve")
 
-    hypotheses = derive_conflict_hypotheses([openmp, numactl])
+    hypotheses = derive_conflict_hypotheses([openmp, openblas])
 
     assert hypotheses
     assert hypotheses[0].resource == "cpu.thread"
@@ -110,12 +111,12 @@ def test_contract_context_bundle_exposes_profile_actions_conflicts(tmp_path: Pat
     artifact_root = tmp_path / "artifacts"
     contract_root = tmp_path / "contracts"
     openmp = _contract("OpenMP", "OMP_NUM_THREADS")
-    numactl = _contract("numactl", "NUMACTL_THREADS", role="reserve")
+    openblas = _contract("OpenBLAS", "OPENBLAS_NUM_THREADS", role="reserve")
     write_contract_bundle("openmp", openmp, artifact_root, contract_root)
-    write_contract_bundle("numactl", numactl, artifact_root, contract_root)
+    write_contract_bundle("openblas", openblas, artifact_root, contract_root)
 
     context = build_agent_context_bundle(
-        ["openmp", "numactl"],
+        ["openmp", "openblas"],
         goal="improve throughput",
         symptom="thread contention",
         contract_root=contract_root,
@@ -126,3 +127,34 @@ def test_contract_context_bundle_exposes_profile_actions_conflicts(tmp_path: Pat
     assert context["candidate_actions"]
     assert context["conflicts"]
     assert context["validation"]
+
+
+def test_composed_contract_id_hydrates_library_refs_for_context(tmp_path: Path) -> None:
+    artifact_root = tmp_path / "artifacts"
+    contract_root = tmp_path / "contracts"
+    openmp = _contract("OpenMP", "OMP_NUM_THREADS")
+    openblas = _contract("OpenBLAS", "OPENBLAS_NUM_THREADS", role="reserve")
+    composed = compose_contracts("openmp_openblas", [openmp, openblas])
+
+    write_contract_bundle("openmp", openmp, artifact_root, contract_root)
+    write_contract_bundle("openblas", openblas, artifact_root, contract_root)
+    write_contract_bundle("openmp_openblas_composed", composed, artifact_root, contract_root)
+
+    context = build_agent_context_bundle(
+        ["openmp_openblas_composed"],
+        goal="improve throughput",
+        symptom="thread contention",
+        contract_root=contract_root,
+        max_items_per_section=3,
+    )
+
+    assert context["profile_first"]
+    assert context["candidate_actions"]
+    assert context["conflicts"]
+    assert context["validation"]
+    candidate_titles = {
+        item["title"]
+        for item in cast(list[dict[str, object]], context["candidate_actions"])
+        if "title" in item
+    }
+    assert "OMP_NUM_THREADS" in candidate_titles or "OPENBLAS_NUM_THREADS" in candidate_titles

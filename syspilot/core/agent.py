@@ -163,6 +163,8 @@ Available tools will be provided for each interaction."""
         self._tool_definitions: list[ToolDefinition] = []
         self._message_history: list[Message] = []
         self._running = False
+        self._llm_prompt_log_path: Path | None = None
+        self._llm_prompt_log_index = 0
 
         # Robust manual directory discovery
         manual_candidates = [
@@ -182,6 +184,47 @@ Available tools will be provided for each interaction."""
 
         # Initialize with system prompt (manuals will be loaded separately)
         self._update_system_prompt()
+
+    def enable_llm_prompt_logging(self, path: Path) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+        self._llm_prompt_log_path = path
+        self._llm_prompt_log_index = 0
+        return path
+
+    @staticmethod
+    def _message_to_prompt_dict(message: Message) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "role": message.role,
+            "content": message.content,
+        }
+        if message.tool_calls is not None:
+            payload["tool_calls"] = message.tool_calls
+        if message.tool_call_id is not None:
+            payload["tool_call_id"] = message.tool_call_id
+        return payload
+
+    @staticmethod
+    def _tool_to_prompt_dict(tool: ToolDefinition) -> dict[str, Any]:
+        return {
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": tool.parameters,
+        }
+
+    def _record_llm_prompt(self) -> None:
+        if self._llm_prompt_log_path is None:
+            return
+        self._llm_prompt_log_index += 1
+        payload = {
+            "index": self._llm_prompt_log_index,
+            "timestamp": datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
+            "state": self.state.value,
+            "messages": [self._message_to_prompt_dict(msg) for msg in self._message_history],
+            "tools": [self._tool_to_prompt_dict(tool) for tool in self._tool_definitions],
+        }
+        with self._llm_prompt_log_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload) + "\n")
 
     def _update_system_prompt(self) -> None:
         prompt_parts = [self.SYSTEM_PROMPT]
@@ -324,6 +367,7 @@ Respond with your analysis and any tool calls needed."""
             self._message_history.append(Message(role="user", content=context_msg))
 
         # Get LLM response
+        self._record_llm_prompt()
         response = await self.llm.chat(
             messages=self._message_history,
             tools=self._tool_definitions if self._tool_definitions else None,

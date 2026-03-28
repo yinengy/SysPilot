@@ -11,6 +11,7 @@ from click.testing import CliRunner
 from syspilot.cli import cli, _build_spawn_profiling_env, _summarize_spawn_runtime_output
 from syspilot.core.agent import SysPilotAgent
 from syspilot.core.llm import LLMTimeoutError
+from syspilot_contract.compose_contracts import compose_contracts
 from syspilot_contract.integration import write_contract_bundle
 from syspilot_contract.schemas import LibraryContract as LibraryContractDSL
 from syspilot_manual.integration import write_manual_bundle
@@ -196,7 +197,12 @@ class _DummyAgent:
         self.config = config
         self.context = SimpleNamespace(loaded_manuals={})
         self.prompts: list[str] = []
+        self.prompt_log_path: Path | None = None
         _DummyAgent.instances.append(self)
+
+    def enable_llm_prompt_logging(self, path: Path) -> Path:
+        self.prompt_log_path = path
+        return path
 
     def load_manuals(self, names: list[str]) -> dict[str, bool]:
         for name in names:
@@ -610,6 +616,55 @@ def test_spawn_mode_prefers_contract_context_before_manual(tmp_path: Path) -> No
     prompt = _DummyAgent.instances[0].prompts[0]
     assert '"candidate_actions"' in prompt
     assert '"os.context_switch_rate"' in prompt
+    assert "RAW MANUAL SHOULD NOT APPEAR" not in prompt
+
+
+def test_spawn_mode_accepts_composed_contract_without_manual_files(tmp_path: Path) -> None:
+    runner = CliRunner()
+    artifact_root = tmp_path / "artifacts"
+    contract_root = tmp_path / "contracts"
+    openmp = _library_contract("OpenMP", "OMP_NUM_THREADS")
+    openblas = _library_contract("OpenBLAS", "OPENBLAS_NUM_THREADS")
+    composed = compose_contracts("openmp_openblas", [openmp, openblas])
+    write_contract_bundle("openmp", openmp, artifact_root, contract_root)
+    write_contract_bundle("openblas", openblas, artifact_root, contract_root)
+    write_contract_bundle("openmp_openblas_composed", composed, artifact_root, contract_root)
+    _DummyAgent.instances.clear()
+
+    with (
+        patch("syspilot.cli.SysPilotAgent", _DummyAgent),
+        patch("syspilot.cli._register_default_skills", _noop),
+        patch("syspilot.cli._register_profiling_tools", _noop),
+        patch("syspilot.cli._register_tuning_tools", _noop),
+        patch("syspilot.cli._run_live_profiling_pipeline", _fake_live_profile),
+        patch("syspilot.cli._run_command", _fake_run_command),
+        patch("syspilot.cli._discover_manual_root", return_value=None),
+        patch("syspilot.cli._discover_contract_root", return_value=contract_root),
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "tune",
+                "--ui-mode",
+                "plain",
+                "--command",
+                "echo hi",
+                "--manual",
+                "openmp_openblas_composed",
+                "--max-iterations",
+                "1",
+                "--timeout",
+                "1",
+                "--no-parse-output",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert _DummyAgent.instances
+    assert _DummyAgent.instances[0].context.loaded_manuals == {}
+    prompt = _DummyAgent.instances[0].prompts[0]
+    assert '"candidate_actions"' in prompt
+    assert '"conflicts"' in prompt
     assert "RAW MANUAL SHOULD NOT APPEAR" not in prompt
 
 

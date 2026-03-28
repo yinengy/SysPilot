@@ -16,7 +16,11 @@ FIXTURE_ROOT = Path(__file__).resolve().parents[1] / "examples" / "manual_mvp"
 
 
 def _library_contract(name: str = "OpenMP") -> LibraryContract:
-    control_name = "OMP_NUM_THREADS" if name == "OpenMP" else "NUMACTL_THREADS"
+    control_name_map = {
+        "OpenMP": "OMP_NUM_THREADS",
+        "OpenBLAS": "OPENBLAS_NUM_THREADS",
+    }
+    control_name = control_name_map.get(name, "THREADS")
     return LibraryContract.model_validate(
         {
             "contract": name,
@@ -214,7 +218,7 @@ def test_compose_contracts_and_build_agent_context_commands(tmp_path: Path) -> N
     artifact_root = tmp_path / "artifacts"
     contract_root = tmp_path / "contracts"
     write_contract_bundle("openmp", _library_contract("OpenMP"), artifact_root, contract_root)
-    write_contract_bundle("numactl", _library_contract("numactl"), artifact_root, contract_root)
+    write_contract_bundle("openblas", _library_contract("OpenBLAS"), artifact_root, contract_root)
 
     compose_result = runner.invoke(
         cli,
@@ -225,7 +229,7 @@ def test_compose_contracts_and_build_agent_context_commands(tmp_path: Path) -> N
             "--contracts",
             "openmp",
             "--contracts",
-            "numactl",
+            "openblas",
             "--artifact-root",
             str(artifact_root),
             "--contract-root",
@@ -245,7 +249,7 @@ def test_compose_contracts_and_build_agent_context_commands(tmp_path: Path) -> N
             "--manuals",
             "openmp",
             "--manuals",
-            "numactl",
+            "openblas",
             "--goal",
             "improve throughput",
             "--contract-root",
@@ -254,6 +258,40 @@ def test_compose_contracts_and_build_agent_context_commands(tmp_path: Path) -> N
     )
     assert context_result.exit_code == 0
     payload = json.loads(context_result.output)
+    assert payload["profile_first"]
+    assert payload["candidate_actions"]
+    assert payload["conflicts"]
+
+
+def test_build_agent_context_accepts_composed_contract_id(tmp_path: Path) -> None:
+    runner = CliRunner()
+    artifact_root = tmp_path / "artifacts"
+    contract_root = tmp_path / "contracts"
+    write_contract_bundle("openmp", _library_contract("OpenMP"), artifact_root, contract_root)
+    write_contract_bundle("openblas", _library_contract("OpenBLAS"), artifact_root, contract_root)
+    from syspilot_contract.compose_contracts import compose_contracts
+
+    composed = compose_contracts(
+        "openmp_openblas",
+        [_library_contract("OpenMP"), _library_contract("OpenBLAS")],
+    )
+    write_contract_bundle("openmp_openblas_composed", composed, artifact_root, contract_root)
+
+    result = runner.invoke(
+        cli,
+        [
+            "build-agent-context",
+            "--manuals",
+            "openmp_openblas_composed",
+            "--goal",
+            "improve throughput",
+            "--contract-root",
+            str(contract_root),
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
     assert payload["profile_first"]
     assert payload["candidate_actions"]
     assert payload["conflicts"]

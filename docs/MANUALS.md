@@ -73,12 +73,15 @@ For externally sourced generated manuals, keep a small repo-tracked source pack 
 Current source-pack examples:
 
 - `manual_sources/openmp/`
+- `manual_sources/openblas/`
 - `manual_sources/numactl/`
 
 ### Runtime behavior
 
 - The existing manual runtime still loads `manual/<name>.md` as raw markdown.
 - Spawn-mode tuning now prefers a structured LPCL `build_agent_context(...)` bundle when `contracts/<name>/contract.yaml` exists.
+- A composed contract like `contracts/openmp_openblas_composed/contract.yaml` can now be passed directly as a runtime knowledge input; SysPilot resolves `selected_contracts` plus hypothesis refs back into concrete controls, signals, recipes, assumptions, and shared-resource facts before building the agent context bundle.
+- When structured contract context is available, tune no longer needs matching raw library manuals to be present.
 - If no contract artifact exists, spawn mode falls back to the structured manual bundle when `manual/<name>/manual.json` exists.
 - If neither structured contract nor structured manual artifacts exist, spawn mode falls back to the current markdown-excerpt behavior.
 - Attach/monitor/analyze flows remain compatible with markdown-only manuals.
@@ -157,20 +160,22 @@ syspilot query --manual openmp --section observability_map --keywords threads --
 # Build a focused structured context bundle for the autotuner
 syspilot build-agent-context --manuals xgboost --manuals openmp --goal maximize_throughput --symptom throughput_plateau
 
-# Generate new OpenMP and numactl manuals from authoritative local source packs
+# Build context directly from a composed LPCL contract
+syspilot build-agent-context --manuals openmp_openblas_composed --goal improve_throughput --contract-root contracts
+
+# Generate new OpenMP and OpenBLAS library contracts from authoritative local source packs
 syspilot ingest --library openmp --docs manual_sources/openmp --metadata manual_sources/openmp/metadata.json
 syspilot extract-evidence --library openmp
 syspilot synthesize-manual --library openmp
 syspilot synthesize-contract --library openmp --contract-root contracts
 
-syspilot ingest --library numactl --docs manual_sources/numactl --metadata manual_sources/numactl/metadata.json
-syspilot extract-evidence --library numactl
-syspilot synthesize-manual --library numactl
-syspilot synthesize-contract --library numactl --contract-root contracts
+syspilot ingest --library openblas --docs manual_sources/openblas --metadata manual_sources/openblas/metadata.json
+syspilot extract-evidence --library openblas
+syspilot synthesize-manual --library openblas
+syspilot synthesize-contract --library openblas --contract-root contracts
 
-# Compose them for a STREAM-style OpenMP workload
-syspilot compose-manuals --app stream_openmp_numactl --libraries openmp --libraries numactl
-syspilot compose-contracts --app stream_openmp_numactl --contracts openmp --contracts numactl --contract-root contracts
+# Compose the library contracts for an OpenMP + OpenBLAS workload
+syspilot compose-contracts --app openmp_openblas --contracts openmp --contracts openblas --contract-root contracts
 ```
 
 ### Programmatic Usage

@@ -606,6 +606,41 @@ def _build_structured_context_bundle(
     return {}
 
 
+def _build_contract_context_bundle(
+    contracts: list[str],
+    *,
+    goal: str | None,
+    symptom: str | None,
+    max_items_per_section: int,
+    contract_root: Path | None,
+) -> dict[str, object]:
+    if contract_root is None:
+        return {}
+    try:
+        from syspilot_contract.integration import (
+            build_agent_context_bundle as build_contract_context_bundle,
+        )
+
+        bundle = build_contract_context_bundle(
+            contracts,
+            goal=goal,
+            symptom=symptom,
+            max_items_per_section=max_items_per_section,
+            contract_root=contract_root,
+        )
+        return bundle if _has_structured_context(bundle) else {}
+    except KeyError:
+        return {}
+    except Exception as exc:
+        logger.debug("Structured contract context unavailable: %s", exc)
+        return {}
+
+
+def _default_tune_prompt_log_path() -> Path:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return Path("artifacts") / "tune_llm_prompts" / f"{stamp}.jsonl"
+
+
 @cli.command("ingest")
 @click.option("--library", required=True, help="Library name or manual ID")
 @click.option(
@@ -1173,15 +1208,29 @@ def tune(
     config.tuning.max_tuning_iterations = max_iterations
 
     agent = SysPilotAgent(config)
+    prompt_log_path = agent.enable_llm_prompt_logging(_default_tune_prompt_log_path())
+    sink.print(f"[cyan]Saving LLM prompts to: {prompt_log_path}[/cyan]")
+
+    contract_root = _discover_contract_root()
+    structured_contract_bundle = _build_contract_context_bundle(
+        list(manual),
+        goal="improve throughput",
+        symptom=None,
+        max_items_per_section=5,
+        contract_root=contract_root,
+    )
 
     if manual:
-        sink.print(f"[cyan]Loading manuals: {', '.join(manual)}[/cyan]")
-        results = agent.load_manuals(list(manual))
-        for manual_name, success in results.items():
-            if success:
-                sink.print(f"  [green]✓ Loaded: {manual_name}[/green]")
-            else:
-                sink.print(f"  [red]✗ Failed: {manual_name}[/red]")
+        if _has_structured_context(structured_contract_bundle):
+            sink.print(f"[cyan]Using structured contract context: {', '.join(manual)}[/cyan]")
+        else:
+            sink.print(f"[cyan]Loading manuals: {', '.join(manual)}[/cyan]")
+            results = agent.load_manuals(list(manual))
+            for manual_name, success in results.items():
+                if success:
+                    sink.print(f"  [green]✓ Loaded: {manual_name}[/green]")
+                else:
+                    sink.print(f"  [red]✗ Failed: {manual_name}[/red]")
 
     manager = ProfilingManager()
     tuner = ApplicationTuner(config.tuning)
