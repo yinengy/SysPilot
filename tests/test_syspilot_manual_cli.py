@@ -11,6 +11,8 @@ from click.testing import CliRunner
 from syspilot.cli import cli, _build_spawn_profiling_env, _summarize_spawn_runtime_output
 from syspilot.core.agent import SysPilotAgent
 from syspilot.core.llm import LLMTimeoutError
+from syspilot_contract.integration import write_contract_bundle
+from syspilot_contract.schemas import LibraryContract as LibraryContractDSL
 from syspilot_manual.integration import write_manual_bundle
 from syspilot_manual.schemas import LibraryManual
 
@@ -96,6 +98,87 @@ def _library_manual(manual_id: str, library_name: str) -> LibraryManual:
                     }
                 ],
             },
+        }
+    )
+
+
+def _library_contract(
+    contract_name: str, control_name: str = "OMP_NUM_THREADS"
+) -> LibraryContractDSL:
+    return LibraryContractDSL.model_validate(
+        {
+            "contract": contract_name,
+            "version": "lpcl/v0",
+            "contract_type": "library",
+            "source_artifacts": [
+                {
+                    "source_id": f"{contract_name}_doc",
+                    "path": f"docs/{contract_name}.md",
+                    "kind": "doc",
+                }
+            ],
+            "uses": [
+                {
+                    "id": "threads",
+                    "resource": "cpu.thread",
+                    "phase": "compute",
+                    "scope": "process",
+                    "role": "consume",
+                    "sharing": "partitionable",
+                    "demand": {
+                        "kind": "scaled_by",
+                        "knob": control_name,
+                        "lower": 1,
+                        "upper": "host.physical_cores",
+                    },
+                    "source_refs": [f"{contract_name}_doc:chunk_001"],
+                }
+            ],
+            "assumptions": [
+                {
+                    "id": "solo_compute_pool",
+                    "predicate": {
+                        "kind": "max_competitors",
+                        "resource": "cpu.thread",
+                        "phase": "compute",
+                        "value": 1,
+                    },
+                    "source_refs": [f"{contract_name}_doc:chunk_001"],
+                }
+            ],
+            "controls": [
+                {
+                    "id": "omp_num_threads",
+                    "name": control_name,
+                    "kind": "env",
+                    "type": "int",
+                    "affects": ["threads"],
+                    "effect": {"op": "increase", "resource": "cpu.thread", "strength": "strong"},
+                    "scope": "process",
+                    "source_refs": [f"{contract_name}_doc:chunk_001"],
+                }
+            ],
+            "signals": [
+                {
+                    "id": "ctx_switch_rate",
+                    "metric": "os.context_switch_rate",
+                    "resource": "cpu.thread",
+                    "indicates": "contention",
+                    "tool": "perf",
+                    "source_refs": [f"{contract_name}_doc:chunk_001"],
+                }
+            ],
+            "recipes": [
+                {
+                    "id": "reduce_oversubscription",
+                    "hypothesis_kind": "shared_cpu_thread_conflict",
+                    "collect": ["ctx_switch_rate"],
+                    "actions": [f"decrease {control_name}"],
+                    "accept_if": "throughput improves",
+                    "rollback_if": "throughput regresses",
+                    "source_refs": [f"{contract_name}_doc:chunk_001"],
+                }
+            ],
         }
     )
 
@@ -482,6 +565,50 @@ def test_spawn_mode_prefers_structured_manual_context(tmp_path: Path) -> None:
     assert _DummyAgent.instances
     prompt = _DummyAgent.instances[0].prompts[0]
     assert '"candidate_actions"' in prompt
+    assert "RAW MANUAL SHOULD NOT APPEAR" not in prompt
+
+
+def test_spawn_mode_prefers_contract_context_before_manual(tmp_path: Path) -> None:
+    runner = CliRunner()
+    artifact_root = tmp_path / "artifacts"
+    manual_root = tmp_path / "manual"
+    contract_root = tmp_path / "contracts"
+    write_contract_bundle("openmp", _library_contract("OpenMP"), artifact_root, contract_root)
+    _DummyAgent.instances.clear()
+
+    with (
+        patch("syspilot.cli.SysPilotAgent", _DummyAgent),
+        patch("syspilot.cli._register_default_skills", _noop),
+        patch("syspilot.cli._register_profiling_tools", _noop),
+        patch("syspilot.cli._register_tuning_tools", _noop),
+        patch("syspilot.cli._run_live_profiling_pipeline", _fake_live_profile),
+        patch("syspilot.cli._run_command", _fake_run_command),
+        patch("syspilot.cli._discover_manual_root", return_value=manual_root),
+        patch("syspilot.cli._discover_contract_root", return_value=contract_root),
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "tune",
+                "--ui-mode",
+                "plain",
+                "--command",
+                "echo hi",
+                "--manual",
+                "openmp",
+                "--max-iterations",
+                "1",
+                "--timeout",
+                "1",
+                "--no-parse-output",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert _DummyAgent.instances
+    prompt = _DummyAgent.instances[0].prompts[0]
+    assert '"candidate_actions"' in prompt
+    assert '"os.context_switch_rate"' in prompt
     assert "RAW MANUAL SHOULD NOT APPEAR" not in prompt
 
 

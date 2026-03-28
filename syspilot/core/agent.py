@@ -200,11 +200,24 @@ Available tools will be provided for each interaction."""
         else:
             self._message_history.insert(0, Message(role="system", content=full_prompt))
 
-    def load_manual(self, manual_name: str) -> bool:
-        manual_path = self._manual_dir / f"{manual_name}.md"
+    def _manual_candidate_paths(self, manual_name: str) -> list[Path]:
+        return [
+            self._manual_dir / f"{manual_name}.md",
+            self._manual_dir / manual_name / "manual.md",
+        ]
 
-        if not manual_path.exists():
-            logger.warning(f"Manual not found: {manual_path}")
+    def load_manual(self, manual_name: str) -> bool:
+        manual_path = next(
+            (path for path in self._manual_candidate_paths(manual_name) if path.exists()),
+            None,
+        )
+
+        if manual_path is None:
+            logger.warning(
+                "Manual not found for %s (checked %s)",
+                manual_name,
+                ", ".join(str(path) for path in self._manual_candidate_paths(manual_name)),
+            )
             return False
 
         try:
@@ -228,7 +241,11 @@ Available tools will be provided for each interaction."""
     def list_available_manuals(self) -> list[str]:
         if not self._manual_dir.exists():
             return []
-        return [p.stem for p in self._manual_dir.glob("*.md")]
+        names = {p.stem for p in self._manual_dir.glob("*.md")}
+        for bundle_dir in (path for path in self._manual_dir.iterdir() if path.is_dir()):
+            if any((bundle_dir / name).exists() for name in ("manual.md", "manual.json")):
+                names.add(bundle_dir.name)
+        return sorted(names)
 
     def register_tool(
         self,

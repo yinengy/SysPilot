@@ -455,7 +455,14 @@ def manuals() -> None:
         )
         return
 
-    manuals_list = [p.stem for p in manual_dir.glob("*.md")]
+    manuals_map: dict[str, Path] = {p.stem: p for p in manual_dir.glob("*.md")}
+    for bundle_dir in (path for path in manual_dir.iterdir() if path.is_dir()):
+        for candidate_name in ("manual.md", "manual.json"):
+            candidate = bundle_dir / candidate_name
+            if candidate.exists() and bundle_dir.name not in manuals_map:
+                manuals_map[bundle_dir.name] = candidate
+                break
+    manuals_list = sorted(manuals_map)
 
     if not manuals_list:
         console.print("[yellow]No manuals available[/yellow]")
@@ -466,8 +473,7 @@ def manuals() -> None:
     table.add_column("Path", style="green")
 
     for manual_name in sorted(manuals_list):
-        manual_path = manual_dir / f"{manual_name}.md"
-        table.add_row(manual_name, str(manual_path))
+        table.add_row(manual_name, str(manuals_map[manual_name]))
 
     console.print(table)
     console.print("\n[dim]Use --manual/-m with monitor, analyze, or tune commands[/dim]")
@@ -505,6 +511,99 @@ def _resolve_manual_root(manual_root: Path | None, *, create: bool = False) -> P
     if create:
         fallback.mkdir(parents=True, exist_ok=True)
     return fallback
+
+
+def _discover_contract_root() -> Path | None:
+    contract_candidates = [
+        Path(__file__).resolve().parents[1] / "contracts",
+        Path("contracts"),
+        Path("~/.syspilot/contracts").expanduser(),
+    ]
+    for path in contract_candidates:
+        if path.exists() and path.is_dir():
+            return path
+    return None
+
+
+def _resolve_contract_root(contract_root: Path | None, *, create: bool = False) -> Path:
+    if contract_root is not None:
+        return contract_root
+
+    discovered = _discover_contract_root()
+    if discovered is not None:
+        return discovered
+
+    fallback = Path("contracts")
+    if create:
+        fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+
+def _contract_prompt_dir() -> Path:
+    return Path(__file__).resolve().parents[1] / "syspilot_contract" / "prompts"
+
+
+def _resolve_contract_path(contract_ref: str, contract_root: Path | None = None) -> Path:
+    candidate = Path(contract_ref).expanduser()
+    if candidate.exists():
+        return candidate
+    return _resolve_contract_root(contract_root) / contract_ref / "contract.yaml"
+
+
+def _has_structured_context(bundle: dict[str, object]) -> bool:
+    return any(
+        bundle.get(key) for key in ("profile_first", "candidate_actions", "conflicts", "validation")
+    )
+
+
+def _build_structured_context_bundle(
+    manuals: list[str],
+    *,
+    goal: str | None,
+    symptom: str | None,
+    max_items_per_section: int,
+    manual_root: Path | None,
+    contract_root: Path | None,
+) -> dict[str, object]:
+    if contract_root is not None:
+        try:
+            from syspilot_contract.integration import (
+                build_agent_context_bundle as build_contract_context_bundle,
+            )
+
+            contract_bundle = build_contract_context_bundle(
+                manuals,
+                goal=goal,
+                symptom=symptom,
+                max_items_per_section=max_items_per_section,
+                contract_root=contract_root,
+            )
+            if _has_structured_context(contract_bundle):
+                return contract_bundle
+        except KeyError:
+            pass
+        except Exception as exc:
+            logger.debug("Structured contract context unavailable: %s", exc)
+
+    if manual_root is not None:
+        try:
+            from syspilot_manual.integration import (
+                build_agent_context_bundle as build_manual_context_bundle,
+            )
+
+            manual_bundle = build_manual_context_bundle(
+                manuals,
+                goal=goal,
+                symptom=symptom,
+                max_items_per_section=max_items_per_section,
+                manual_root=manual_root,
+            )
+            if _has_structured_context(manual_bundle):
+                return manual_bundle
+        except Exception as exc:
+            logger.debug("Structured manual context unavailable: %s", exc)
+
+    return {}
 
 
 @cli.command("ingest")
@@ -649,6 +748,94 @@ def synthesize_manual_cmd(
     )
 
 
+@cli.command("synthesize-contract")
+@click.option("--library", required=True, help="Library name used during ingest")
+@click.option("--contract-id", help="Override contract ID (defaults to slugified library name)")
+@click.option(
+    "--artifact-root",
+    type=click.Path(path_type=Path),
+    default=Path("artifacts"),
+    show_default=True,
+    help="Artifact root containing extracted evidence",
+)
+@click.option(
+    "--contract-root",
+    type=click.Path(path_type=Path),
+    help="Runtime contract root",
+)
+@click.pass_context
+def synthesize_contract_cmd(
+    ctx: click.Context,
+    library: str,
+    contract_id: str | None,
+    artifact_root: Path,
+    contract_root: Path | None,
+) -> None:
+    from syspilot_contract.integration import synthesize_library_contract_bundle
+    from syspilot_manual.llm_client import ManualLLMClient
+
+    llm_client = ManualLLMClient(
+        config=_manual_pipeline_llm_config(ctx.obj["config"].llm, minimum_timeout_seconds=180.0),
+        prompt_dir=_contract_prompt_dir(),
+    )
+    resolved_contract_id = contract_id or _slugify_manual_id(library)
+    resolved_contract_root = _resolve_contract_root(contract_root, create=True)
+    contract = asyncio.run(
+        synthesize_library_contract_bundle(
+            contract_id=resolved_contract_id,
+            library_name=library,
+            artifact_root=artifact_root,
+            llm_client=llm_client,
+            contract_root=resolved_contract_root,
+            progress_callback=_contract_synthesis_progress_callback,
+        )
+    )
+    click.echo(
+        json.dumps(
+            {
+                "contract_id": resolved_contract_id,
+                "contract": contract.contract,
+                "contract_root": str(resolved_contract_root),
+                "bundle_dir": str(resolved_contract_root / resolved_contract_id),
+                "contract_yaml": str(
+                    resolved_contract_root / resolved_contract_id / "contract.yaml"
+                ),
+            },
+            indent=2,
+        )
+    )
+
+
+@cli.command("check-contract")
+@click.argument("contract_ref")
+@click.option(
+    "--contract-root",
+    type=click.Path(path_type=Path),
+    help="Optional runtime contract root for ID lookup",
+)
+def check_contract_cmd(contract_ref: str, contract_root: Path | None) -> None:
+    from syspilot_contract.checker import validate_contract_file
+
+    contract_path = _resolve_contract_path(contract_ref, contract_root)
+    if not contract_path.exists():
+        raise click.ClickException(f"Contract not found: {contract_path}")
+    contract, result = validate_contract_file(contract_path)
+    click.echo(
+        json.dumps(
+            {
+                "contract_path": str(contract_path),
+                "valid": result.valid,
+                "issues": result.issues,
+                "contract_type": getattr(contract, "contract_type", None),
+                "contract": getattr(contract, "contract", None),
+            },
+            indent=2,
+        )
+    )
+    if not result.valid:
+        raise SystemExit(1)
+
+
 @cli.command("render-manual")
 @click.option("--manual", "manual_id", required=True, help="Manual ID to render")
 @click.option(
@@ -757,6 +944,60 @@ def compose_manuals_cmd(
     )
 
 
+@cli.command("compose-contracts")
+@click.option("--app", required=True, help="Application or workload name")
+@click.option(
+    "--contracts",
+    multiple=True,
+    required=True,
+    help="Selected contract IDs or contract.yaml paths",
+)
+@click.option("--contract-id", help="Override composed contract ID (defaults to <app>_composed)")
+@click.option(
+    "--artifact-root",
+    type=click.Path(path_type=Path),
+    default=Path("artifacts"),
+    show_default=True,
+)
+@click.option(
+    "--contract-root",
+    type=click.Path(path_type=Path),
+)
+def compose_contracts_cmd(
+    app: str,
+    contracts: tuple[str, ...],
+    contract_id: str | None,
+    artifact_root: Path,
+    contract_root: Path | None,
+) -> None:
+    from syspilot_contract.integration import compose_and_write_contract
+
+    resolved_contract_id = contract_id or f"{_slugify_manual_id(app)}_composed"
+    resolved_contract_root = _resolve_contract_root(contract_root, create=True)
+    composed = compose_and_write_contract(
+        contract_id=resolved_contract_id,
+        app_name=app,
+        contract_refs=list(contracts),
+        artifact_root=artifact_root,
+        contract_root=resolved_contract_root,
+        progress_callback=_contract_composition_progress_callback,
+    )
+    click.echo(
+        json.dumps(
+            {
+                "contract_id": resolved_contract_id,
+                "contract": composed.contract,
+                "contract_root": str(resolved_contract_root),
+                "bundle_dir": str(resolved_contract_root / resolved_contract_id),
+                "contract_yaml": str(
+                    resolved_contract_root / resolved_contract_id / "contract.yaml"
+                ),
+            },
+            indent=2,
+        )
+    )
+
+
 @cli.command("query")
 @click.option("--manual", "manual_id", required=True, help="Manual ID to query")
 @click.option("--section", help="Section name")
@@ -798,21 +1039,25 @@ def query_manual_cmd(
     "--manual-root",
     type=click.Path(path_type=Path),
 )
+@click.option(
+    "--contract-root",
+    type=click.Path(path_type=Path),
+)
 def build_agent_context_cmd(
     manuals: tuple[str, ...],
     goal: str | None,
     symptom: str | None,
     max_items_per_section: int,
     manual_root: Path | None,
+    contract_root: Path | None,
 ) -> None:
-    from syspilot_manual.integration import build_agent_context_bundle
-
-    bundle = build_agent_context_bundle(
+    bundle = _build_structured_context_bundle(
         list(manuals),
         goal=goal,
         symptom=symptom,
         max_items_per_section=max_items_per_section,
-        manual_root=_resolve_manual_root(manual_root),
+        manual_root=manual_root if manual_root is not None else _discover_manual_root(),
+        contract_root=contract_root if contract_root is not None else _discover_contract_root(),
     )
     click.echo(json.dumps(bundle, indent=2))
 
@@ -1282,26 +1527,19 @@ def _build_spawn_manual_context(manuals: tuple[str, ...]) -> str:
         return ""
 
     manual_root = _discover_manual_root()
-    if manual_root is None:
+    contract_root = _discover_contract_root()
+    if manual_root is None and contract_root is None:
         return ""
 
-    try:
-        from syspilot_manual.integration import build_agent_context_bundle
-
-        context_bundle = build_agent_context_bundle(
-            list(manuals),
-            goal="improve throughput",
-            manual_root=manual_root,
-            max_items_per_section=5,
-        )
-    except Exception as exc:
-        logger.warning("Structured manual context unavailable: %s", exc)
-        return ""
-
-    if not any(
-        context_bundle.get(key)
-        for key in ("profile_first", "candidate_actions", "conflicts", "validation")
-    ):
+    context_bundle = _build_structured_context_bundle(
+        list(manuals),
+        goal="improve throughput",
+        symptom=None,
+        max_items_per_section=5,
+        manual_root=manual_root,
+        contract_root=contract_root,
+    )
+    if not _has_structured_context(context_bundle):
         return ""
 
     return json.dumps(context_bundle, indent=2)
@@ -1388,6 +1626,32 @@ def _manual_composition_progress_callback(progress: object) -> None:
     click.echo(
         "[compose-manuals] "
         f"{progress.app_name}/{progress.manual_id} phase={progress.status} "
+        f"libraries={progress.library_count} elapsed={_format_progress_duration(progress.elapsed_s)} "
+        f"eta={_format_progress_duration(progress.eta_s)} finish~{_format_progress_finish_time(progress.eta_s)}"
+    )
+
+
+def _contract_synthesis_progress_callback(progress: object) -> None:
+    from syspilot_contract.integration import ContractSynthesisProgress
+
+    if not isinstance(progress, ContractSynthesisProgress):
+        return
+    click.echo(
+        "[synthesize-contract] "
+        f"{progress.library_name}/{progress.contract_id} phase={progress.status} "
+        f"evidence={progress.evidence_items} elapsed={_format_progress_duration(progress.elapsed_s)} "
+        f"eta={_format_progress_duration(progress.eta_s)} finish~{_format_progress_finish_time(progress.eta_s)}"
+    )
+
+
+def _contract_composition_progress_callback(progress: object) -> None:
+    from syspilot_contract.integration import ContractCompositionProgress
+
+    if not isinstance(progress, ContractCompositionProgress):
+        return
+    click.echo(
+        "[compose-contracts] "
+        f"{progress.app_name}/{progress.contract_id} phase={progress.status} "
         f"libraries={progress.library_count} elapsed={_format_progress_duration(progress.elapsed_s)} "
         f"eta={_format_progress_duration(progress.eta_s)} finish~{_format_progress_finish_time(progress.eta_s)}"
     )

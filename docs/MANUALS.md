@@ -8,6 +8,21 @@ The manual system provides agent-readable documentation for tuning libraries, to
 
 SysPilot now supports a JSON-first manual bundle for auto-generated manuals while preserving the existing handwritten markdown path.
 
+## LPCL Contract Pipeline
+
+SysPilot now also supports a YAML-based LPCL contract pipeline that can replace the structured manual-generation path operationally while keeping the manual pipeline code intact for ablation.
+
+### Contract bundle layout
+
+For a generated contract named `openmp`, the runtime-compatible outputs are:
+
+- `contracts/openmp/contract.yaml` — LPCL source of truth
+
+Artifact/debug outputs are also written under:
+
+- `artifacts/contracts/`
+- `artifacts/composed_contracts/`
+
 ### Bundle layout
 
 For a generated manual named `openmp`, the runtime-compatible outputs are:
@@ -42,8 +57,9 @@ Current source-pack examples:
 ### Runtime behavior
 
 - The existing manual runtime still loads `manual/<name>.md` as raw markdown.
-- Spawn-mode tuning now prefers a structured `build_agent_context(...)` bundle when `manual/<name>/manual.json` exists.
-- If structured artifacts are missing, spawn mode falls back to the current markdown-excerpt behavior.
+- Spawn-mode tuning now prefers a structured LPCL `build_agent_context(...)` bundle when `contracts/<name>/contract.yaml` exists.
+- If no contract artifact exists, spawn mode falls back to the structured manual bundle when `manual/<name>/manual.json` exists.
+- If neither structured contract nor structured manual artifacts exist, spawn mode falls back to the current markdown-excerpt behavior.
 - Attach/monitor/analyze flows remain compatible with markdown-only manuals.
 - Long-running `extract-evidence` runs now report progress + ETA, checkpoint successful chunk results, and resume from remaining chunks after interruption.
 - `synthesize-manual` and `compose-manuals` now report phase progress + ETA and fail fast on bounded LLM timeouts instead of hanging indefinitely.
@@ -96,6 +112,12 @@ syspilot extract-evidence --library openmp
 # Synthesize a JSON-first manual bundle
 syspilot synthesize-manual --library openmp
 
+# Synthesize an LPCL contract bundle from the same evidence
+syspilot synthesize-contract --library openmp
+
+# Validate an LPCL contract file or contract ID
+syspilot check-contract contracts/openmp/contract.yaml
+
 # Re-render compatibility markdown from manual.json
 syspilot render-manual --manual openmp
 
@@ -104,6 +126,9 @@ syspilot build-index --manual openmp
 
 # Compose multiple manuals into an app-level manual
 syspilot compose-manuals --app xgb_train --libraries xgboost --libraries openmp
+
+# Compose multiple LPCL contracts into conflict hypotheses
+syspilot compose-contracts --app xgb_train --contracts xgboost --contracts openmp
 
 # Query targeted manual slices
 syspilot query --manual openmp --section observability_map --keywords threads --keywords oversubscription
@@ -115,13 +140,16 @@ syspilot build-agent-context --manuals xgboost --manuals openmp --goal maximize_
 syspilot ingest --library openmp --docs manual_sources/openmp --metadata manual_sources/openmp/metadata.json
 syspilot extract-evidence --library openmp
 syspilot synthesize-manual --library openmp
+syspilot synthesize-contract --library openmp --contract-root contracts
 
 syspilot ingest --library numactl --docs manual_sources/numactl --metadata manual_sources/numactl/metadata.json
 syspilot extract-evidence --library numactl
 syspilot synthesize-manual --library numactl
+syspilot synthesize-contract --library numactl --contract-root contracts
 
 # Compose them for a STREAM-style OpenMP workload
 syspilot compose-manuals --app stream_openmp_numactl --libraries openmp --libraries numactl
+syspilot compose-contracts --app stream_openmp_numactl --contracts openmp --contracts numactl --contract-root contracts
 ```
 
 ### Programmatic Usage

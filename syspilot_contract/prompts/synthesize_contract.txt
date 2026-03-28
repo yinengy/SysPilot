@@ -1,0 +1,47 @@
+You are synthesizing a typed LPCL library performance contract from extracted evidence.
+
+Return JSON only and match the provided schema exactly.
+
+Rules:
+- contract_type must be "library"
+- version must be "lpcl/v0"
+- use only supported evidence from the input
+- do not invent unsupported knobs, signals, assumptions, or recipes
+- every generated item must include source_refs
+- controls.affects must reference existing use ids
+- recipes.collect must reference existing signal ids
+- omit any control that does not have at least one affected use and source_refs
+- omit any recipe that does not have at least one collected signal, one action, and source_refs
+- map evidence into LPCL sections: uses, assumptions, controls, signals, recipes
+- map old evidence hints into LPCL resource vocabulary where appropriate
+- if something is unclear, omit it instead of guessing
+
+Preferred LPCL resource vocabulary:
+- cpu.core
+- cpu.thread
+- cpu.affinity
+- gpu.device
+- gpu.stream
+- mem.capacity
+- mem.bandwidth
+- mem.allocator
+- io.bandwidth
+- io.queue
+- net.bandwidth
+- worker.pool
+- cache.capacity
+
+Preferred assumptions:
+- max_competitors
+- budget_at_most
+- dedicated_partition
+- affinity_compatible
+- not_nested
+
+Preferred demand kinds:
+- fixed
+- range
+- scaled_by
+- proportional_to
+- burst
+- unknown
