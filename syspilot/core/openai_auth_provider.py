@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import base64
+import contextlib
 import json
 import os
 import time
@@ -8,7 +10,16 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 from syspilot.core.config import LLMConfig
-from syspilot.core.llm import BaseLLMProvider, LLMResponse, Message, ToolDefinition
+from syspilot.core.llm import (
+    BaseLLMProvider,
+    LLMProviderError,
+    LLMResponse,
+    LLMTimeoutError,
+    Message,
+    ToolDefinition,
+    _format_timeout_seconds,
+    _is_transient_exception,
+)
 from syspilot.core.openai_auth import (
     ACCOUNT_CLAIM,
     CLIENT_ID,
@@ -28,6 +39,17 @@ class OpenAIAuthProvider(BaseLLMProvider):
 
     def __init__(self, config: LLMConfig) -> None:
         self.config = config
+        self._auth_lock = asyncio.Lock()
+
+    def _request_timeout_seconds(self) -> float:
+        return max(float(self.config.timeout_seconds), 0.001)
+
+    def _wrap_provider_error(self, exc: BaseException, context: str) -> LLMProviderError:
+        message = str(exc).strip() or exc.__class__.__name__
+        return LLMProviderError(
+            f"OpenAI auth {context} failed: {message}",
+            retryable=_is_transient_exception(exc),
+        )
 
     def _resolve_model(self) -> str:
         normalized = (self.config.model or "").strip().lower()
@@ -66,17 +88,14 @@ class OpenAIAuthProvider(BaseLLMProvider):
     def _load_auth(self) -> dict[str, Any]:
         if not self.auth_path.exists():
             raise ValueError(
-                f"OpenAI auth file not found at {self.auth_path}. "
-                "Run 'syspilot auth login' first."
+                f"OpenAI auth file not found at {self.auth_path}. Run 'syspilot auth login' first."
             )
 
         with open(self.auth_path, "r") as f:
             data = json.load(f)
 
         if data.get("type") != "oauth":
-            raise ValueError(
-                f"Unsupported auth type in {self.auth_path}: {data.get('type')}"
-            )
+            raise ValueError(f"Unsupported auth type in {self.auth_path}: {data.get('type')}")
 
         access = data.get("access")
         refresh = data.get("refresh")
@@ -120,8 +139,7 @@ class OpenAIAuthProvider(BaseLLMProvider):
 
         if response.status_code >= 400:
             raise ValueError(
-                "Failed to refresh OpenAI token "
-                f"(status {response.status_code}): {response.text}"
+                f"Failed to refresh OpenAI token (status {response.status_code}): {response.text}"
             )
 
         payload = response.json()
@@ -165,8 +183,13 @@ class OpenAIAuthProvider(BaseLLMProvider):
 
     async def _resolve_auth(self) -> dict[str, Any]:
         auth = self._load_auth()
-        if self._is_expired(auth):
-            auth = await self._refresh_auth(auth)
+        if not self._is_expired(auth):
+            return auth
+
+        async with self._auth_lock:
+            auth = self._load_auth()
+            if self._is_expired(auth):
+                auth = await self._refresh_auth(auth)
         return auth
 
     async def _build_client(self) -> Any:
@@ -315,6 +338,12 @@ class OpenAIAuthProvider(BaseLLMProvider):
             normalized.append("reasoning.encrypted_content")
         return normalized
 
+    async def _collect_final_response(self, client: Any, request_kwargs: dict[str, Any]) -> Any:
+        async with client.responses.stream(**request_kwargs) as stream:
+            async for _ in stream:
+                pass
+            return await stream.get_final_response()
+
     async def chat(
         self,
         messages: list[Message],
@@ -336,10 +365,18 @@ class OpenAIAuthProvider(BaseLLMProvider):
             if tools:
                 request_kwargs["tools"] = self._convert_tools(tools)
 
-            async with client.responses.stream(**request_kwargs) as stream:
-                async for _ in stream:
-                    pass
-                response = await stream.get_final_response()
+            try:
+                response = await asyncio.wait_for(
+                    self._collect_final_response(client, request_kwargs),
+                    timeout=self._request_timeout_seconds(),
+                )
+            except asyncio.TimeoutError as exc:
+                raise LLMTimeoutError(
+                    "OpenAI auth final response timed out after "
+                    f"{_format_timeout_seconds(self._request_timeout_seconds())}"
+                ) from exc
+            except Exception as exc:
+                raise self._wrap_provider_error(exc, "final response") from exc
 
             tool_calls = self._extract_tool_calls(response)
             return LLMResponse(
@@ -358,6 +395,9 @@ class OpenAIAuthProvider(BaseLLMProvider):
         **kwargs: Any,
     ) -> AsyncIterator[str]:
         client = await self._build_client()
+        timeout_seconds = self._request_timeout_seconds()
+        stream_cm: Any = None
+        stream: Any = None
         try:
             input_items, instructions = self._prepare_input(messages)
             request_kwargs: dict[str, Any] = {
@@ -372,11 +412,38 @@ class OpenAIAuthProvider(BaseLLMProvider):
             if tools:
                 request_kwargs["tools"] = self._convert_tools(tools)
 
-            async with client.responses.stream(**request_kwargs) as stream:
-                async for event in stream:
-                    if getattr(event, "type", None) == "response.output_text.delta":
-                        delta = getattr(event, "delta", None)
-                        if delta:
-                            yield delta
+            stream_cm = client.responses.stream(**request_kwargs)
+            try:
+                stream = await asyncio.wait_for(stream_cm.__aenter__(), timeout=timeout_seconds)
+            except asyncio.TimeoutError as exc:
+                raise LLMTimeoutError(
+                    "OpenAI auth stream setup timed out after "
+                    f"{_format_timeout_seconds(timeout_seconds)}"
+                ) from exc
+            except Exception as exc:
+                raise self._wrap_provider_error(exc, "stream setup") from exc
+
+            while True:
+                try:
+                    event = await asyncio.wait_for(anext(stream), timeout=timeout_seconds)
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError as exc:
+                    raise LLMTimeoutError(
+                        "OpenAI auth stream timed out after "
+                        f"{_format_timeout_seconds(timeout_seconds)}"
+                    ) from exc
+                except Exception as exc:
+                    raise self._wrap_provider_error(exc, "streaming response") from exc
+
+                if getattr(event, "type", None) == "response.output_text.delta":
+                    delta = getattr(event, "delta", None)
+                    if delta:
+                        yield delta
         finally:
+            if stream_cm is not None:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(
+                        stream_cm.__aexit__(None, None, None), timeout=timeout_seconds
+                    )
             await client.close()

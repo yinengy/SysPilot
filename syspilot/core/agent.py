@@ -17,13 +17,14 @@ from pathlib import Path
 from typing import Any, Callable
 
 from syspilot.core.config import SysPilotConfig
-from syspilot.core.llm import LLMInterface, Message, ToolDefinition, LLMResponse
+from syspilot.core.llm import LLMError, LLMInterface, Message, ToolDefinition, LLMResponse
 
 logger = logging.getLogger(__name__)
 
 
 class AgentState(str, Enum):
     """Agent operational states."""
+
     IDLE = "idle"
     MONITORING = "monitoring"
     PROFILING = "profiling"
@@ -35,6 +36,7 @@ class AgentState(str, Enum):
 @dataclass
 class ProfileResult:
     """Result from a profiling operation."""
+
     timestamp: datetime
     source: str  # e.g., "cpu_collector", "ebpf_script", "custom_script"
     data: dict[str, Any]
@@ -46,6 +48,7 @@ class ProfileResult:
 @dataclass
 class TuningRecommendation:
     """A tuning recommendation from the agent."""
+
     parameter: str
     current_value: Any
     recommended_value: Any
@@ -57,6 +60,7 @@ class TuningRecommendation:
 @dataclass
 class AgentContext:
     """Context maintained by the agent across interactions."""
+
     target_pid: int | None = None
     target_name: str | None = None
     profile_history: list[ProfileResult] = field(default_factory=list)
@@ -64,37 +68,37 @@ class AgentContext:
     active_scripts: dict[str, str] = field(default_factory=dict)  # name -> script content
     system_baseline: dict[str, Any] = field(default_factory=dict)
     loaded_manuals: dict[str, str] = field(default_factory=dict)
-    
+
     def get_context_summary(self, max_profiles: int = 5) -> str:
         """Generate a condensed context summary for LLM."""
         lines = []
-        
+
         if self.target_pid:
             lines.append(f"Target Process: PID {self.target_pid}")
         if self.target_name:
             lines.append(f"Target Name: {self.target_name}")
-        
+
         if self.system_baseline:
             lines.append(f"System Baseline: {json.dumps(self.system_baseline, indent=2)}")
-        
+
         # Include recent profile summaries (not raw data)
         recent_profiles = self.profile_history[-max_profiles:]
         if recent_profiles:
             lines.append("\nRecent Profile Summaries:")
             for p in recent_profiles:
                 lines.append(f"  [{p.timestamp.isoformat()}] {p.source}: {p.summary}")
-        
+
         return "\n".join(lines)
 
 
 class SysPilotAgent:
     """
     Main SysPilot Agent.
-    
+
     Orchestrates system monitoring and application tuning using an LLM
     to dynamically generate profiling scripts and make tuning decisions.
     """
-    
+
     SYSTEM_PROMPT = """You are SysPilot, an AI agent specialized in system monitoring and application performance tuning.
 
 Your capabilities:
@@ -159,7 +163,7 @@ Available tools will be provided for each interaction."""
         self._tool_definitions: list[ToolDefinition] = []
         self._message_history: list[Message] = []
         self._running = False
-        
+
         # Robust manual directory discovery
         manual_candidates = [
             Path(__file__).resolve().parents[2] / "manual",
@@ -168,45 +172,45 @@ Available tools will be provided for each interaction."""
             # User config: ~/.syspilot/manual
             Path("~/.syspilot/manual").expanduser(),
         ]
-        
-        self._manual_dir = manual_candidates[0] # Default
+
+        self._manual_dir = manual_candidates[0]  # Default
         for p in manual_candidates:
             if p.exists() and p.is_dir():
                 self._manual_dir = p
                 logger.debug(f"Using manual directory: {p}")
                 break
-        
+
         # Initialize with system prompt (manuals will be loaded separately)
         self._update_system_prompt()
-    
+
     def _update_system_prompt(self) -> None:
         prompt_parts = [self.SYSTEM_PROMPT]
-        
+
         if self.context.loaded_manuals:
             prompt_parts.append("\n\n## LOADED MANUALS")
             prompt_parts.append("You have access to the following technical manuals for tuning:")
             for manual_name, manual_content in self.context.loaded_manuals.items():
                 prompt_parts.append(f"\n### Manual: {manual_name}")
                 prompt_parts.append(manual_content)
-        
+
         full_prompt = "\n".join(prompt_parts)
-        
+
         if self._message_history and self._message_history[0].role == "system":
             self._message_history[0] = Message(role="system", content=full_prompt)
         else:
             self._message_history.insert(0, Message(role="system", content=full_prompt))
-    
+
     def load_manual(self, manual_name: str) -> bool:
         manual_path = self._manual_dir / f"{manual_name}.md"
-        
+
         if not manual_path.exists():
             logger.warning(f"Manual not found: {manual_path}")
             return False
-        
+
         try:
-            with open(manual_path, 'r') as f:
+            with open(manual_path, "r") as f:
                 content = f.read()
-            
+
             self.context.loaded_manuals[manual_name] = content
             self._update_system_prompt()
             logger.info(f"Loaded manual: {manual_name} ({len(content)} bytes)")
@@ -214,18 +218,18 @@ Available tools will be provided for each interaction."""
         except Exception as e:
             logger.error(f"Failed to load manual {manual_name}: {e}")
             return False
-    
+
     def load_manuals(self, manual_names: list[str]) -> dict[str, bool]:
         results = {}
         for name in manual_names:
             results[name] = self.load_manual(name)
         return results
-    
+
     def list_available_manuals(self) -> list[str]:
         if not self._manual_dir.exists():
             return []
         return [p.stem for p in self._manual_dir.glob("*.md")]
-    
+
     def register_tool(
         self,
         name: str,
@@ -235,13 +239,15 @@ Available tools will be provided for each interaction."""
     ) -> None:
         """Register a tool that the agent can use."""
         self._tools[name] = func
-        self._tool_definitions.append(ToolDefinition(
-            name=name,
-            description=description,
-            parameters=parameters,
-        ))
+        self._tool_definitions.append(
+            ToolDefinition(
+                name=name,
+                description=description,
+                parameters=parameters,
+            )
+        )
         logger.info(f"Registered tool: {name}")
-    
+
     def _build_context_message(self) -> str:
         """Build current context for the LLM."""
         return f"""Current Agent State: {self.state.value}
@@ -254,38 +260,40 @@ Respond with your analysis and any tool calls needed."""
         """Execute a registered tool."""
         if name not in self._tools:
             raise ValueError(f"Unknown tool: {name}")
-        
+
         func = self._tools[name]
         logger.debug(f"Executing tool: {name} with args: {arguments}")
-        
+
         # Handle both sync and async functions
         result = func(**arguments)
         if asyncio.iscoroutine(result):
             result = await result
-        
+
         return result
 
     async def _process_tool_calls(self, tool_calls: list[dict[str, Any]]) -> list[Message]:
         """Process tool calls from LLM response."""
         results = []
-        
+
         for tc in tool_calls:
             tool_name = tc["function"]["name"]
-            arguments = json.loads(tc["function"]["arguments"])
-            
+
             try:
+                arguments = json.loads(tc["function"]["arguments"])
                 result = await self._execute_tool(tool_name, arguments)
                 result_str = json.dumps(result) if not isinstance(result, str) else result
             except Exception as e:
                 logger.error(f"Tool {tool_name} failed: {e}")
                 result_str = f"Error: {str(e)}"
-            
-            results.append(Message(
-                role="tool",
-                content=result_str,
-                tool_call_id=tc["id"],
-            ))
-        
+
+            results.append(
+                Message(
+                    role="tool",
+                    content=result_str,
+                    tool_call_id=tc["id"],
+                )
+            )
+
         return results
 
     async def step(self, user_input: str | None = None) -> LLMResponse:
@@ -297,35 +305,37 @@ Respond with your analysis and any tool calls needed."""
             # Add context update
             context_msg = self._build_context_message()
             self._message_history.append(Message(role="user", content=context_msg))
-        
+
         # Get LLM response
         response = await self.llm.chat(
             messages=self._message_history,
             tools=self._tool_definitions if self._tool_definitions else None,
         )
-        
+
         # Add assistant response to history
-        self._message_history.append(Message(
-            role="assistant",
-            content=response.content,
-            tool_calls=response.tool_calls,
-        ))
-        
+        self._message_history.append(
+            Message(
+                role="assistant",
+                content=response.content,
+                tool_calls=response.tool_calls,
+            )
+        )
+
         # Process tool calls if any
         if response.tool_calls:
             tool_results = await self._process_tool_calls(response.tool_calls)
             self._message_history.extend(tool_results)
-            
+
             # Continue conversation after tool execution
             return await self.step()
-        
+
         return response
 
     async def run_monitoring_loop(self) -> None:
         self._running = True
         self.state = AgentState.MONITORING
         logger.info("Starting monitoring loop")
-        
+
         iteration = 0
         while self._running:
             try:
@@ -360,12 +370,12 @@ Respond with your analysis and any tool calls needed."""
             self.context.target_pid = pid
         if name:
             self.context.target_name = name
-        
+
         self.state = AgentState.ANALYZING
-        
+
         prompt = f"""Analyze the target application:
-- PID: {self.context.target_pid or 'Not specified'}
-- Name: {self.context.target_name or 'Not specified'}
+- PID: {self.context.target_pid or "Not specified"}
+- Name: {self.context.target_name or "Not specified"}
 
 1. First, gather basic process information
 2. Profile CPU and memory usage
@@ -374,19 +384,28 @@ Respond with your analysis and any tool calls needed."""
 
 Provide a summary of findings."""
 
-        response = await self.step(prompt)
-        self.state = AgentState.IDLE
-        return response.content
+        try:
+            response = await self.step(prompt)
+            return response.content
+        except LLMError as exc:
+            logger.warning("Analyze target LLM request failed: %s", exc)
+            return f"Analysis unavailable: {exc}"
+        finally:
+            self.state = AgentState.IDLE
 
-    async def tune_application(self, recommendations: list[TuningRecommendation] | None = None) -> str:
+    async def tune_application(
+        self, recommendations: list[TuningRecommendation] | None = None
+    ) -> str:
         """Apply tuning recommendations."""
         self.state = AgentState.TUNING
-        
+
         if recommendations:
-            rec_text = "\n".join([
-                f"- {r.parameter}: {r.current_value} -> {r.recommended_value} ({r.reason})"
-                for r in recommendations
-            ])
+            rec_text = "\n".join(
+                [
+                    f"- {r.parameter}: {r.current_value} -> {r.recommended_value} ({r.reason})"
+                    for r in recommendations
+                ]
+            )
             prompt = f"""Apply the following tuning recommendations:
 {rec_text}
 
@@ -398,9 +417,14 @@ Execute the tuning and report results."""
             prompt = """Based on the current profiling data, suggest and apply tuning recommendations.
 Be conservative and explain each change."""
 
-        response = await self.step(prompt)
-        self.state = AgentState.IDLE
-        return response.content
+        try:
+            response = await self.step(prompt)
+            return response.content
+        except LLMError as exc:
+            logger.warning("Tune application LLM request failed: %s", exc)
+            return f"Tuning analysis unavailable: {exc}"
+        finally:
+            self.state = AgentState.IDLE
 
     async def run_tuning_loop(
         self,
@@ -436,11 +460,16 @@ Be conservative and explain each change."""
                 "4. If no further optimizations are possible, respond with an empty list []"
             )
 
-            response = await self.step(prompt)
+            try:
+                response = await self.step(prompt)
+            except LLMError as exc:
+                logger.warning("Tuning iteration %s LLM request failed: %s", i, exc)
+                break
 
             try:
                 import re as _re
-                json_match = _re.search(r'\[.*\]', response.content, _re.DOTALL)
+
+                json_match = _re.search(r"\[.*\]", response.content, _re.DOTALL)
                 if json_match:
                     recommendations = json.loads(json_match.group())
                 else:

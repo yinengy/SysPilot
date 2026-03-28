@@ -10,6 +10,8 @@ import subprocess
 import sys
 import time
 from collections.abc import Sequence
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -22,6 +24,7 @@ from rich.panel import Panel
 from syspilot import __version__
 from syspilot.core.config import SysPilotConfig, LLMConfig
 from syspilot.core.agent import SysPilotAgent
+from syspilot.core.llm import LLMError
 from syspilot.core.openai_auth import (
     build_authorization_url,
     create_pkce_verifier_and_challenge,
@@ -50,6 +53,26 @@ from syspilot.ui.output_sink import OutputSink, SwitchableOutputSink, TuneUIMode
 from syspilot.ui.tui_sidecar import TuneTuiOrchestrator, should_wait_for_user_on_close
 
 console = Console()
+logger = logging.getLogger(__name__)
+
+
+def _default_llm_config_path() -> Path:
+    return Path(__file__).resolve().parents[1] / "config" / "llm_config.json"
+
+
+def _load_default_llm_config() -> LLMConfig:
+    default_path = _default_llm_config_path()
+    if default_path.exists():
+        return LLMConfig.from_file(default_path)
+    return LLMConfig.from_file()
+
+
+def _manual_pipeline_llm_config(base: LLMConfig, minimum_timeout_seconds: float) -> LLMConfig:
+    return replace(
+        base,
+        timeout_seconds=max(base.timeout_seconds, minimum_timeout_seconds),
+        max_retries=max(base.max_retries, 1),
+    )
 
 
 class _TuneEmitter(Protocol):
@@ -224,8 +247,7 @@ def cli(
     else:
         # Load defaults, but try to find LLM config
         sys_config = SysPilotConfig()
-        # Try to load credentials from default locations
-        sys_config.llm = LLMConfig.from_file()
+        sys_config.llm = _load_default_llm_config()
         ctx.obj["config"] = sys_config
 
     ctx.obj["config"].log_level = log_level
@@ -425,20 +447,7 @@ def profile(ctx: click.Context, pid: int, collector: tuple[str, ...]) -> None:
 @cli.command()
 def manuals() -> None:
     """List available tuning manuals."""
-    from pathlib import Path
-
-    # Same discovery logic as Agent
-    manual_candidates = [
-        Path(__file__).resolve().parents[1] / "manual",
-        Path("manual"),
-        Path("~/.syspilot/manual").expanduser(),
-    ]
-
-    manual_dir = None
-    for p in manual_candidates:
-        if p.exists() and p.is_dir():
-            manual_dir = p
-            break
+    manual_dir = _discover_manual_root()
 
     if not manual_dir:
         console.print(
@@ -465,6 +474,347 @@ def manuals() -> None:
     console.print(
         "[dim]Examples: syspilot analyze 1234 --manual numactl | syspilot tune --pid 1234 --manual numactl[/dim]"
     )
+
+
+def _discover_manual_root() -> Path | None:
+    manual_candidates = [
+        Path(__file__).resolve().parents[1] / "manual",
+        Path("manual"),
+        Path("~/.syspilot/manual").expanduser(),
+    ]
+    for path in manual_candidates:
+        if path.exists() and path.is_dir():
+            return path
+    return None
+
+
+def _slugify_manual_id(value: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+    return normalized or "manual"
+
+
+def _resolve_manual_root(manual_root: Path | None, *, create: bool = False) -> Path:
+    if manual_root is not None:
+        return manual_root
+
+    discovered = _discover_manual_root()
+    if discovered is not None:
+        return discovered
+
+    fallback = Path("manual")
+    if create:
+        fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+
+@cli.command("ingest")
+@click.option("--library", required=True, help="Library name or manual ID")
+@click.option(
+    "--docs",
+    required=True,
+    type=click.Path(exists=True, path_type=Path),
+    help="Docs file or directory",
+)
+@click.option(
+    "--code",
+    type=click.Path(exists=True, path_type=Path),
+    help="Optional code file or directory for lightweight hints",
+)
+@click.option(
+    "--metadata",
+    type=click.Path(exists=True, path_type=Path),
+    help="Optional metadata file (json/yaml/txt)",
+)
+@click.option(
+    "--artifact-root",
+    type=click.Path(path_type=Path),
+    default=Path("artifacts"),
+    show_default=True,
+    help="Artifact output root",
+)
+def ingest(
+    library: str, docs: Path, code: Path | None, metadata: Path | None, artifact_root: Path
+) -> None:
+    from syspilot_manual.integration import ingest_library_inputs
+
+    chunks = ingest_library_inputs(
+        library_name=library,
+        docs_path=docs,
+        artifact_root=artifact_root,
+        code_path=code,
+        metadata_path=metadata,
+    )
+    click.echo(
+        json.dumps(
+            {
+                "library": library,
+                "artifact_root": str(artifact_root),
+                "chunks_written": len(chunks),
+                "chunk_manifest": str(artifact_root / "chunks" / library / "chunks.jsonl"),
+            },
+            indent=2,
+        )
+    )
+
+
+@cli.command("extract-evidence")
+@click.option("--library", required=True, help="Library name used during ingest")
+@click.option(
+    "--artifact-root",
+    type=click.Path(path_type=Path),
+    default=Path("artifacts"),
+    show_default=True,
+    help="Artifact root containing chunks",
+)
+@click.pass_context
+def extract_evidence_cmd(ctx: click.Context, library: str, artifact_root: Path) -> None:
+    from syspilot_manual.integration import extract_library_evidence
+    from syspilot_manual.llm_client import ManualLLMClient
+
+    llm_client = ManualLLMClient(
+        config=_manual_pipeline_llm_config(ctx.obj["config"].llm, minimum_timeout_seconds=90.0)
+    )
+    evidence = asyncio.run(
+        extract_library_evidence(
+            library,
+            artifact_root,
+            llm_client,
+            progress_callback=_manual_extract_progress_callback,
+        )
+    )
+    click.echo(
+        json.dumps(
+            {
+                "library": library,
+                "artifact_root": str(artifact_root),
+                "evidence_items": len(evidence),
+                "evidence_path": str(artifact_root / "evidence" / library / "evidence.jsonl"),
+            },
+            indent=2,
+        )
+    )
+
+
+@cli.command("synthesize-manual")
+@click.option("--library", required=True, help="Library name used during ingest")
+@click.option("--manual-id", help="Override manual ID (defaults to slugified library name)")
+@click.option(
+    "--artifact-root",
+    type=click.Path(path_type=Path),
+    default=Path("artifacts"),
+    show_default=True,
+    help="Artifact root containing extracted evidence",
+)
+@click.option(
+    "--manual-root",
+    type=click.Path(path_type=Path),
+    help="Compatibility manual root",
+)
+@click.pass_context
+def synthesize_manual_cmd(
+    ctx: click.Context,
+    library: str,
+    manual_id: str | None,
+    artifact_root: Path,
+    manual_root: Path | None,
+) -> None:
+    from syspilot_manual.integration import synthesize_library_bundle
+    from syspilot_manual.llm_client import ManualLLMClient
+
+    llm_client = ManualLLMClient(
+        config=_manual_pipeline_llm_config(ctx.obj["config"].llm, minimum_timeout_seconds=180.0)
+    )
+    resolved_manual_id = manual_id or _slugify_manual_id(library)
+    resolved_manual_root = _resolve_manual_root(manual_root, create=True)
+    manual = asyncio.run(
+        synthesize_library_bundle(
+            manual_id=resolved_manual_id,
+            library_name=library,
+            artifact_root=artifact_root,
+            llm_client=llm_client,
+            manual_root=resolved_manual_root,
+            progress_callback=_manual_synthesis_progress_callback,
+        )
+    )
+    click.echo(
+        json.dumps(
+            {
+                "manual_id": manual.manual_id,
+                "manual_root": str(resolved_manual_root),
+                "bundle_dir": str(resolved_manual_root / manual.manual_id),
+                "compat_markdown": str(resolved_manual_root / f"{manual.manual_id}.md"),
+            },
+            indent=2,
+        )
+    )
+
+
+@cli.command("render-manual")
+@click.option("--manual", "manual_id", required=True, help="Manual ID to render")
+@click.option(
+    "--artifact-root",
+    type=click.Path(path_type=Path),
+    default=Path("artifacts"),
+    show_default=True,
+)
+@click.option(
+    "--manual-root",
+    type=click.Path(path_type=Path),
+)
+def render_manual_cmd(manual_id: str, artifact_root: Path, manual_root: Path | None) -> None:
+    from syspilot_manual.integration import render_existing_manual
+
+    bundle_dir = render_existing_manual(manual_id, artifact_root, _resolve_manual_root(manual_root))
+    click.echo(json.dumps({"manual_id": manual_id, "bundle_dir": str(bundle_dir)}, indent=2))
+
+
+@cli.command("build-index")
+@click.option("--manual", "manual_id", required=True, help="Manual ID to index")
+@click.option(
+    "--artifact-root",
+    type=click.Path(path_type=Path),
+    default=Path("artifacts"),
+    show_default=True,
+)
+@click.option(
+    "--manual-root",
+    type=click.Path(path_type=Path),
+)
+def build_index_cmd(manual_id: str, artifact_root: Path, manual_root: Path | None) -> None:
+    from syspilot_manual.integration import build_existing_index
+
+    bundle_dir = build_existing_index(manual_id, artifact_root, _resolve_manual_root(manual_root))
+    click.echo(
+        json.dumps(
+            {
+                "manual_id": manual_id,
+                "index_path": str(bundle_dir / "manual_index.jsonl"),
+            },
+            indent=2,
+        )
+    )
+
+
+@cli.command("compose-manuals")
+@click.option("--app", required=True, help="Application or workload name")
+@click.option(
+    "--libraries", multiple=True, required=True, help="Selected manual IDs or manual.json paths"
+)
+@click.option("--manual-id", help="Override composed manual ID (defaults to <app>_composed)")
+@click.option("--objective", help="Optional app objective")
+@click.option("--symptom", help="Optional current symptom")
+@click.option(
+    "--artifact-root",
+    type=click.Path(path_type=Path),
+    default=Path("artifacts"),
+    show_default=True,
+)
+@click.option(
+    "--manual-root",
+    type=click.Path(path_type=Path),
+)
+@click.pass_context
+def compose_manuals_cmd(
+    ctx: click.Context,
+    app: str,
+    libraries: tuple[str, ...],
+    manual_id: str | None,
+    objective: str | None,
+    symptom: str | None,
+    artifact_root: Path,
+    manual_root: Path | None,
+) -> None:
+    from syspilot_manual.integration import compose_and_write_manual
+    from syspilot_manual.llm_client import ManualLLMClient
+
+    llm_client = ManualLLMClient(
+        config=_manual_pipeline_llm_config(ctx.obj["config"].llm, minimum_timeout_seconds=180.0)
+    )
+    resolved_manual_id = manual_id or f"{_slugify_manual_id(app)}_composed"
+    resolved_manual_root = _resolve_manual_root(manual_root, create=True)
+    composed = asyncio.run(
+        compose_and_write_manual(
+            manual_id=resolved_manual_id,
+            app_name=app,
+            manual_refs=list(libraries),
+            artifact_root=artifact_root,
+            llm_client=llm_client,
+            manual_root=resolved_manual_root,
+            objective=objective,
+            symptom=symptom,
+            progress_callback=_manual_composition_progress_callback,
+        )
+    )
+    click.echo(
+        json.dumps(
+            {
+                "manual_id": composed.manual_id,
+                "bundle_dir": str(resolved_manual_root / composed.manual_id),
+                "compat_markdown": str(resolved_manual_root / f"{composed.manual_id}.md"),
+            },
+            indent=2,
+        )
+    )
+
+
+@cli.command("query")
+@click.option("--manual", "manual_id", required=True, help="Manual ID to query")
+@click.option("--section", help="Section name")
+@click.option("--keywords", multiple=True, help="Keyword filters")
+@click.option("--symptom", help="Symptom filter")
+@click.option("--goal", help="Goal filter")
+@click.option(
+    "--manual-root",
+    type=click.Path(path_type=Path),
+)
+def query_manual_cmd(
+    manual_id: str,
+    section: str | None,
+    keywords: tuple[str, ...],
+    symptom: str | None,
+    goal: str | None,
+    manual_root: Path | None,
+) -> None:
+    from syspilot_manual.integration import load_store
+
+    store = load_store(_resolve_manual_root(manual_root))
+    if section:
+        result = store.query_section(manual_id, section, list(keywords) or None)
+    elif symptom:
+        result = store.query_by_symptom([manual_id], symptom)
+    elif goal:
+        result = store.query_by_goal([manual_id], goal)
+    else:
+        raise click.UsageError("Provide --section, --symptom, or --goal")
+    click.echo(json.dumps(result, indent=2))
+
+
+@cli.command("build-agent-context")
+@click.option("--manuals", multiple=True, required=True, help="Manual IDs to query")
+@click.option("--goal", help="Goal filter")
+@click.option("--symptom", help="Symptom filter")
+@click.option("--max-items-per-section", default=5, show_default=True, type=int)
+@click.option(
+    "--manual-root",
+    type=click.Path(path_type=Path),
+)
+def build_agent_context_cmd(
+    manuals: tuple[str, ...],
+    goal: str | None,
+    symptom: str | None,
+    max_items_per_section: int,
+    manual_root: Path | None,
+) -> None:
+    from syspilot_manual.integration import build_agent_context_bundle
+
+    bundle = build_agent_context_bundle(
+        list(manuals),
+        goal=goal,
+        symptom=symptom,
+        max_items_per_section=max_items_per_section,
+        manual_root=_resolve_manual_root(manual_root),
+    )
+    click.echo(json.dumps(bundle, indent=2))
 
 
 @cli.command()
@@ -924,6 +1274,156 @@ def _event_output_payload(
         "stderr_len": len(stderr_text),
         "stdout_truncated": stdout_truncated,
         "stderr_truncated": stderr_truncated,
+    }
+
+
+def _build_spawn_manual_context(manuals: tuple[str, ...]) -> str:
+    if not manuals:
+        return ""
+
+    manual_root = _discover_manual_root()
+    if manual_root is None:
+        return ""
+
+    try:
+        from syspilot_manual.integration import build_agent_context_bundle
+
+        context_bundle = build_agent_context_bundle(
+            list(manuals),
+            goal="improve throughput",
+            manual_root=manual_root,
+            max_items_per_section=5,
+        )
+    except Exception as exc:
+        logger.warning("Structured manual context unavailable: %s", exc)
+        return ""
+
+    if not any(
+        context_bundle.get(key)
+        for key in ("profile_first", "candidate_actions", "conflicts", "validation")
+    ):
+        return ""
+
+    return json.dumps(context_bundle, indent=2)
+
+
+def _format_progress_duration(seconds: float) -> str:
+    total_seconds = max(int(round(seconds)), 0)
+    hours, rem = divmod(total_seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def _format_progress_finish_time(eta_s: float) -> str:
+    finish_time = datetime.now(timezone.utc) + timedelta(seconds=max(eta_s, 0.0))
+    return finish_time.strftime("%H:%M:%S UTC")
+
+
+def _manual_extract_progress_callback(progress: object) -> None:
+    from syspilot_manual.extract_evidence import ExtractionProgress
+
+    if not isinstance(progress, ExtractionProgress):
+        return
+    if progress.status == "started":
+        if progress.resumed_chunks:
+            click.echo(
+                "[extract-evidence] "
+                f"{progress.library_name}: resuming from checkpoint at "
+                f"{progress.resumed_chunks}/{progress.total_chunks} chunks"
+            )
+        else:
+            click.echo(
+                f"[extract-evidence] {progress.library_name}: starting {progress.total_chunks} chunks"
+            )
+        return
+    if progress.status == "completed":
+        click.echo(
+            "[extract-evidence] "
+            f"{progress.library_name}: completed {progress.processed_chunks}/{progress.total_chunks} "
+            f"chunks, ok={progress.succeeded_chunks}, failed={progress.failed_chunks}, "
+            f"elapsed={_format_progress_duration(progress.elapsed_s)}"
+        )
+        return
+
+    if progress.processed_chunks != 1 and progress.processed_chunks % 10 != 0:
+        return
+
+    pct = (
+        (progress.processed_chunks / progress.total_chunks * 100.0)
+        if progress.total_chunks
+        else 100.0
+    )
+    click.echo(
+        "[extract-evidence] "
+        f"{progress.processed_chunks}/{progress.total_chunks} ({pct:.1f}%) "
+        f"ok={progress.succeeded_chunks} failed={progress.failed_chunks} "
+        f"items={progress.current_items} elapsed={_format_progress_duration(progress.elapsed_s)} "
+        f"avg/chunk={progress.avg_chunk_s:.1f}s eta={_format_progress_duration(progress.eta_s)} "
+        f"finish~{_format_progress_finish_time(progress.eta_s)} current={progress.current_chunk_id}"
+    )
+
+
+def _manual_synthesis_progress_callback(progress: object) -> None:
+    from syspilot_manual.integration import ManualSynthesisProgress
+
+    if not isinstance(progress, ManualSynthesisProgress):
+        return
+    click.echo(
+        "[synthesize-manual] "
+        f"{progress.library_name}/{progress.manual_id} phase={progress.status} "
+        f"evidence={progress.evidence_items} elapsed={_format_progress_duration(progress.elapsed_s)} "
+        f"eta={_format_progress_duration(progress.eta_s)} finish~{_format_progress_finish_time(progress.eta_s)}"
+    )
+
+
+def _manual_composition_progress_callback(progress: object) -> None:
+    from syspilot_manual.integration import ManualCompositionProgress
+
+    if not isinstance(progress, ManualCompositionProgress):
+        return
+    click.echo(
+        "[compose-manuals] "
+        f"{progress.app_name}/{progress.manual_id} phase={progress.status} "
+        f"libraries={progress.library_count} elapsed={_format_progress_duration(progress.elapsed_s)} "
+        f"eta={_format_progress_duration(progress.eta_s)} finish~{_format_progress_finish_time(progress.eta_s)}"
+    )
+
+
+def _build_spawn_profiling_env(env_overrides: dict[str, str] | None) -> dict[str, str] | None:
+    if not env_overrides:
+        profiling_env = os.environ.copy()
+    else:
+        profiling_env = os.environ.copy()
+        profiling_env.update({key: str(value) for key, value in env_overrides.items()})
+
+    profiling_env.setdefault("OMP_DISPLAY_ENV", "true")
+    profiling_env.setdefault("OMP_DISPLAY_AFFINITY", "true")
+    return profiling_env
+
+
+def _summarize_spawn_runtime_output(
+    stdout: str, stderr: str, *, max_chars: int = 2000
+) -> dict[str, object]:
+    combined = (stdout or "") + ("\n" + stderr if stderr else "")
+    excerpt = combined[:max_chars]
+    thread_requested = re.search(r"Number of Threads requested\s*=\s*(\d+)", combined)
+    thread_counted = re.search(r"Number of Threads counted\s*=\s*(\d+)", combined)
+    openmp_env_present = "OPENMP DISPLAY ENVIRONMENT BEGIN" in combined
+    affinity_lines = [
+        line.strip()
+        for line in combined.splitlines()
+        if "affinity" in line.lower() or "place" in line.lower()
+    ]
+    return {
+        "stdout_excerpt": excerpt,
+        "threads_requested": int(thread_requested.group(1)) if thread_requested else None,
+        "threads_counted": int(thread_counted.group(1)) if thread_counted else None,
+        "openmp_display_env_present": openmp_env_present,
+        "affinity_excerpt": "\n".join(affinity_lines[:20]),
     }
 
 
@@ -1619,7 +2119,11 @@ If no metrics found, return: {{"no_metrics": true}}
 
 RESPOND WITH ONLY THE JSON OBJECT, NO EXPLANATION:"""
 
-    response = await agent.step(prompt)
+    try:
+        response = await agent.step(prompt)
+    except LLMError as exc:
+        logger.warning("Output metric extraction skipped after LLM failure: %s", exc)
+        return {"no_metrics": True, "error": str(exc)}
 
     import re
 
@@ -1642,10 +2146,7 @@ async def _run_live_profiling_pipeline(
     env_overrides: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     started_at = time.monotonic()
-    env = None
-    if env_overrides:
-        env = os.environ.copy()
-        env.update({k: str(v) for k, v in env_overrides.items()})
+    env = _build_spawn_profiling_env(env_overrides)
 
     proc = await asyncio.create_subprocess_exec(
         *command_parts,
@@ -1666,6 +2167,7 @@ async def _run_live_profiling_pipeline(
     tools_used: list[str] = []
     key_findings: list[str] = []
     per_pid_runtime_maps: dict[str, dict[str, Any]] = {}
+    per_pid_collect_profile: dict[str, dict[str, Any]] = {}
     collect_summaries: list[str] = []
     agent_tool_calls = 0
 
@@ -1682,6 +2184,7 @@ async def _run_live_profiling_pipeline(
             tools_used.append(f"collect_profile:{target_pid}")
 
             if isinstance(collect_result, dict):
+                per_pid_collect_profile[str(target_pid)] = collect_result
                 summaries: list[str] = []
                 for collector_name, payload in collect_result.items():
                     if isinstance(payload, dict) and "summary" in payload:
@@ -1836,6 +2339,7 @@ async def _run_live_profiling_pipeline(
         stderr = "Command timed out during profiling pipeline"
 
     wall = time.monotonic() - started_at
+    runtime_output = _summarize_spawn_runtime_output(stdout, stderr)
 
     workers = process_targets.get("workers", [])
     if workers:
@@ -1853,15 +2357,22 @@ async def _run_live_profiling_pipeline(
         first_key = next(iter(per_pid_runtime_maps))
         refined_runtime_maps = per_pid_runtime_maps[first_key]
 
+    primary_collect_profile = per_pid_collect_profile.get(str(primary_pid), {})
+    if not primary_collect_profile and per_pid_collect_profile:
+        first_key = next(iter(per_pid_collect_profile))
+        primary_collect_profile = per_pid_collect_profile[first_key]
+
     profiling_json: dict[str, Any] = {
         "pipeline_used": True,
         "tools_used": tools_used,
         "target_pids": target_pids,
         "primary_pid": primary_pid,
         "collect_profile_summary": " | ".join(collect_summaries)[:1800],
+        "collect_profile_data": primary_collect_profile,
         "ebpf_summary": ebpf_summary,
         "refined_runtime_maps": refined_runtime_maps,
         "per_pid_runtime_maps": per_pid_runtime_maps,
+        "runtime_output": runtime_output,
         "process_tree_targets": process_targets,
         "key_findings": key_findings,
     }
@@ -1933,8 +2444,8 @@ async def _run_spawn_tune_loop_async(
         title="Starting",
     )
 
-    manual_content = ""
-    if manuals and agent.context.loaded_manuals:
+    manual_content = _build_spawn_manual_context(manuals)
+    if not manual_content and manuals and agent.context.loaded_manuals:
         for manual_name in manuals:
             if manual_name in agent.context.loaded_manuals:
                 manual_content += f"\n\n### {manual_name} Manual (excerpt)\n"
@@ -2189,6 +2700,7 @@ async def _run_spawn_tune_loop_async(
 
 ## Rules
 - Use only profiling evidence and loaded manuals.
+- Loaded manual evidence may be a structured JSON context bundle instead of raw markdown excerpts; use the structured bundle first when present.
 - Re-profile is performed each iteration; propose next-step actions for this iteration.
 - Avoid recommending exact commands already tried.
 - Keep workload-defining arguments fixed (model/input/token counts/repetitions/output mode) so comparisons stay fair.
@@ -2229,11 +2741,25 @@ async def _run_spawn_tune_loop_async(
             sink.print("\n[dim]Deterministic benchmark mode: no tuning actions generated.[/dim]")
         else:
             analysis_started_at = time.time()
-            response = await agent.step(prompt)
-            analysis_wall_time_s = time.time() - analysis_started_at
-            sink.print(f"\n[dim]{response.content}[/dim]")
-
-            recommendation = _parse_spawn_actions(response.content)
+            try:
+                response = await agent.step(prompt)
+            except LLMError as exc:
+                analysis_wall_time_s = time.time() - analysis_started_at
+                logger.warning("Spawn-mode tuning analysis unavailable: %s", exc)
+                sink.print(f"\n[yellow]Agent tuning analysis unavailable: {exc}[/yellow]")
+                recommendation = {
+                    "valid": True,
+                    "error": "",
+                    "summary": f"LLM tuning analysis unavailable: {exc}",
+                    "manual_citation": "",
+                    "evidence": [],
+                    "actions": [],
+                    "skipped_actions": [],
+                }
+            else:
+                analysis_wall_time_s = time.time() - analysis_started_at
+                sink.print(f"\n[dim]{response.content}[/dim]")
+                recommendation = _parse_spawn_actions(response.content)
         if not recommendation["valid"]:
             _emit_tune_event(
                 event_emitter,

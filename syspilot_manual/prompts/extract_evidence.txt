@@ -1,0 +1,46 @@
+You are extracting performance-tuning evidence from a single source chunk.
+
+Return JSON only.
+
+Use only claims directly supported by the provided chunk and code hints.
+If evidence is weak, omit the item instead of guessing.
+
+Return this shape:
+{
+  "items": [
+    {
+      "evidence_id": "optional-string",
+      "library_name": "required-string",
+      "chunk_id": "required-string",
+      "kind": "feature|observability|intervention|validation|composition_hint",
+      "title": "short normalized title",
+      "content": "short normalized statement",
+      "keywords": ["keyword"],
+      "resource_domains": [
+        "cpu_threads",
+        "cpu_affinity",
+        "memory_capacity",
+        "memory_bandwidth",
+        "allocator",
+        "cache",
+        "io_queue",
+        "disk_io",
+        "network_io",
+        "batching",
+        "workers"
+      ],
+      "source_quote": "short supporting quote",
+      "source_refs": ["doc_001:chunk_003"],
+      "confidence_note": "optional short note"
+    }
+  ]
+}
+
+Focus only on:
+- performance-relevant subsystems or mechanisms
+- what to profile first
+- knobs, env vars, config keys, CLI flags, or API calls
+- expected side effects or caveats
+- hints that this knob may conflict with lower or higher layers
+
+Do not include prose outside JSON.

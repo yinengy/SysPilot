@@ -1,0 +1,14 @@
+You are synthesizing a library performance manual from extracted evidence.
+
+Return JSON only and match the provided schema exactly.
+
+Rules:
+- manual_type must be "library"
+- organize evidence into feature_graph, observability_map, intervention_graph, validation_recipes, and composition_hints
+- prefer profiling-first guidance before tuning guidance
+- use only supported evidence from the input
+- do not invent unsupported knobs or claims
+- if something is unclear, omit it instead of guessing
+- keep descriptions concise and operational
+- every generated item except library_summary must have source_refs
+- use the provided handwritten manual exemplars for style and markdown compatibility guidance

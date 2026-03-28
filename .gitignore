@@ -92,6 +92,8 @@ config
 log
 node_modules
 ui/ratatui/target/
+manual/*
+manual_sources/*
 
 # OpenCode
 .sisyphus

@@ -1,0 +1,60 @@
+# Composed Manual: {{ app_name }}
+
+## Summary
+
+{{ app_summary }}
+
+## Shared Resources
+{% for item in shared_resources %}
+### {{ item.resource_domain }}
+- Libraries: {{ item.libraries | join(", ") }}
+- Note: {{ item.note }}
+- Source refs: {{ item.source_refs | join(", ") }}
+
+{% endfor %}
+## Profiling First: Combined Observability
+{% for item in combined_observability %}
+### {{ item.library }} — {{ item.question }}
+- Priority: {{ item.priority }}
+{% if item.symptoms %}- Symptoms: {{ item.symptoms | join(", ") }}
+{% endif %}- Signals:
+{% for signal in item.signals %}  - {{ signal.name }} via {{ signal.tool }} — {{ signal.reason }}
+{% endfor %}- Source refs: {{ item.source_refs | join(", ") }}
+
+{% endfor %}
+## Conflicts
+{% for item in conflict_summary %}
+### {{ item.title }}
+- Libraries: {{ item.libraries | join(", ") }}
+{% if item.resource_domains %}- Resource domains: {{ item.resource_domains | join(", ") }}
+{% endif %}- Reason: {{ item.reason }}
+- Resolution hint: {{ item.resolution_hint }}
+- Source refs: {{ item.source_refs | join(", ") }}
+
+{% endfor %}
+## Safe Candidate Interventions
+{% for item in combined_interventions %}
+### {{ item.library }} — {{ item.intervention_id }}
+{% if item.when %}- When to use: {{ item.when | join("; ") }}
+{% endif %}- Actions:
+{% for action in item.actions %}  - {{ action.kind }} / {{ action.name }}: {{ action.suggestion }}
+{% endfor %}- Expected effect: {{ item.expected_effect }}
+{% if item.side_effects %}- Side effects: {{ item.side_effects | join("; ") }}
+{% endif %}{% if item.conflicts_with %}- Conflicts: {{ item.conflicts_with | join(", ") }}
+{% endif %}- Source refs: {{ item.source_refs | join(", ") }}
+
+{% endfor %}
+## Validation Recipes
+{% for item in combined_validation %}
+### {{ item.library }} — {{ item.for_intervention }}
+- Reruns: {{ item.reruns }}
+{% if item.metrics %}- Metrics: {{ item.metrics | join(", ") }}
+{% endif %}- Accept if: {{ item.accept_if }}
+- Rollback if: {{ item.rollback_if }}
+- Source refs: {{ item.source_refs | join(", ") }}
+
+{% endfor %}
+## Recommended Query Order
+{% for item in recommended_query_order %}
+- {{ item }}
+{% endfor %}

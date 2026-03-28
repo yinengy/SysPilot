@@ -4,6 +4,50 @@
 
 The manual system provides agent-readable documentation for tuning libraries, tools, and frameworks. Manuals are loaded into the agent's context, enabling it to make informed tuning decisions based on expert knowledge.
 
+## Structured Manual MVP
+
+SysPilot now supports a JSON-first manual bundle for auto-generated manuals while preserving the existing handwritten markdown path.
+
+### Bundle layout
+
+For a generated manual named `openmp`, the runtime-compatible outputs are:
+
+- `manual/openmp/manual.json` — source of truth for storage, querying, and composition
+- `manual/openmp/manual.md` — deterministic rendered view of `manual.json`
+- `manual/openmp/manual_index.jsonl` — flattened item index for targeted retrieval
+- `manual/openmp.md` — compatibility markdown consumed by the existing manual loader
+
+Artifact/debug outputs are also written under:
+
+- `artifacts/raw_sources/`
+- `artifacts/chunks/`
+- `artifacts/evidence/`
+- `artifacts/manuals/`
+- `artifacts/composed/`
+- `artifacts/logs/`
+
+### Authoritative source packs
+
+For externally sourced generated manuals, keep a small repo-tracked source pack under `manual_sources/<library>/`.
+
+- Store normalized markdown/text snippets instead of raw crawler dumps.
+- Keep `metadata.json` with library name, aliases, known knobs, and the authoritative source URLs used.
+- Use the source pack as the explicit `syspilot ingest --docs ... --metadata ...` input so manual generation is reproducible and inspectable.
+
+Current source-pack examples:
+
+- `manual_sources/openmp/`
+- `manual_sources/numactl/`
+
+### Runtime behavior
+
+- The existing manual runtime still loads `manual/<name>.md` as raw markdown.
+- Spawn-mode tuning now prefers a structured `build_agent_context(...)` bundle when `manual/<name>/manual.json` exists.
+- If structured artifacts are missing, spawn mode falls back to the current markdown-excerpt behavior.
+- Attach/monitor/analyze flows remain compatible with markdown-only manuals.
+- Long-running `extract-evidence` runs now report progress + ETA, checkpoint successful chunk results, and resume from remaining chunks after interruption.
+- `synthesize-manual` and `compose-manuals` now report phase progress + ETA and fail fast on bounded LLM timeouts instead of hanging indefinitely.
+
 ## Architecture
 
 ### Components
@@ -42,6 +86,42 @@ syspilot analyze 1234 --manual numactl
 
 # Spawn-mode tuning with working directory + manual policy
 syspilot tune --command "./parallel_vlc ../config/transformer.json 0-11 12-23" --workdir /home/yyan/vlc/examples/Torch/build --manual vlcs --parse-output
+
+# Ingest docs into chunked manual-source artifacts
+syspilot ingest --library openmp --docs examples/manual_mvp/openmp.md
+
+# Extract structured evidence with the configured LLM
+syspilot extract-evidence --library openmp
+
+# Synthesize a JSON-first manual bundle
+syspilot synthesize-manual --library openmp
+
+# Re-render compatibility markdown from manual.json
+syspilot render-manual --manual openmp
+
+# Rebuild the flattened retrieval index
+syspilot build-index --manual openmp
+
+# Compose multiple manuals into an app-level manual
+syspilot compose-manuals --app xgb_train --libraries xgboost --libraries openmp
+
+# Query targeted manual slices
+syspilot query --manual openmp --section observability_map --keywords threads --keywords oversubscription
+
+# Build a focused structured context bundle for the autotuner
+syspilot build-agent-context --manuals xgboost --manuals openmp --goal maximize_throughput --symptom throughput_plateau
+
+# Generate new OpenMP and numactl manuals from authoritative local source packs
+syspilot ingest --library openmp --docs manual_sources/openmp --metadata manual_sources/openmp/metadata.json
+syspilot extract-evidence --library openmp
+syspilot synthesize-manual --library openmp
+
+syspilot ingest --library numactl --docs manual_sources/numactl --metadata manual_sources/numactl/metadata.json
+syspilot extract-evidence --library numactl
+syspilot synthesize-manual --library numactl
+
+# Compose them for a STREAM-style OpenMP workload
+syspilot compose-manuals --app stream_openmp_numactl --libraries openmp --libraries numactl
 ```
 
 ### Programmatic Usage
@@ -93,6 +173,36 @@ Virtual Library Contexts CPU-affinity tuning for manager/worker process workload
 - Tuning: iterative core-range rebalancing with process-tree-aware profiling evidence
 
 ## Creating New Manuals
+
+### Auto-generation pipeline
+
+The MVP auto-generation path is intentionally simple and inspectable:
+
+1. ingest docs/code hints into normalized source files and chunks
+2. extract `evidence.jsonl` with LLM pass 1
+3. merge/deduplicate evidence deterministically
+4. synthesize `manual.json` with LLM pass 2
+5. verify/repair once with schema checks + LLM pass 3
+6. render `manual.md` deterministically from `manual.json`
+7. flatten `manual_index.jsonl` for targeted retrieval
+
+`manual.json` is the source of truth. Markdown and JSONL are derived artifacts.
+
+### Query API
+
+The structured query layer works over `manual.json` and `manual_index.jsonl` and exposes deterministic methods for:
+
+- `get_manual(manual_id)`
+- `list_manuals()`
+- `query_section(manual_id, section, keywords=None)`
+- `query_by_symptom(manual_ids, symptom)`
+- `query_by_goal(manual_ids, goal)`
+- `get_observability(manual_ids, keywords=None, symptom=None)`
+- `get_interventions(manual_ids, keywords=None, symptom=None)`
+- `get_conflicts(manual_ids)`
+- `build_agent_context(manual_ids, goal=None, symptom=None, max_items_per_section=5)`
+
+This keeps retrieval explicit and lightweight without adding embeddings or a graph database.
 
 ### Manual Template
 

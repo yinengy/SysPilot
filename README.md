@@ -210,17 +210,41 @@ syspilot tune --pid 12345 --manual postgresql --dry-run
 
 ## Configuration
 
-Create `syspilot.yaml`:
+LLM settings are loaded from a single file, `config/llm_config.json`, by default.
+
+Use OpenAI API mode:
+
+```json
+{
+  "provider": "openai",
+  "base_url": "https://your-endpoint/v1",
+  "api_key": "sk-...",
+  "model": "gpt-5.4",
+  "temperature": 0.1,
+  "max_tokens": 272000,
+  "timeout_seconds": 30,
+  "max_retries": 1
+}
+```
+
+To switch to ChatGPT OAuth mode, edit the same file:
+
+```json
+{
+  "provider": "openai_auth",
+  "model": "gpt-5.3-codex",
+  "openai_auth_file": "~/.syspilot/auth/openai.json",
+  "base_url": "https://chatgpt.com/backend-api/codex",
+  "temperature": 0.1,
+  "max_tokens": 4096,
+  "timeout_seconds": 30,
+  "max_retries": 1
+}
+```
+
+Create `syspilot.yaml` for the rest of SysPilot settings:
 
 ```yaml
-llm:
-  provider: openai  # or openai_auth / anthropic
-  model: gpt-4o
-  temperature: 0.1
-  debug_conversation: false
-  # optional: write markdown transcript when debug_conversation=true
-  # debug_markdown_file: ~/.syspilot/logs/llm_debug.md
-
 monitoring:
   interval_seconds: 5.0
   cpu_threshold_percent: 80.0
@@ -231,14 +255,6 @@ tuning:
   auto_tune: false
   dry_run: true
   backup_configs: true
-```
-
-Set your API key:
-
-```bash
-export OPENAI_API_KEY="your-key"
-# or
-export ANTHROPIC_API_KEY="your-key"
 ```
 
 ### OpenAI OAuth (no OpenCode dependency)
@@ -255,17 +271,7 @@ Use `syspilot auth login --auto` if you want browser callback mode.
 If automatic browser launch is unavailable (for example on headless SSH sessions), SysPilot falls back to manual URL-paste flow immediately instead of waiting for callback timeout.
 Manual paste mode accepts callback data from both query strings and URL fragments (for example `.../callback?code=...` and `.../callback#code=...`).
 
-Then configure SysPilot with provider `openai_auth`:
-
-```yaml
-llm:
-  provider: openai_auth
-  model: gpt-5.3-codex  # supported: gpt-5.2-codex, gpt-5.3-codex
-  # Optional override, default is ~/.syspilot/auth/openai.json
-  openai_auth_file: ~/.syspilot/auth/openai.json
-  # Optional override, default is https://chatgpt.com/backend-api/codex
-  # base_url: https://chatgpt.com/backend-api/codex
-```
+Then switch `config/llm_config.json` to `provider: openai_auth` and set `openai_auth_file` if you do not want the default path.
 
 ## Usage Examples
 

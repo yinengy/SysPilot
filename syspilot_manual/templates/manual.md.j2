@@ -1,0 +1,57 @@
+# Library Manual: {{ library_name }}
+
+## Summary
+
+{{ library_summary }}
+
+## Feature Graph
+{% for item in feature_graph %}
+### {{ item.name }}
+- Description: {{ item.description }}
+- Resource domains: {{ item.resource_domains | join(", ") }}
+{% if item.keywords %}- Keywords: {{ item.keywords | join(", ") }}
+{% endif %}- Source refs: {{ item.source_refs | join(", ") }}
+
+{% endfor %}
+## Profiling First: Observability Map
+{% for item in observability_map %}
+### {{ item.question }}
+- Priority: {{ item.priority }}
+{% if item.symptoms %}- Symptoms: {{ item.symptoms | join(", ") }}
+{% endif %}- Signals:
+{% for signal in item.signals %}  - {{ signal.name }} via {{ signal.tool }} — {{ signal.reason }}
+{% endfor %}- Source refs: {{ item.source_refs | join(", ") }}
+
+{% endfor %}
+## Candidate Interventions
+{% for item in intervention_graph %}
+### {{ item.intervention_id }}
+{% if item.when %}- When to use: {{ item.when | join("; ") }}
+{% endif %}- Actions:
+{% for action in item.actions %}  - {{ action.kind }} / {{ action.name }}: {{ action.suggestion }}
+{% endfor %}- Expected effect: {{ item.expected_effect }}
+{% if item.side_effects %}- Side effects: {{ item.side_effects | join("; ") }}
+{% endif %}{% if item.conflicts_with %}- Conflicts: {{ item.conflicts_with | join(", ") }}
+{% endif %}- Source refs: {{ item.source_refs | join(", ") }}
+
+{% endfor %}
+## Validation Recipes
+{% for item in validation_recipes %}
+### {{ item.for_intervention }}
+- Reruns: {{ item.reruns }}
+{% if item.metrics %}- Metrics: {{ item.metrics | join(", ") }}
+{% endif %}- Accept if: {{ item.accept_if }}
+- Rollback if: {{ item.rollback_if }}
+- Source refs: {{ item.source_refs | join(", ") }}
+
+{% endfor %}
+## Composition Hints
+
+{% if composition_hints.shared_resources %}- Shared resources: {{ composition_hints.shared_resources | join(", ") }}
+{% endif %}{% for item in composition_hints.conflict_patterns %}
+### {{ item.with_keywords | join(", ") or "Conflict pattern" }}
+- Reason: {{ item.reason }}
+- Resolution hint: {{ item.resolution_hint }}
+- Source refs: {{ item.source_refs | join(", ") }}
+
+{% endfor %}

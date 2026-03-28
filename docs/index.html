@@ -898,11 +898,545 @@
         .dsg-savings-label { font-size: 0.85rem; color: var(--text-secondary); margin-top: 0.25rem; }
         .dsg-savings-arrow { font-size: 1.5rem; color: var(--text-secondary); font-weight: 700; }
 
+        /* Manual Generation Pipeline */
+        #manual-generation {
+            background: linear-gradient(to bottom, rgba(2, 6, 23, 0.4), rgba(15, 23, 42, 0.95));
+        }
+
+        .mg-shell {
+            border-color: rgba(6, 182, 212, 0.35);
+            background:
+                radial-gradient(circle at top, rgba(6, 182, 212, 0.08), transparent 35%),
+                radial-gradient(circle at bottom right, rgba(59, 130, 246, 0.08), transparent 30%),
+                var(--card-bg);
+        }
+
+        .mg-kicker {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.35rem 0.8rem;
+            border-radius: 999px;
+            border: 1px solid rgba(6, 182, 212, 0.35);
+            background: rgba(6, 182, 212, 0.08);
+            color: var(--accent-cyan);
+            font-size: 0.8rem;
+            font-weight: 700;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+            margin-bottom: 1.25rem;
+        }
+
+        .mg-flow {
+            display: flex;
+            flex-direction: column;
+            gap: 1.4rem;
+        }
+
+        .mg-sequence {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: center;
+            align-items: stretch;
+            gap: 0.75rem;
+        }
+
+        .mg-card,
+        .mg-pill {
+            background: rgba(15, 23, 42, 0.92);
+            border: 1px solid var(--border-color);
+            border-radius: 0.9rem;
+            padding: 1rem;
+            position: relative;
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
+        }
+
+        .mg-step {
+            flex: 1 1 175px;
+            max-width: 200px;
+            min-width: 160px;
+        }
+
+        .mg-step-title,
+        .mg-panel-title,
+        .mg-artifact-name,
+        .mg-pill strong,
+        .mg-library-name {
+            font-weight: 700;
+            color: var(--text-primary);
+        }
+
+        .mg-step-title {
+            font-size: 0.95rem;
+            margin-bottom: 0.55rem;
+        }
+
+        .mg-card code,
+        .mg-pill code,
+        .mg-inline-code {
+            font-family: 'Courier New', monospace;
+            background: rgba(148, 163, 184, 0.12);
+            border: 1px solid rgba(148, 163, 184, 0.15);
+            border-radius: 0.4rem;
+            padding: 0.12rem 0.4rem;
+            color: var(--text-primary);
+        }
+
+        .mg-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.35rem;
+            margin-bottom: 0.6rem;
+            padding: 0.25rem 0.65rem;
+            border-radius: 999px;
+            color: #fff;
+            font-size: 0.7rem;
+            font-weight: 700;
+        }
+
+        .mg-cyan { border-color: rgba(6, 182, 212, 0.45); }
+        .mg-cyan .mg-badge { background: var(--accent-cyan); color: #042f38; }
+        .mg-blue { border-color: rgba(59, 130, 246, 0.45); }
+        .mg-blue .mg-badge { background: var(--accent-blue); }
+        .mg-green { border-color: rgba(34, 197, 94, 0.45); }
+        .mg-green .mg-badge { background: var(--accent-green); color: #052e16; }
+        .mg-orange { border-color: rgba(249, 115, 22, 0.45); }
+        .mg-orange .mg-badge { background: var(--accent-orange); }
+
+        .mg-arrow {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--accent-cyan);
+            min-width: 44px;
+            opacity: 0.9;
+        }
+
+        .mg-arrow svg,
+        .mg-down-arrow svg,
+        .mg-fusion svg {
+            display: block;
+        }
+
+        .mg-down-arrow {
+            display: flex;
+            justify-content: center;
+        }
+
+        .mg-panel-title {
+            margin-bottom: 0.85rem;
+            font-size: 1rem;
+        }
+
+        .mg-panel-title.text-cyan {
+            color: var(--accent-cyan);
+        }
+
+        .mg-panel-title.text-green {
+            color: var(--accent-green);
+        }
+
+        .mg-step-subtitle,
+        .mg-label,
+        .mg-mini-note,
+        .mg-library-subtitle,
+        .mg-pill span {
+            color: var(--text-secondary);
+            font-size: 0.78rem;
+            line-height: 1.45;
+        }
+
+        .mg-chip-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.45rem;
+        }
+
+        .mg-chip {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            padding: 0.28rem 0.55rem;
+            border-radius: 999px;
+            border: 1px solid rgba(148, 163, 184, 0.2);
+            background: rgba(30, 41, 59, 0.7);
+            color: var(--text-secondary);
+            font-size: 0.74rem;
+            white-space: nowrap;
+        }
+
+        .mg-chip code {
+            padding: 0;
+            border: none;
+            background: transparent;
+        }
+
+        .mg-chip-cyan {
+            border-color: rgba(6, 182, 212, 0.35);
+            color: #9eeaf6;
+        }
+
+        .mg-chip-blue {
+            border-color: rgba(59, 130, 246, 0.35);
+            color: #bfdbfe;
+        }
+
+        .mg-chip-green {
+            border-color: rgba(34, 197, 94, 0.35);
+            color: #86efac;
+        }
+
+        .mg-chip-orange {
+            border-color: rgba(249, 115, 22, 0.35);
+            color: #fdba74;
+        }
+
+        .mg-source-truth {
+            border: 2px solid var(--accent-cyan);
+            background:
+                linear-gradient(135deg, rgba(6, 182, 212, 0.18), rgba(59, 130, 246, 0.12)),
+                rgba(15, 23, 42, 0.96);
+            box-shadow: 0 0 30px rgba(6, 182, 212, 0.18);
+        }
+
+        .mg-source-truth .mg-badge {
+            background: linear-gradient(135deg, var(--accent-cyan), var(--accent-blue));
+            color: #e0f2fe;
+        }
+
+        .mg-artifact-name {
+            margin-bottom: 0.35rem;
+            font-size: 1rem;
+        }
+
+        .mg-outputs {
+            display: grid;
+            grid-template-columns: minmax(0, 1.15fr) minmax(88px, 120px) minmax(0, 0.95fr);
+            gap: 1rem;
+            align-items: center;
+        }
+
+        .mg-library-grid {
+            display: grid;
+            gap: 0.75rem;
+        }
+
+        .mg-library {
+            display: grid;
+            gap: 0.55rem;
+            padding: 0.9rem;
+        }
+
+        .mg-library-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 0.6rem;
+        }
+
+        .mg-library-name {
+            font-size: 0.92rem;
+        }
+
+        .mg-library-subtitle {
+            margin-top: -0.2rem;
+        }
+
+        .mg-source-pill {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: fit-content;
+            padding: 0.34rem 0.65rem;
+            border-radius: 999px;
+            border: 1px solid rgba(6, 182, 212, 0.4);
+            background: rgba(6, 182, 212, 0.14);
+            color: #cffafe;
+            font-size: 0.76rem;
+            font-weight: 700;
+            box-shadow: 0 0 16px rgba(6, 182, 212, 0.12);
+        }
+
+        .mg-fusion {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 0.65rem;
+            color: var(--accent-cyan);
+        }
+
+        .mg-fusion-tag {
+            padding: 0.28rem 0.65rem;
+            border-radius: 999px;
+            border: 1px solid rgba(6, 182, 212, 0.28);
+            background: rgba(6, 182, 212, 0.08);
+            color: var(--accent-cyan);
+            font-size: 0.74rem;
+            font-weight: 700;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+        }
+
+        .mg-compose-result {
+            display: grid;
+            gap: 0.9rem;
+        }
+
+        .mg-final-manual {
+            padding: 1.1rem;
+        }
+
+        .mg-final-manual .mg-artifact-name {
+            font-size: 1.15rem;
+        }
+
+        .mg-usage-grid {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 0.75rem;
+        }
+
+        .mg-pill {
+            min-height: 100%;
+            display: grid;
+            gap: 0.35rem;
+        }
+
+        .mg-pill strong {
+            display: block;
+            font-size: 0.9rem;
+        }
+
+        .mg-pill-cyan { border-color: rgba(6, 182, 212, 0.45); }
+        .mg-pill-blue { border-color: rgba(59, 130, 246, 0.45); }
+        .mg-pill-green { border-color: rgba(34, 197, 94, 0.45); }
+
+        .mg-anatomy {
+            display: grid;
+            gap: 1rem;
+            padding: 1.1rem;
+            border: 1px solid rgba(6, 182, 212, 0.28);
+            background:
+                linear-gradient(180deg, rgba(6, 182, 212, 0.08), rgba(15, 23, 42, 0.9) 28%),
+                rgba(15, 23, 42, 0.96);
+        }
+
+        .mg-anatomy-head {
+            display: grid;
+            grid-template-columns: minmax(0, 1.25fr) minmax(0, 0.75fr);
+            gap: 0.9rem;
+            align-items: stretch;
+        }
+
+        .mg-json-frame,
+        .mg-derived-stack,
+        .mg-anatomy-section {
+            min-width: 0;
+            border-radius: 0.9rem;
+            border: 1px solid rgba(148, 163, 184, 0.16);
+            background: rgba(2, 6, 23, 0.45);
+            padding: 0.95rem;
+        }
+
+        .mg-json-frame {
+            display: grid;
+            gap: 0.85rem;
+            border-color: rgba(6, 182, 212, 0.28);
+            box-shadow: inset 0 0 0 1px rgba(6, 182, 212, 0.08);
+        }
+
+        .mg-json-topline {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            justify-content: space-between;
+            gap: 0.75rem;
+        }
+
+        .mg-json-title {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.6rem;
+            font-size: 1rem;
+            font-weight: 700;
+            color: var(--text-primary);
+        }
+
+        .mg-json-dot {
+            width: 0.7rem;
+            height: 0.7rem;
+            border-radius: 999px;
+            background: var(--accent-cyan);
+            box-shadow: 0 0 14px rgba(6, 182, 212, 0.45);
+        }
+
+        .mg-field-grid,
+        .mg-derived-stack,
+        .mg-anatomy-grid,
+        .mg-mini-stack {
+            display: grid;
+            gap: 0.65rem;
+        }
+
+        .mg-field-grid {
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+
+        .mg-field-box {
+            border-radius: 0.75rem;
+            border: 1px solid rgba(148, 163, 184, 0.16);
+            background: rgba(30, 41, 59, 0.52);
+            padding: 0.75rem;
+            min-height: 100%;
+        }
+
+        .mg-field-label {
+            font-size: 0.72rem;
+            font-weight: 700;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+            color: var(--text-secondary);
+            margin-bottom: 0.3rem;
+        }
+
+        .mg-field-value {
+            color: var(--text-primary);
+            font-weight: 600;
+            font-size: 0.85rem;
+            line-height: 1.35;
+        }
+
+        .mg-derived-stack {
+            align-content: start;
+        }
+
+        .mg-derived-title {
+            font-size: 0.78rem;
+            font-weight: 700;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+            color: var(--accent-green);
+        }
+
+        .mg-derived-card {
+            border-radius: 0.75rem;
+            padding: 0.8rem;
+            border: 1px solid rgba(34, 197, 94, 0.18);
+            background: rgba(15, 23, 42, 0.82);
+            display: grid;
+            gap: 0.25rem;
+        }
+
+        .mg-derived-card code {
+            width: fit-content;
+        }
+
+        .mg-anatomy-grid {
+            grid-template-columns: repeat(5, minmax(0, 1fr));
+        }
+
+        .mg-anatomy-section {
+            display: grid;
+            gap: 0.55rem;
+            min-height: 100%;
+        }
+
+        .mg-anatomy-section.mg-cyan { border-color: rgba(6, 182, 212, 0.35); }
+        .mg-anatomy-section.mg-blue { border-color: rgba(59, 130, 246, 0.35); }
+        .mg-anatomy-section.mg-green { border-color: rgba(34, 197, 94, 0.35); }
+        .mg-anatomy-section.mg-orange { border-color: rgba(249, 115, 22, 0.35); }
+
+        .mg-section-name {
+            display: flex;
+            align-items: center;
+            gap: 0.45rem;
+            color: var(--text-primary);
+            font-weight: 700;
+            font-size: 0.86rem;
+            line-height: 1.3;
+        }
+
+        .mg-section-bar {
+            width: 0.28rem;
+            align-self: stretch;
+            border-radius: 999px;
+            background: currentColor;
+            opacity: 0.95;
+        }
+
+        .mg-section-name.text-cyan,
+        .mg-section-name.text-cyan .mg-section-bar { color: var(--accent-cyan); }
+        .mg-section-name.text-blue,
+        .mg-section-name.text-blue .mg-section-bar { color: var(--accent-blue); }
+        .mg-section-name.text-green,
+        .mg-section-name.text-green .mg-section-bar { color: var(--accent-green); }
+        .mg-section-name.text-orange,
+        .mg-section-name.text-orange .mg-section-bar { color: var(--accent-orange); }
+
+        .mg-mini-stack {
+            grid-template-columns: 1fr;
+        }
+
+        .mg-mini-item {
+            border-radius: 0.7rem;
+            border: 1px solid rgba(148, 163, 184, 0.14);
+            background: rgba(30, 41, 59, 0.4);
+            padding: 0.55rem 0.65rem;
+        }
+
+        .mg-mini-k {
+            display: block;
+            color: var(--text-primary);
+            font-size: 0.78rem;
+            font-weight: 700;
+            line-height: 1.25;
+        }
+
+        .mg-mini-v {
+            display: block;
+            margin-top: 0.18rem;
+            color: var(--text-secondary);
+            font-size: 0.72rem;
+            line-height: 1.35;
+        }
+
         @media (max-width: 768px) {
             .dsg-split { flex-direction: column; gap: 0.5rem; }
             .dsg-arrow-right svg { transform: rotate(90deg); }
             .dsg-savings-row { flex-direction: column; gap: 1rem; }
             .dsg-savings-arrow { transform: rotate(90deg); }
+
+            .mg-sequence {
+                flex-direction: column;
+                align-items: stretch;
+            }
+
+            .mg-step {
+                max-width: none;
+            }
+
+            .mg-arrow svg {
+                transform: rotate(90deg);
+            }
+
+            .mg-outputs {
+                grid-template-columns: 1fr;
+            }
+
+            .mg-fusion svg {
+                transform: rotate(90deg);
+            }
+
+            .mg-usage-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .mg-anatomy-head,
+            .mg-field-grid,
+            .mg-anatomy-grid {
+                grid-template-columns: 1fr;
+            }
         }
 
         /* Labels in Tuned State */
@@ -1438,6 +1972,288 @@ Memory mapped: 1.2 GB total</code></pre>
                         <div class="dsg-savings-item">
                             <div class="dsg-savings-number" style="color: var(--accent-cyan);">99.9%</div>
                             <div class="dsg-savings-label">Context reduction</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <section id="manual-generation">
+        <div class="container">
+            <h2 class="text-center">JSON-First Manual Generation</h2>
+            <p class="text-center subtitle" style="margin-bottom: 2rem;">
+                Small source packs become structured library manuals, then multiple manuals compose into one runtime guide.
+            </p>
+
+            <div class="diagram-container mg-shell">
+                <div class="mg-kicker">Generated manual pipeline • mostly illustration</div>
+
+                <div class="mg-flow">
+                    <div class="mg-sequence">
+                        <div class="mg-card mg-step mg-cyan">
+                            <div class="mg-badge">Input</div>
+                            <div class="mg-step-title">source packs</div>
+                            <div class="mg-chip-row">
+                                <span class="mg-chip mg-chip-cyan"><code>manual_sources/&lt;library&gt;/</code></span>
+                                <span class="mg-chip">docs</span>
+                                <span class="mg-chip">metadata</span>
+                            </div>
+                        </div>
+
+                        <div class="mg-arrow" aria-hidden="true">
+                            <svg width="40" height="18" viewBox="0 0 40 18"><line x1="0" y1="9" x2="30" y2="9" stroke="currentColor" stroke-width="2" stroke-dasharray="4 3"/><polygon points="30,1 30,17 40,9" fill="currentColor"/></svg>
+                        </div>
+
+                        <div class="mg-card mg-step mg-blue">
+                            <div class="mg-badge">Step 1</div>
+                            <div class="mg-step-title">ingest / chunk</div>
+                            <div class="mg-chip-row">
+                                <span class="mg-chip mg-chip-blue">raw</span>
+                                <span class="mg-chip mg-chip-blue">chunks</span>
+                                <span class="mg-chip mg-chip-blue">resumable</span>
+                            </div>
+                        </div>
+
+                        <div class="mg-arrow" aria-hidden="true">
+                            <svg width="40" height="18" viewBox="0 0 40 18"><line x1="0" y1="9" x2="30" y2="9" stroke="currentColor" stroke-width="2" stroke-dasharray="4 3"/><polygon points="30,1 30,17 40,9" fill="currentColor"/></svg>
+                        </div>
+
+                        <div class="mg-card mg-step mg-orange">
+                            <div class="mg-badge">Step 2</div>
+                            <div class="mg-step-title">extract evidence</div>
+                            <div class="mg-chip-row">
+                                <span class="mg-chip mg-chip-orange">LLM pass 1</span>
+                                <span class="mg-chip mg-chip-orange"><code>evidence.jsonl</code></span>
+                            </div>
+                        </div>
+
+                        <div class="mg-arrow" aria-hidden="true">
+                            <svg width="40" height="18" viewBox="0 0 40 18"><line x1="0" y1="9" x2="30" y2="9" stroke="currentColor" stroke-width="2" stroke-dasharray="4 3"/><polygon points="30,1 30,17 40,9" fill="currentColor"/></svg>
+                        </div>
+
+                        <div class="mg-card mg-step mg-green">
+                            <div class="mg-badge">Step 3</div>
+                            <div class="mg-step-title">synthesize + verify</div>
+                            <div class="mg-chip-row">
+                                <span class="mg-chip mg-chip-green">LLM pass 2</span>
+                                <span class="mg-chip mg-chip-green">schema</span>
+                                <span class="mg-chip mg-chip-green">repair</span>
+                            </div>
+                        </div>
+
+                        <div class="mg-arrow" aria-hidden="true">
+                            <svg width="40" height="18" viewBox="0 0 40 18"><line x1="0" y1="9" x2="30" y2="9" stroke="currentColor" stroke-width="2" stroke-dasharray="4 3"/><polygon points="30,1 30,17 40,9" fill="currentColor"/></svg>
+                        </div>
+
+                        <div class="mg-card mg-step mg-source-truth">
+                            <div class="mg-badge">Source of truth</div>
+                            <div class="mg-step-title"><code>manual.json</code></div>
+                            <div class="mg-chip-row">
+                                <span class="mg-chip mg-chip-cyan"><code>manual.md</code></span>
+                                <span class="mg-chip mg-chip-blue"><code>manual_index.jsonl</code></span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="mg-down-arrow" aria-hidden="true">
+                        <svg width="40" height="48" viewBox="0 0 40 48">
+                            <line x1="20" y1="0" x2="20" y2="36" stroke="var(--accent-cyan)" stroke-width="2" stroke-dasharray="4 3"/>
+                            <polygon points="12,36 28,36 20,46" fill="var(--accent-cyan)"/>
+                        </svg>
+                    </div>
+
+                    <div class="mg-card mg-anatomy">
+                        <div class="mg-panel-title text-cyan">What a generated library manual contains</div>
+
+                        <div class="mg-anatomy-head">
+                            <div class="mg-json-frame">
+                                <div class="mg-json-topline">
+                                    <div class="mg-json-title">
+                                        <span class="mg-json-dot" aria-hidden="true"></span>
+                                        <code>manual.json</code>
+                                    </div>
+                                    <span class="mg-chip mg-chip-cyan">structured tuning knowledge</span>
+                                </div>
+
+                                <div class="mg-field-grid">
+                                    <div class="mg-field-box">
+                                        <div class="mg-field-label">manual_id</div>
+                                        <div class="mg-field-value"><code>openmp</code></div>
+                                    </div>
+                                    <div class="mg-field-box">
+                                        <div class="mg-field-label">manual_type</div>
+                                        <div class="mg-field-value"><code>library</code></div>
+                                    </div>
+                                    <div class="mg-field-box">
+                                        <div class="mg-field-label">library_name</div>
+                                        <div class="mg-field-value">OpenMP</div>
+                                    </div>
+                                    <div class="mg-field-box">
+                                        <div class="mg-field-label">library_summary</div>
+                                        <div class="mg-field-value">runtime model + knobs + tuning context</div>
+                                    </div>
+                                    <div class="mg-field-box" style="grid-column: 1 / -1;">
+                                        <div class="mg-field-label">source_artifacts</div>
+                                        <div class="mg-field-value">doc chunks • code hints • metadata</div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="mg-derived-stack">
+                                <div class="mg-derived-title">Rendered / derived views</div>
+                                <div class="mg-derived-card">
+                                    <code>manual.md</code>
+                                    <span class="mg-mini-note">deterministic rendered view</span>
+                                </div>
+                                <div class="mg-derived-card">
+                                    <code>manual_index.jsonl</code>
+                                    <span class="mg-mini-note">flattened retrieval index</span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="mg-anatomy-grid">
+                            <div class="mg-anatomy-section mg-cyan">
+                                <div class="mg-section-name text-cyan"><span class="mg-section-bar" aria-hidden="true"></span>feature_graph</div>
+                                <div class="mg-mini-stack">
+                                    <div class="mg-mini-item"><span class="mg-mini-k">mechanisms</span><span class="mg-mini-v">features / runtime levers</span></div>
+                                    <div class="mg-mini-item"><span class="mg-mini-k">knobs</span><span class="mg-mini-v">what can be changed</span></div>
+                                </div>
+                            </div>
+
+                            <div class="mg-anatomy-section mg-blue">
+                                <div class="mg-section-name text-blue"><span class="mg-section-bar" aria-hidden="true"></span>observability_map</div>
+                                <div class="mg-mini-stack">
+                                    <div class="mg-mini-item"><span class="mg-mini-k">measure first</span><span class="mg-mini-v">questions / signals / tools</span></div>
+                                    <div class="mg-mini-item"><span class="mg-mini-k">symptoms</span><span class="mg-mini-v">what to look for</span></div>
+                                </div>
+                            </div>
+
+                            <div class="mg-anatomy-section mg-green">
+                                <div class="mg-section-name text-green"><span class="mg-section-bar" aria-hidden="true"></span>intervention_graph</div>
+                                <div class="mg-mini-stack">
+                                    <div class="mg-mini-item"><span class="mg-mini-k">actions</span><span class="mg-mini-v">env / cli / config / api</span></div>
+                                    <div class="mg-mini-item"><span class="mg-mini-k">knobs</span><span class="mg-mini-v">expected effect + side effects</span></div>
+                                </div>
+                            </div>
+
+                            <div class="mg-anatomy-section mg-orange">
+                                <div class="mg-section-name text-orange"><span class="mg-section-bar" aria-hidden="true"></span>validation_recipes</div>
+                                <div class="mg-mini-stack">
+                                    <div class="mg-mini-item"><span class="mg-mini-k">accept</span><span class="mg-mini-v">reruns + metrics + pass check</span></div>
+                                    <div class="mg-mini-item"><span class="mg-mini-k">rollback</span><span class="mg-mini-v">revert conditions</span></div>
+                                </div>
+                            </div>
+
+                            <div class="mg-anatomy-section mg-cyan">
+                                <div class="mg-section-name text-cyan"><span class="mg-section-bar" aria-hidden="true"></span>composition_hints</div>
+                                <div class="mg-mini-stack">
+                                    <div class="mg-mini-item"><span class="mg-mini-k">conflicts</span><span class="mg-mini-v">collision patterns</span></div>
+                                    <div class="mg-mini-item"><span class="mg-mini-k">shared resources</span><span class="mg-mini-v">cross-library pressure</span></div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="mg-down-arrow" aria-hidden="true">
+                        <svg width="40" height="48" viewBox="0 0 40 48">
+                            <line x1="20" y1="0" x2="20" y2="36" stroke="var(--accent-cyan)" stroke-width="2" stroke-dasharray="4 3"/>
+                            <polygon points="12,36 28,36 20,46" fill="var(--accent-cyan)"/>
+                        </svg>
+                    </div>
+
+                    <div class="mg-outputs">
+                        <div class="mg-card">
+                            <div class="mg-panel-title text-cyan">Multiple library manuals</div>
+                            <div class="mg-library-grid">
+                                <div class="mg-card mg-library mg-cyan">
+                                    <div class="mg-library-head">
+                                        <div class="mg-library-name">numactl manual</div>
+                                        <span class="mg-chip mg-chip-cyan">generated</span>
+                                    </div>
+                                    <div class="mg-library-subtitle">docs + metadata → structured manual</div>
+                                    <div class="mg-source-pill"><code>manual.json</code></div>
+                                    <div class="mg-chip-row">
+                                        <span class="mg-chip mg-chip-cyan"><code>manual.md</code></span>
+                                        <span class="mg-chip mg-chip-blue"><code>manual_index.jsonl</code></span>
+                                    </div>
+                                </div>
+
+                                <div class="mg-card mg-library mg-blue">
+                                    <div class="mg-library-head">
+                                        <div class="mg-library-name">OpenMP manual</div>
+                                        <span class="mg-chip mg-chip-blue">generated</span>
+                                    </div>
+                                    <div class="mg-library-subtitle">same pipeline, separate manual bundle</div>
+                                    <div class="mg-source-pill"><code>manual.json</code></div>
+                                    <div class="mg-chip-row">
+                                        <span class="mg-chip mg-chip-cyan"><code>manual.md</code></span>
+                                        <span class="mg-chip mg-chip-blue"><code>manual_index.jsonl</code></span>
+                                    </div>
+                                </div>
+
+                                <div class="mg-card mg-library mg-green">
+                                    <div class="mg-library-head">
+                                        <div class="mg-library-name">library manual N</div>
+                                        <span class="mg-chip mg-chip-green">generated</span>
+                                    </div>
+                                    <div class="mg-library-subtitle">more manuals can join the same compose step</div>
+                                    <div class="mg-source-pill"><code>manual.json</code></div>
+                                    <div class="mg-chip-row">
+                                        <span class="mg-chip mg-chip-cyan"><code>manual.md</code></span>
+                                        <span class="mg-chip mg-chip-blue"><code>manual_index.jsonl</code></span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="mg-fusion" aria-hidden="true">
+                            <svg width="104" height="170" viewBox="0 0 104 170">
+                                <line x1="0" y1="24" x2="38" y2="24" stroke="currentColor" stroke-width="2" stroke-dasharray="4 3"/>
+                                <line x1="0" y1="85" x2="38" y2="85" stroke="currentColor" stroke-width="2" stroke-dasharray="4 3"/>
+                                <line x1="0" y1="146" x2="38" y2="146" stroke="currentColor" stroke-width="2" stroke-dasharray="4 3"/>
+                                <line x1="38" y1="24" x2="64" y2="85" stroke="currentColor" stroke-width="2"/>
+                                <line x1="38" y1="85" x2="64" y2="85" stroke="currentColor" stroke-width="2"/>
+                                <line x1="38" y1="146" x2="64" y2="85" stroke="currentColor" stroke-width="2"/>
+                                <line x1="64" y1="85" x2="94" y2="85" stroke="currentColor" stroke-width="2" stroke-dasharray="4 3"/>
+                                <polygon points="94,77 94,93 104,85" fill="currentColor"/>
+                            </svg>
+                            <div class="mg-fusion-tag">compose</div>
+                        </div>
+
+                        <div class="mg-compose-result">
+                            <div class="mg-card mg-final-manual mg-source-truth">
+                                <div class="mg-badge">Final composed manual</div>
+                                <div class="mg-artifact-name"><code>manual.json</code></div>
+                                <div class="mg-chip-row" style="margin-bottom: 0.55rem;">
+                                    <span class="mg-chip mg-chip-cyan">merged library guidance</span>
+                                    <span class="mg-chip mg-chip-green">app-level context</span>
+                                    <span class="mg-chip mg-chip-orange">different schema</span>
+                                </div>
+                                <div class="mg-chip-row">
+                                    <span class="mg-chip mg-chip-cyan"><code>manual.md</code></span>
+                                    <span class="mg-chip mg-chip-blue"><code>manual_index.jsonl</code></span>
+                                </div>
+                            </div>
+
+                            <div>
+                                <div class="mg-panel-title text-green">Downstream use</div>
+                                <div class="mg-usage-grid">
+                                    <div class="mg-pill mg-pill-cyan">
+                                        <strong>query</strong>
+                                        <span>targeted slices</span>
+                                    </div>
+                                    <div class="mg-pill mg-pill-blue">
+                                        <strong>agent context</strong>
+                                        <span>focused runtime bundle</span>
+                                    </div>
+                                    <div class="mg-pill mg-pill-green">
+                                        <strong>autotuner</strong>
+                                        <span>manual-backed actions</span>
+                                    </div>
+                                </div>
+                            </div>
                         </div>
                     </div>
                 </div>

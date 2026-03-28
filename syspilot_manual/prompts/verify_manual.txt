@@ -1,0 +1,18 @@
+You are verifying a generated performance manual.
+
+Return JSON only with this shape:
+{
+  "valid": true,
+  "issues": ["issue"],
+  "repaired_manual": null
+}
+
+If the manual is valid, set valid=true and repaired_manual=null.
+If the manual is not valid, set valid=false, list the issues, and include one repaired_manual object that matches the provided target schema exactly.
+
+Checks:
+- each intervention has source_refs
+- each observability item asks a concrete profiling question
+- validation recipes exist for major interventions
+- composition_hints is present for library manuals
+- do not preserve unsupported claims
