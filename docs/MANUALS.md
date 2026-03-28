@@ -18,6 +18,27 @@ For a generated contract named `openmp`, the runtime-compatible outputs are:
 
 - `contracts/openmp/contract.yaml` — LPCL source of truth
 
+The contract schema now prefers a **typed core** over free-form strings:
+
+- controls use canonical scalar/domain types such as `int`, `bool`, `enum`, `cpu_set`, and `numa_node_set`
+- demand bounds use host symbols like `host.visible_cpus` instead of prose such as “visible processors”
+- signals use structured probes (`probe.kind`, `probe.target`) instead of a free-form `tool` string
+- recipes reference `control_refs` and `signal` ids directly
+- composed conflicts use `candidate_control_refs`, `candidate_recipe_refs`, and signal/control refs instead of copied action prose
+
+Natural language is still allowed for fields that genuinely need it, such as explanatory `indicates` text and acceptance/rollback criteria.
+
+### Enforced LPCL checking
+
+`synthesize-contract` now enforces a bounded verify/repair loop before any bundle is written:
+
+- generated contract JSON is normalized and checked against the LPCL schema
+- semantic lint checks verify refs like `controls.affects`, `recipes.collect`, and composed cross-library refs
+- if the checker fails, SysPilot asks the LLM to repair the invalid sections and retries with a small bounded budget
+- if the contract still fails after the repair budget is exhausted, generation fails explicitly and no partial contract bundle is written
+
+This means `contracts/<id>/contract.yaml` is now a checked artifact, not just a raw first-pass LLM draft.
+
 Artifact/debug outputs are also written under:
 
 - `artifacts/contracts/`

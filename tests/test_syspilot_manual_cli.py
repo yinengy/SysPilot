@@ -164,15 +164,16 @@ def _library_contract(
                     "metric": "os.context_switch_rate",
                     "resource": "cpu.thread",
                     "indicates": "contention",
-                    "tool": "perf",
+                    "probe": {"kind": "command", "target": "perf"},
                     "source_refs": [f"{contract_name}_doc:chunk_001"],
                 }
             ],
             "recipes": [
                 {
                     "id": "reduce_oversubscription",
-                    "hypothesis_kind": "shared_cpu_thread_conflict",
+                    "hypothesis_kind": "shared_resource_conflict",
                     "collect": ["ctx_switch_rate"],
+                    "control_refs": ["omp_num_threads"],
                     "actions": [f"decrease {control_name}"],
                     "accept_if": "throughput improves",
                     "rollback_if": "throughput regresses",

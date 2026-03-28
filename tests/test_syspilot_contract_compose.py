@@ -62,15 +62,16 @@ def _contract(name: str, control_name: str, role: str = "consume") -> LibraryCon
                     "metric": f"{name}.runqueue_length",
                     "resource": "cpu.thread",
                     "indicates": "thread contention",
-                    "tool": "perf",
+                    "probe": {"kind": "command", "target": "perf"},
                     "source_refs": [f"{name}_doc:chunk_001"],
                 }
             ],
             "recipes": [
                 {
                     "id": f"{name}_recipe",
-                    "hypothesis_kind": "shared_cpu_thread_conflict",
+                    "hypothesis_kind": "shared_resource_conflict",
                     "collect": [f"{name}_signal"],
+                    "control_refs": [f"{name}_control"],
                     "actions": [f"decrease {control_name}"],
                     "accept_if": "throughput improves",
                     "rollback_if": "throughput regresses",
@@ -99,8 +100,10 @@ def test_composer_derives_hypotheses_from_shared_resource() -> None:
 
     assert hypotheses
     assert hypotheses[0].resource == "cpu.thread"
-    assert "OMP_NUM_THREADS" in hypotheses[0].basis.colliding_controls
+    assert "OpenMP.OpenMP_control" in hypotheses[0].basis.colliding_controls
     assert any("solo_compute_pool" in item for item in hypotheses[0].basis.violated_assumptions)
+    assert "OpenMP.OpenMP_signal" in hypotheses[0].validation.collect
+    assert "OpenMP.OpenMP_recipe" in hypotheses[0].candidate_recipe_refs
 
 
 def test_contract_context_bundle_exposes_profile_actions_conflicts(tmp_path: Path) -> None:

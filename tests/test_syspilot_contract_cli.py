@@ -72,15 +72,16 @@ def _library_contract(name: str = "OpenMP") -> LibraryContract:
                     "metric": f"{name.lower()}.runqueue_length",
                     "resource": "cpu.thread",
                     "indicates": "thread contention",
-                    "tool": "perf",
+                    "probe": {"kind": "command", "target": "perf"},
                     "source_refs": [f"{name}_doc:chunk_001"],
                 }
             ],
             "recipes": [
                 {
                     "id": f"{name.lower()}_recipe",
-                    "hypothesis_kind": "shared_cpu_thread_conflict",
+                    "hypothesis_kind": "shared_resource_conflict",
                     "collect": [f"{name.lower()}_signal"],
+                    "control_refs": [f"{name.lower()}_threads"],
                     "actions": [f"decrease {control_name}"],
                     "accept_if": "throughput improves",
                     "rollback_if": "throughput regresses",

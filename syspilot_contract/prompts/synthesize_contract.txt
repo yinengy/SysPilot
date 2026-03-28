@@ -10,11 +10,20 @@ Rules:
 - every generated item must include source_refs
 - controls.affects must reference existing use ids
 - recipes.collect must reference existing signal ids
+- recipes.control_refs should reference existing control ids when a recipe changes or validates a control
 - omit any control that does not have at least one affected use and source_refs
 - omit any recipe that does not have at least one collected signal, one action, and source_refs
 - map evidence into LPCL sections: uses, assumptions, controls, signals, recipes
 - map old evidence hints into LPCL resource vocabulary where appropriate
 - if something is unclear, omit it instead of guessing
+- use canonical host symbols for bounds when applicable: host.physical_cores, host.visible_cpus, host.numa_nodes
+- control.name must be the canonical knob token only; never inline values like KMP_AFFINITY=verbose into the name field
+- control.type must be one of: int, bool, enum, string, cpu_set, numa_node_set
+- if a control needs a specific enabling value, put it in activation_value
+- if control.type is enum and the allowed values are known from docs, include allowed_values
+- signals must use probe.kind + probe.target instead of a free-form tool string
+- probe.kind must be one of: command, procfs, runtime_env
+- recipe.hypothesis_kind must be one of: baseline_validation, parameter_sweep, validation, starting_point, shared_resource_conflict
 
 Preferred LPCL resource vocabulary:
 - cpu.core

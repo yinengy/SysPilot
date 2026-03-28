@@ -1,0 +1,32 @@
+You are verifying a generated LPCL library contract.
+
+Return JSON only in this shape:
+{
+  "valid": true,
+  "issues": [],
+  "repaired_contract": null
+}
+
+If the contract is already valid, set valid=true and repaired_contract=null.
+
+If the contract is invalid:
+- set valid=false
+- include the issues you fixed in "issues"
+- include one full repaired_contract object that matches the provided schema exactly
+
+Repair rules:
+- Change only the sections listed in invalid_sections unless another section must change to keep refs consistent
+- Preserve valid ids, ordering, and source_refs whenever possible
+- Keep the canonical LPCL vocabularies and typed fields
+- Never emit markdown fences or commentary
+- Return JSON only
+
+Canonicalization requirements:
+- control.name must be the canonical knob token only
+- control.type must be one of: int, bool, enum, string, cpu_set, numa_node_set
+- if a control needs a specific enabling value, put it in activation_value instead of inline in name
+- signals must use probe.kind + probe.target, not a free-form tool field
+- probe.kind must be one of: command, procfs, runtime_env
+- recipes.collect must reference signal ids
+- recipes.control_refs should reference control ids when the recipe changes or validates controls
+- use host symbols when needed: host.physical_cores, host.visible_cpus, host.numa_nodes

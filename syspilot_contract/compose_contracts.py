@@ -32,6 +32,18 @@ def _assumption_ref(contract: LibraryContract, assumption_id: str) -> str:
     return f"{contract.contract}.{assumption_id}"
 
 
+def _control_ref(contract: LibraryContract, control_id: str) -> str:
+    return f"{contract.contract}.{control_id}"
+
+
+def _signal_ref(contract: LibraryContract, signal_id: str) -> str:
+    return f"{contract.contract}.{signal_id}"
+
+
+def _recipe_ref(contract: LibraryContract, recipe_id: str) -> str:
+    return f"{contract.contract}.{recipe_id}"
+
+
 def _phase_overlaps(left: PhaseName, right: PhaseName) -> bool:
     return left == right or left == "unknown" or right == "unknown"
 
@@ -98,53 +110,48 @@ def _violated_assumptions(
     return sorted(set(violated))
 
 
-def _candidate_actions(
+def _candidate_recipe_refs(
     left: LibraryContract,
     right: LibraryContract,
     resource: ResourceType,
     controls: list[Control],
 ) -> list[str]:
-    actions: list[str] = []
-    control_names = sorted({control.name for control in controls})
-    if len(control_names) >= 2:
-        actions.append(f"coordinate {' and '.join(control_names)} before changing both")
-    elif control_names:
-        actions.append(
-            f"change {control_names[0]} conservatively and validate before combining with other layers"
-        )
-
+    recipe_refs: list[str] = []
     for contract in (left, right):
         relevant_signal_ids = {
             signal.id for signal in contract.signals if signal.resource == resource
         }
+        relevant_control_ids = {
+            control.id for control in contract.controls if control.effect.resource == resource
+        }
         for recipe in contract.recipes:
             if (
                 relevant_signal_ids.intersection(recipe.collect)
-                or resource.split(".")[-1] in recipe.hypothesis_kind
+                or relevant_control_ids.intersection(recipe.control_refs)
+                or recipe.hypothesis_kind == "shared_resource_conflict"
             ):
-                actions.extend(recipe.actions)
+                recipe_refs.append(_recipe_ref(contract, recipe.id))
 
-    if not actions:
-        actions.append(
-            f"profile {resource} first and change one competing control family at a time"
-        )
-    return sorted(dict.fromkeys(actions))
+    if not recipe_refs and controls:
+        for contract in (left, right):
+            for recipe in contract.recipes:
+                if recipe.hypothesis_kind in {"validation", "starting_point", "parameter_sweep"}:
+                    recipe_refs.append(_recipe_ref(contract, recipe.id))
+    return sorted(dict.fromkeys(recipe_refs))
 
 
-def _validation_metrics(
+def _validation_signal_refs(
     left: LibraryContract,
     right: LibraryContract,
     resource: ResourceType,
 ) -> list[str]:
-    metrics = [
-        signal.metric
+    signal_refs = [
+        _signal_ref(contract, signal.id)
         for contract in (left, right)
         for signal in contract.signals
         if signal.resource == resource
     ]
-    if not metrics:
-        metrics = [f"{resource}.utilization"]
-    return sorted(dict.fromkeys(metrics))
+    return sorted(dict.fromkeys(signal_refs))
 
 
 def derive_conflict_hypotheses(contracts: list[LibraryContract]) -> list[ConflictHypothesis]:
@@ -171,9 +178,11 @@ def derive_conflict_hypotheses(contracts: list[LibraryContract]) -> list[Conflic
                     key=lambda item: (item.name.lower(), item.id.lower()),
                 )
                 colliding_controls = [
-                    control.name
-                    for control in controls
-                    if control.scope in {"process", "library", "system", "device"}
+                    _control_ref(contract, control.id)
+                    for contract in (left, right)
+                    for control in contract.controls
+                    if control.effect.resource == left_use.resource
+                    and control.scope in {"process", "library", "system", "device"}
                 ]
                 violated_assumptions = _violated_assumptions(left, right, left_use.resource, phase)
                 sharing_trigger = any(
@@ -229,9 +238,10 @@ def derive_conflict_hypotheses(contracts: list[LibraryContract]) -> list[Conflic
                             colliding_controls=sorted(set(colliding_controls)),
                         ),
                         validate=HypothesisValidation(
-                            collect=_validation_metrics(left, right, left_use.resource)
+                            collect=_validation_signal_refs(left, right, left_use.resource)
                         ),
-                        candidate_actions=_candidate_actions(
+                        candidate_control_refs=sorted(set(colliding_controls)),
+                        candidate_recipe_refs=_candidate_recipe_refs(
                             left,
                             right,
                             left_use.resource,

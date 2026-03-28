@@ -116,6 +116,37 @@ DemandKind = Literal[
     "unknown",
 ]
 
+HostSymbol = Literal[
+    "host.physical_cores",
+    "host.visible_cpus",
+    "host.numa_nodes",
+]
+
+ControlValueType = Literal[
+    "int",
+    "bool",
+    "enum",
+    "string",
+    "cpu_set",
+    "numa_node_set",
+]
+
+ProbeKind = Literal[
+    "command",
+    "procfs",
+    "runtime_env",
+]
+
+RecipeHypothesisKind = Literal[
+    "baseline_validation",
+    "parameter_sweep",
+    "validation",
+    "starting_point",
+    "shared_resource_conflict",
+]
+
+ConflictHypothesisKind = Literal["shared_resource_conflict"]
+
 PredicateKind = Literal[
     "max_competitors",
     "budget_at_most",
@@ -154,15 +185,15 @@ class FixedDemand(ContractBaseModel):
 
 class RangeDemand(ContractBaseModel):
     kind: Literal["range"] = "range"
-    lower: int | str
-    upper: int | str
+    lower: int | HostSymbol
+    upper: int | HostSymbol
 
 
 class ScaledByDemand(ContractBaseModel):
     kind: Literal["scaled_by"] = "scaled_by"
     knob: str
-    lower: int | str
-    upper: int | str
+    lower: int | HostSymbol
+    upper: int | HostSymbol
 
 
 class ProportionalToDemand(ContractBaseModel):
@@ -219,7 +250,7 @@ class BudgetAtMostPredicate(ContractBaseModel):
     kind: Literal["budget_at_most"] = "budget_at_most"
     resource: ResourceType
     phase: PhaseName
-    value: int | str
+    value: int | HostSymbol
 
 
 class DedicatedPartitionPredicate(ContractBaseModel):
@@ -274,23 +305,32 @@ class ControlEffect(ContractBaseModel):
     strength: Literal["weak", "moderate", "strong"] = "moderate"
 
 
+class SignalProbe(ContractBaseModel):
+    kind: ProbeKind
+    target: str
+
+
 class Control(ContractBaseModel):
     id: str
     name: str
     kind: Literal["env", "config", "api", "cli", "runtime"]
-    type: str
+    type: ControlValueType
     affects: list[str] = Field(default_factory=list)
     effect: ControlEffect
     scope: ScopeName
+    allowed_values: list[str] = Field(default_factory=list)
+    activation_value: str | int | bool | None = None
     source_refs: list[str]
 
-    @field_validator("affects", "source_refs", mode="after")
+    @field_validator("affects", "allowed_values", "source_refs", mode="after")
     @classmethod
     def _normalize_string_lists(cls, values: list[str]) -> list[str]:
         return _clean_strings(values)
 
     @model_validator(mode="after")
     def _require_references(self) -> "Control":
+        if "=" in self.name:
+            raise ValueError("Controls must use canonical knob names without inline values")
         if not self.affects:
             raise ValueError("Controls require at least one affected use")
         if not self.source_refs:
@@ -303,7 +343,7 @@ class Signal(ContractBaseModel):
     metric: str
     resource: ResourceType
     indicates: str
-    tool: str
+    probe: SignalProbe
     source_refs: list[str]
 
     @field_validator("source_refs", mode="after")
@@ -320,14 +360,15 @@ class Signal(ContractBaseModel):
 
 class Recipe(ContractBaseModel):
     id: str
-    hypothesis_kind: str
+    hypothesis_kind: RecipeHypothesisKind
     collect: list[str] = Field(default_factory=list)
+    control_refs: list[str] = Field(default_factory=list)
     actions: list[str] = Field(default_factory=list)
     accept_if: str
     rollback_if: str
     source_refs: list[str]
 
-    @field_validator("collect", "actions", "source_refs", mode="after")
+    @field_validator("collect", "control_refs", "actions", "source_refs", mode="after")
     @classmethod
     def _normalize_string_lists(cls, values: list[str]) -> list[str]:
         return _clean_strings(values)
@@ -411,16 +452,23 @@ class HypothesisValidation(ContractBaseModel):
 
 class ConflictHypothesis(ContractBaseModel):
     id: str
-    kind: str
+    kind: ConflictHypothesisKind
     resource: ResourceType
     phase: PhaseName
     libraries: list[str] = Field(default_factory=list)
     basis: HypothesisBasis
     validation: HypothesisValidation = Field(alias="validate", serialization_alias="validate")
-    candidate_actions: list[str] = Field(default_factory=list)
+    candidate_control_refs: list[str] = Field(default_factory=list)
+    candidate_recipe_refs: list[str] = Field(default_factory=list)
     source_refs: list[str]
 
-    @field_validator("libraries", "candidate_actions", "source_refs", mode="after")
+    @field_validator(
+        "libraries",
+        "candidate_control_refs",
+        "candidate_recipe_refs",
+        "source_refs",
+        mode="after",
+    )
     @classmethod
     def _normalize_string_lists(cls, values: list[str]) -> list[str]:
         return _clean_strings(values)
@@ -461,6 +509,17 @@ class ContractCheckResult(ContractBaseModel):
     @field_validator("issues", mode="after")
     @classmethod
     def _normalize_issues(cls, values: list[str]) -> list[str]:
+        return _clean_strings(values)
+
+
+class ContractVerificationResult(ContractBaseModel):
+    valid: bool
+    issues: list[str] = Field(default_factory=list)
+    repaired_contract: dict[str, Any] | None = None
+
+    @field_validator("issues", mode="after")
+    @classmethod
+    def _normalize_verification_issues(cls, values: list[str]) -> list[str]:
         return _clean_strings(values)
 
 

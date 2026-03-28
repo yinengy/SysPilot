@@ -36,18 +36,21 @@ def render_contract_markdown(contract: LibraryContract | ComposedContract) -> st
         lines.extend(["", "## Controls", ""])
         for item in contract.controls:
             affects = ", ".join(item.affects)
+            activation = (
+                f", activation={item.activation_value}" if item.activation_value is not None else ""
+            )
             lines.append(
-                f"- `{item.name}` ({item.kind}, {item.type}) affects `{affects}` with `{item.effect.op}` on `{item.effect.resource}` at `{item.scope}` scope"
+                f"- `{item.name}` ({item.kind}, {item.type}{activation}) affects `{affects}` with `{item.effect.op}` on `{item.effect.resource}` at `{item.scope}` scope"
             )
         lines.extend(["", "## Signals", ""])
         for item in contract.signals:
             lines.append(
-                f"- `{item.metric}` via `{item.tool}` watches `{item.resource}` and indicates `{item.indicates}`"
+                f"- `{item.metric}` via `{item.probe.kind}:{item.probe.target}` watches `{item.resource}` and indicates `{item.indicates}`"
             )
         lines.extend(["", "## Recipes", ""])
         for item in contract.recipes:
             lines.append(
-                f"- `{item.id}` → collect {', '.join(item.collect)}; actions: {', '.join(item.actions)}"
+                f"- `{item.id}` → collect {', '.join(item.collect)}; controls: {', '.join(item.control_refs)}; actions: {', '.join(item.actions)}"
             )
     else:
         lines.extend(["## Shared Resources", ""])
@@ -60,6 +63,8 @@ def render_contract_markdown(contract: LibraryContract | ComposedContract) -> st
             lines.append(
                 f"- `{item.id}` → `{item.resource}` / `{item.phase}` across {', '.join(item.libraries)}; collect {', '.join(item.validation.collect)}"
             )
-            if item.candidate_actions:
-                lines.append(f"  - actions: {', '.join(item.candidate_actions)}")
+            if item.candidate_control_refs:
+                lines.append(f"  - controls: {', '.join(item.candidate_control_refs)}")
+            if item.candidate_recipe_refs:
+                lines.append(f"  - recipes: {', '.join(item.candidate_recipe_refs)}")
     return "\n".join(lines).strip() + "\n"

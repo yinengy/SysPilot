@@ -95,12 +95,13 @@ def resolve_library_contract_inputs(
     contract_refs: list[str],
     contract_root: Path,
 ) -> list[LibraryContract]:
-    store = ContractStore(contract_root)
     contracts: list[LibraryContract] = []
     for contract_ref in sorted(set(contract_refs)):
         candidate = Path(contract_ref).expanduser()
         loaded = (
-            load_contract(candidate) if candidate.exists() else store.get_contract(contract_ref)
+            load_contract(candidate)
+            if candidate.exists()
+            else load_contract(runtime_contract_dir(contract_root, contract_ref) / "contract.yaml")
         )
         if not isinstance(loaded, LibraryContract):
             raise TypeError(f"Expected library contract for {contract_ref}")

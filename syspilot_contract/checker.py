@@ -103,6 +103,14 @@ def _duplicate_id_issues(section: str, ids: list[str]) -> list[str]:
     ]
 
 
+def _ref_library(ref: str) -> str | None:
+    if "." not in ref:
+        return None
+    library, _ = ref.split(".", 1)
+    library = library.strip()
+    return library or None
+
+
 def _check_library_contract(contract: LibraryContract) -> list[str]:
     issues: list[str] = []
     issues.extend(_duplicate_id_issues("uses", [item.id for item in contract.uses]))
@@ -113,6 +121,7 @@ def _check_library_contract(contract: LibraryContract) -> list[str]:
 
     use_by_id = {item.id: item for item in contract.uses}
     signal_ids = {item.id for item in contract.signals}
+    control_ids = {item.id for item in contract.controls}
 
     for control in contract.controls:
         missing_uses = [item for item in control.affects if item not in use_by_id]
@@ -127,12 +136,26 @@ def _check_library_contract(contract: LibraryContract) -> list[str]:
             issues.append(
                 f"controls:{control.id} effect.resource={control.effect.resource} does not match affected uses"
             )
+        if (
+            control.type == "enum"
+            and control.allowed_values
+            and isinstance(control.activation_value, str)
+            and control.activation_value not in control.allowed_values
+        ):
+            issues.append(
+                f"controls:{control.id} activation_value={control.activation_value} is not in allowed_values"
+            )
 
     for recipe in contract.recipes:
         missing_signals = [item for item in recipe.collect if item not in signal_ids]
         if missing_signals:
             issues.append(
                 f"recipes:{recipe.id} collects unknown signals: {', '.join(sorted(missing_signals))}"
+            )
+        missing_controls = [item for item in recipe.control_refs if item not in control_ids]
+        if missing_controls:
+            issues.append(
+                f"recipes:{recipe.id} references unknown controls: {', '.join(sorted(missing_controls))}"
             )
 
     return issues
@@ -161,6 +184,24 @@ def _check_composed_contract(contract: ComposedContract) -> list[str]:
             issues.append(f"hypotheses:{item.id} is missing a supporting basis")
         if not item.validation.collect:
             issues.append(f"hypotheses:{item.id} must include validation signals")
+        ref_sections = {
+            "overlaps": [ref for overlap in item.basis.overlaps for ref in overlap.uses],
+            "violated_assumptions": item.basis.violated_assumptions,
+            "colliding_controls": item.basis.colliding_controls,
+            "validation": item.validation.collect,
+            "candidate_control_refs": item.candidate_control_refs,
+            "candidate_recipe_refs": item.candidate_recipe_refs,
+        }
+        for section_name, refs in ref_sections.items():
+            invalid_refs = [
+                ref
+                for ref in refs
+                if (_ref_library(ref) is None or _ref_library(ref) not in selected)
+            ]
+            if invalid_refs:
+                issues.append(
+                    f"hypotheses:{item.id} has invalid {section_name}: {', '.join(sorted(invalid_refs))}"
+                )
     return issues
 
 
