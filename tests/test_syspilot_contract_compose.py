@@ -158,3 +158,35 @@ def test_composed_contract_id_hydrates_library_refs_for_context(tmp_path: Path) 
         if "title" in item
     }
     assert "OMP_NUM_THREADS" in candidate_titles or "OPENBLAS_NUM_THREADS" in candidate_titles
+
+
+def test_duplicate_library_contracts_get_distinct_instances_and_context(tmp_path: Path) -> None:
+    artifact_root = tmp_path / "artifacts"
+    contract_root = tmp_path / "contracts"
+    openmp = _contract("OpenMP", "OMP_NUM_THREADS")
+    composed = compose_contracts("openmp_openmp", [openmp, openmp.model_copy(deep=True)])
+
+    write_contract_bundle("openmp", openmp, artifact_root, contract_root)
+    write_contract_bundle("openmp_openmp_composed", composed, artifact_root, contract_root)
+
+    assert [item.instance_id for item in composed.contract_instances] == ["openmp_1", "openmp_2"]
+    assert [item.contract_id for item in composed.contract_instances] == ["OpenMP", "OpenMP"]
+    assert composed.hypotheses
+    assert sorted(composed.hypotheses[0].libraries) == ["openmp_1", "openmp_2"]
+    assert "openmp_1.threads" in composed.hypotheses[0].basis.overlaps[0].uses
+    assert "openmp_2.threads" in composed.hypotheses[0].basis.overlaps[0].uses
+
+    context = build_agent_context_bundle(
+        ["openmp_openmp_composed"],
+        goal="improve throughput",
+        symptom="thread contention",
+        contract_root=contract_root,
+        max_items_per_section=4,
+    )
+
+    assert context["shared_resources"]
+    conflicts = cast(list[dict[str, object]], context["conflicts"])
+    assert conflicts
+    libraries = conflicts[0].get("libraries")
+    assert isinstance(libraries, list)
+    assert sorted(str(item) for item in libraries) == ["openmp_1", "openmp_2"]

@@ -96,7 +96,7 @@ def resolve_library_contract_inputs(
     contract_root: Path,
 ) -> list[LibraryContract]:
     contracts: list[LibraryContract] = []
-    for contract_ref in sorted(set(contract_refs)):
+    for contract_ref in contract_refs:
         candidate = Path(contract_ref).expanduser()
         loaded = (
             load_contract(candidate)

@@ -8,6 +8,7 @@ from syspilot_contract.checker import assert_valid_contract
 from syspilot_contract.schemas import (
     ComposedContract,
     ConflictHypothesis,
+    ContractInstance,
     Control,
     HypothesisBasis,
     HypothesisOverlap,
@@ -42,6 +43,28 @@ def _signal_ref(contract: LibraryContract, signal_id: str) -> str:
 
 def _recipe_ref(contract: LibraryContract, recipe_id: str) -> str:
     return f"{contract.contract}.{recipe_id}"
+
+
+def _instantiate_contracts(
+    contracts: list[LibraryContract],
+) -> tuple[list[LibraryContract], list[ContractInstance]]:
+    base_totals: dict[str, int] = defaultdict(int)
+    base_labels: list[str] = []
+    for contract in contracts:
+        base_label = _slugify(contract.contract)
+        base_labels.append(base_label)
+        base_totals[base_label] += 1
+
+    base_seen: dict[str, int] = defaultdict(int)
+    instantiated: list[LibraryContract] = []
+    instances: list[ContractInstance] = []
+    for contract, base_label in zip(contracts, base_labels, strict=False):
+        base_seen[base_label] += 1
+        ordinal = base_seen[base_label]
+        instance_id = f"{base_label}_{ordinal}" if base_totals[base_label] > 1 else base_label
+        instantiated.append(contract.model_copy(update={"contract": instance_id}))
+        instances.append(ContractInstance(instance_id=instance_id, contract_id=contract.contract))
+    return instantiated, instances
 
 
 def _phase_overlaps(left: PhaseName, right: PhaseName) -> bool:
@@ -257,14 +280,17 @@ def compose_contracts(
     contract_name: str,
     contracts: list[LibraryContract],
 ) -> ComposedContract:
-    selected_contracts = sorted(contract.contract for contract in contracts)
+    ordered_contracts = sorted(contracts, key=lambda item: item.contract.lower())
+    instantiated_contracts, instances = _instantiate_contracts(ordered_contracts)
+    selected_contracts = [instance.instance_id for instance in instances]
     composed = ComposedContract(
         contract=contract_name,
         contract_type="composed",
         version="lpcl/v0",
         selected_contracts=selected_contracts,
-        shared_resources=derive_shared_resources(contracts),
-        hypotheses=derive_conflict_hypotheses(contracts),
+        contract_instances=instances,
+        shared_resources=derive_shared_resources(instantiated_contracts),
+        hypotheses=derive_conflict_hypotheses(instantiated_contracts),
     )
     verified = assert_valid_contract(composed)
     if not isinstance(verified, ComposedContract):

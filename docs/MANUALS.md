@@ -81,6 +81,7 @@ Current source-pack examples:
 - The existing manual runtime still loads `manual/<name>.md` as raw markdown.
 - Spawn-mode tuning now prefers a structured LPCL `build_agent_context(...)` bundle when `contracts/<name>/contract.yaml` exists.
 - A composed contract like `contracts/openmp_openblas_composed/contract.yaml` can now be passed directly as a runtime knowledge input; SysPilot resolves `selected_contracts` plus hypothesis refs back into concrete controls, signals, recipes, assumptions, and shared-resource facts before building the agent context bundle.
+- Composed contracts may now include multiple instances of the same library contract. SysPilot writes deterministic `contract_instances` metadata and uses instance-qualified refs like `openmp_1.*` and `openmp_2.*` so duplicate libraries remain distinguishable at both compose time and runtime query time.
 - When structured contract context is available, tune no longer needs matching raw library manuals to be present.
 - If no contract artifact exists, spawn mode falls back to the structured manual bundle when `manual/<name>/manual.json` exists.
 - If neither structured contract nor structured manual artifacts exist, spawn mode falls back to the current markdown-excerpt behavior.
@@ -154,6 +155,9 @@ syspilot compose-manuals --app xgb_train --libraries xgboost --libraries openmp
 # Compose multiple LPCL contracts into conflict hypotheses
 syspilot compose-contracts --app xgb_train --contracts xgboost --contracts openmp
 
+# Compose two instances of the same library contract
+syspilot compose-contracts --app openmp_openmp --contracts openmp --contracts openmp --contract-root contracts
+
 # Query targeted manual slices
 syspilot query --manual openmp --section observability_map --keywords threads --keywords oversubscription
 
@@ -162,6 +166,9 @@ syspilot build-agent-context --manuals xgboost --manuals openmp --goal maximize_
 
 # Build context directly from a composed LPCL contract
 syspilot build-agent-context --manuals openmp_openblas_composed --goal improve_throughput --contract-root contracts
+
+# Build context from a duplicate-instance composed contract
+syspilot build-agent-context --manuals openmp_openmp_composed --goal improve_throughput --contract-root contracts
 
 # Generate new OpenMP and OpenBLAS library contracts from authoritative local source packs
 syspilot ingest --library openmp --docs manual_sources/openmp --metadata manual_sources/openmp/metadata.json
@@ -176,6 +183,9 @@ syspilot synthesize-contract --library openblas --contract-root contracts
 
 # Compose the library contracts for an OpenMP + OpenBLAS workload
 syspilot compose-contracts --app openmp_openblas --contracts openmp --contracts openblas --contract-root contracts
+
+# Compose two OpenMP instances when the application loads parallel OpenMP-backed objects
+syspilot compose-contracts --app openmp_openmp --contracts openmp --contracts openmp --contract-root contracts
 ```
 
 ### Programmatic Usage

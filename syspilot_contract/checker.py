@@ -164,6 +164,10 @@ def _check_library_contract(contract: LibraryContract) -> list[str]:
 def _check_composed_contract(contract: ComposedContract) -> list[str]:
     issues: list[str] = []
     selected = set(contract.selected_contracts)
+    instance_ids = [item.instance_id for item in contract.contract_instances]
+    issues.extend(_duplicate_id_issues("contract_instances", instance_ids))
+    if contract.selected_contracts != instance_ids:
+        issues.append("selected_contracts must match contract_instances.instance_id order")
     for item in contract.shared_resources:
         unknown_libraries = [library for library in item.libraries if library not in selected]
         if unknown_libraries:

@@ -8,8 +8,9 @@ from unittest.mock import patch
 from click.testing import CliRunner
 
 from syspilot.cli import cli
+from syspilot_contract.checker import load_contract
 from syspilot_contract.integration import write_contract_bundle
-from syspilot_contract.schemas import LibraryContract
+from syspilot_contract.schemas import ComposedContract, LibraryContract
 
 
 FIXTURE_ROOT = Path(__file__).resolve().parents[1] / "examples" / "manual_mvp"
@@ -295,3 +296,35 @@ def test_build_agent_context_accepts_composed_contract_id(tmp_path: Path) -> Non
     assert payload["profile_first"]
     assert payload["candidate_actions"]
     assert payload["conflicts"]
+
+
+def test_compose_contracts_allows_duplicate_contract_refs(tmp_path: Path) -> None:
+    runner = CliRunner()
+    artifact_root = tmp_path / "artifacts"
+    contract_root = tmp_path / "contracts"
+    write_contract_bundle("openmp", _library_contract("OpenMP"), artifact_root, contract_root)
+
+    result = runner.invoke(
+        cli,
+        [
+            "compose-contracts",
+            "--app",
+            "openmp_openmp",
+            "--contracts",
+            "openmp",
+            "--contracts",
+            "openmp",
+            "--artifact-root",
+            str(artifact_root),
+            "--contract-root",
+            str(contract_root),
+        ],
+    )
+
+    assert result.exit_code == 0
+    contract = load_contract(contract_root / "openmp_openmp_composed" / "contract.yaml")
+    assert isinstance(contract, ComposedContract)
+    assert [item.instance_id for item in contract.contract_instances] == ["openmp_1", "openmp_2"]
+    assert [item.contract_id for item in contract.contract_instances] == ["OpenMP", "OpenMP"]
+    assert contract.hypotheses
+    assert sorted(contract.hypotheses[0].libraries) == ["openmp_1", "openmp_2"]

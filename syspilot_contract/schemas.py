@@ -408,6 +408,11 @@ class LibraryContract(ContractBaseModel):
         return self
 
 
+class ContractInstance(ContractBaseModel):
+    instance_id: str
+    contract_id: str
+
+
 class SharedResourceItem(ContractBaseModel):
     resource: ResourceType
     phase: PhaseName
@@ -487,6 +492,7 @@ class ComposedContract(ContractBaseModel):
     contract: str
     contract_type: Literal["composed"] = "composed"
     selected_contracts: list[str] = Field(default_factory=list)
+    contract_instances: list[ContractInstance] = Field(default_factory=list)
     shared_resources: list[SharedResourceItem] = Field(default_factory=list)
     hypotheses: list[ConflictHypothesis] = Field(default_factory=list)
 
@@ -499,6 +505,14 @@ class ComposedContract(ContractBaseModel):
     def _require_selected_contracts(self) -> "ComposedContract":
         if not self.selected_contracts:
             raise ValueError("selected_contracts must not be empty")
+        if not self.contract_instances:
+            self.contract_instances = [
+                ContractInstance(instance_id=item, contract_id=item)
+                for item in self.selected_contracts
+            ]
+        instance_ids = [item.instance_id for item in self.contract_instances]
+        if self.selected_contracts != instance_ids:
+            raise ValueError("selected_contracts must match contract_instances.instance_id order")
         return self
 
 

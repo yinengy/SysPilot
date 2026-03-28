@@ -11,6 +11,7 @@ from syspilot_contract.schemas import (
     Assumption,
     ComposedContract,
     Control,
+    ContractInstance,
     LibraryContract,
     Recipe,
     ResourceUse,
@@ -70,25 +71,25 @@ class ContractStore:
     def list_contracts(self) -> list[str]:
         return sorted(self._contracts)
 
-    def _library_contracts_for_composed(
+    def _instance_contracts_for_composed(
         self,
         composed: ComposedContract | None,
     ) -> list[LibraryContract]:
         if composed is None:
             return []
         libraries: list[LibraryContract] = []
-        for contract_id in composed.selected_contracts:
+        for instance in composed.contract_instances:
             try:
-                contract = self.get_contract(contract_id)
+                contract = self.get_contract(instance.contract_id)
             except KeyError as exc:
                 raise KeyError(
-                    f"Composed contract '{composed.contract}' references missing selected contract '{contract_id}'"
+                    f"Composed contract '{composed.contract}' references missing contract '{instance.contract_id}' for instance '{instance.instance_id}'"
                 ) from exc
             if isinstance(contract, LibraryContract):
-                libraries.append(contract)
+                libraries.append(contract.model_copy(update={"contract": instance.instance_id}))
             else:
                 raise TypeError(
-                    f"Composed contract '{composed.contract}' selected contract '{contract_id}' is not a library contract"
+                    f"Composed contract '{composed.contract}' instance '{instance.instance_id}' target '{instance.contract_id}' is not a library contract"
                 )
         return libraries
 
@@ -96,22 +97,28 @@ class ContractStore:
         self,
         contract_ids: list[str],
     ) -> tuple[list[LibraryContract], ComposedContract | None]:
-        library_map: dict[str, LibraryContract] = {}
+        library_contracts: list[LibraryContract] = []
         composed_contracts: list[ComposedContract] = []
         for contract_id in contract_ids:
             contract = self.get_contract(contract_id)
             if isinstance(contract, LibraryContract):
-                library_map[contract.contract] = contract
+                library_contracts.append(contract)
             else:
                 composed_contracts.append(contract)
         if len(composed_contracts) > 1:
             raise ValueError("Only one composed contract can be queried at a time")
         composed = composed_contracts[0] if composed_contracts else None
-        for contract in self._library_contracts_for_composed(composed):
-            library_map.setdefault(contract.contract, contract)
-        libraries = [library_map[name] for name in sorted(library_map)]
+        if composed is not None:
+            libraries = self._instance_contracts_for_composed(composed)
+            explicit_library_map = {contract.contract: contract for contract in library_contracts}
+            for contract in explicit_library_map.values():
+                if contract.contract not in {item.contract for item in libraries}:
+                    libraries.append(contract)
+        else:
+            libraries = library_contracts
         if composed is None and len(libraries) >= 2:
             composed = compose_contracts("context_composed", libraries)
+            libraries = self._instance_contracts_for_composed(composed)
         return libraries, composed
 
     @staticmethod
@@ -166,7 +173,7 @@ class ContractStore:
         symptom: str | None = None,
         max_items_per_section: int = 5,
     ) -> dict[str, object]:
-        libraries, composed = self._resolve_context_inputs(sorted(set(contract_ids)))
+        libraries, composed = self._resolve_context_inputs(contract_ids)
         terms = _tokenize(" ".join(value for value in (goal, symptom) if value))
 
         use_ref_map = {
@@ -507,7 +514,7 @@ class ContractStore:
 
         labels = [contract.contract for contract in libraries]
         if composed is not None and not labels:
-            labels = composed.selected_contracts
+            labels = [instance.instance_id for instance in composed.contract_instances]
         summary = (
             f"Structured contract context for {', '.join(sorted(labels))}. "
             f"Goal={goal or 'unspecified'}. Symptom={symptom or 'unspecified'}."
