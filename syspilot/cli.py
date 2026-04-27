@@ -1268,6 +1268,9 @@ def tune(
                 workdir,
                 sink,
                 event_emitter,
+                structured_contract_bundle
+                if _has_structured_context(structured_contract_bundle)
+                else None,
             )
         else:
             assert pid is not None
@@ -1706,7 +1709,16 @@ def _contract_composition_progress_callback(progress: object) -> None:
     )
 
 
-def _build_spawn_profiling_env(env_overrides: dict[str, str] | None) -> dict[str, str] | None:
+def _stringify_env_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _build_spawn_profiling_env(
+    env_overrides: dict[str, str] | None,
+    guided_env_overrides: dict[str, str] | None = None,
+) -> dict[str, str] | None:
     if not env_overrides:
         profiling_env = os.environ.copy()
     else:
@@ -1715,7 +1727,268 @@ def _build_spawn_profiling_env(env_overrides: dict[str, str] | None) -> dict[str
 
     profiling_env.setdefault("OMP_DISPLAY_ENV", "true")
     profiling_env.setdefault("OMP_DISPLAY_AFFINITY", "true")
+    if guided_env_overrides:
+        for key, value in guided_env_overrides.items():
+            profiling_env.setdefault(key, _stringify_env_value(value))
     return profiling_env
+
+
+def _extract_hypothesis_profiles(
+    structured_context_bundle: dict[str, object] | None,
+    selected_hypothesis_refs: list[str] | None = None,
+    *,
+    max_profiles: int = 3,
+) -> list[dict[str, Any]]:
+    if not isinstance(structured_context_bundle, dict):
+        return []
+    raw_profiles = structured_context_bundle.get("hypothesis_profiles")
+    if not isinstance(raw_profiles, list):
+        return []
+    profiles = [item for item in raw_profiles if isinstance(item, dict)]
+    if selected_hypothesis_refs:
+        selected = {item.strip() for item in selected_hypothesis_refs if item.strip()}
+        prioritized = [
+            item for item in profiles if str(item.get("hypothesis_id", "")).strip() in selected
+        ]
+        if prioritized:
+            return prioritized[:max_profiles]
+    return profiles[:max_profiles]
+
+
+def _collect_contract_report_env(hypothesis_profiles: list[dict[str, Any]]) -> dict[str, str]:
+    report_env: dict[str, str] = {}
+    for profile in hypothesis_profiles:
+        report_controls = profile.get("report_controls")
+        if not isinstance(report_controls, list):
+            continue
+        for control_entry in report_controls:
+            if not isinstance(control_entry, dict):
+                continue
+            control = control_entry.get("control")
+            if not isinstance(control, dict):
+                continue
+            name = str(control.get("name", "")).strip()
+            activation_value = control.get("activation_value")
+            if not name or activation_value is None:
+                continue
+            report_env.setdefault(name, _stringify_env_value(activation_value))
+    return report_env
+
+
+def _build_contract_hypothesis_validation_script(
+    hypothesis_profiles: list[dict[str, Any]],
+    profiling_json: dict[str, Any],
+    stdout: str,
+    stderr: str,
+    report_env: dict[str, str],
+    active_env: dict[str, str],
+) -> str:
+    payload = {
+        "plans": hypothesis_profiles,
+        "profiling": {
+            "runtime_output": profiling_json.get("runtime_output", {}),
+            "refined_runtime_maps": profiling_json.get("refined_runtime_maps", {}),
+            "collect_profile_data": profiling_json.get("collect_profile_data", {}),
+        },
+        "combined_output": (stdout or "") + ("\n" + stderr if stderr else ""),
+        "report_env": report_env,
+        "active_env": active_env,
+    }
+    payload_json = json.dumps(payload)
+    return (
+        "import json\n"
+        f"payload = json.loads({json.dumps(payload_json)})\n"
+        "plans = payload.get('plans', [])\n"
+        "profiling = payload.get('profiling', {})\n"
+        "runtime_output = profiling.get('runtime_output', {}) if isinstance(profiling, dict) else {}\n"
+        "refined_runtime_maps = profiling.get('refined_runtime_maps', {}) if isinstance(profiling, dict) else {}\n"
+        "collect_profile_data = profiling.get('collect_profile_data', {}) if isinstance(profiling, dict) else {}\n"
+        "cpu_collector = collect_profile_data.get('cpu', {}) if isinstance(collect_profile_data, dict) else {}\n"
+        "cpu_data = cpu_collector.get('data', {}) if isinstance(cpu_collector, dict) else {}\n"
+        "combined_output = str(payload.get('combined_output', ''))\n"
+        "report_env = payload.get('report_env', {}) if isinstance(payload.get('report_env', {}), dict) else {}\n"
+        "active_env = payload.get('active_env', {}) if isinstance(payload.get('active_env', {}), dict) else {}\n"
+        "def _parse_cpu_list(text):\n"
+        "    if not isinstance(text, str) or not text.strip():\n"
+        "        return None\n"
+        "    total = 0\n"
+        "    for part in text.split(','):\n"
+        "        part = part.strip()\n"
+        "        if not part:\n"
+        "            continue\n"
+        "        if '-' in part:\n"
+        "            start, end = part.split('-', 1)\n"
+        "            if start.strip().isdigit() and end.strip().isdigit():\n"
+        "                total += int(end) - int(start) + 1\n"
+        "        elif part.isdigit():\n"
+        "            total += 1\n"
+        "    return total or None\n"
+        "def _signal_result(signal_entry):\n"
+        "    signal = signal_entry.get('signal', {}) if isinstance(signal_entry, dict) else {}\n"
+        "    probe = signal.get('probe', {}) if isinstance(signal, dict) else {}\n"
+        "    target = str(probe.get('target', '')).strip()\n"
+        "    kind = str(probe.get('kind', '')).strip()\n"
+        "    result = {\n"
+        "        'ref': signal_entry.get('ref'),\n"
+        "        'metric': signal.get('metric'),\n"
+        "        'probe': probe,\n"
+        "        'observed': False,\n"
+        "        'source': 'unsupported',\n"
+        "        'value': None,\n"
+        "        'excerpt': [],\n"
+        "    }\n"
+        "    lines = combined_output.splitlines()\n"
+        "    if kind == 'runtime_env':\n"
+        "        matches = [line.strip() for line in lines if target.lower() in line.lower()]\n"
+        "        result['observed'] = bool(matches)\n"
+        "        result['source'] = 'runtime_output' if matches else 'runtime_output_missing'\n"
+        "        result['value'] = matches[:8] if matches else None\n"
+        "        result['excerpt'] = matches[:8]\n"
+        "        return result\n"
+        "    if kind == 'procfs':\n"
+        "        value = refined_runtime_maps.get(target)\n"
+        "        result['observed'] = value is not None\n"
+        "        result['source'] = 'refined_runtime_maps' if value is not None else 'procfs_missing'\n"
+        "        result['value'] = value\n"
+        "        return result\n"
+        "    if kind == 'command':\n"
+        "        if target == 'openblas_get_num_threads':\n"
+        "            value = runtime_output.get('threads_counted')\n"
+        "            if value is None:\n"
+        "                value = cpu_data.get('num_threads')\n"
+        "            result['observed'] = value is not None\n"
+        "            result['source'] = 'runtime_output.threads_counted' if runtime_output.get('threads_counted') is not None else ('collect_profile.cpu.num_threads' if cpu_data.get('num_threads') is not None else 'unsupported')\n"
+        "            result['value'] = value\n"
+        "            return result\n"
+        "        if target == 'openblas_get_num_procs':\n"
+        "            cpus_allowed = refined_runtime_maps.get('Cpus_allowed_list')\n"
+        "            value = _parse_cpu_list(cpus_allowed)\n"
+        "            result['observed'] = value is not None\n"
+        "            result['source'] = 'refined_runtime_maps.Cpus_allowed_list' if value is not None else 'unsupported'\n"
+        "            result['value'] = value\n"
+        "            return result\n"
+        "        if target == 'openblas_getaffinity':\n"
+        "            cpus_allowed = refined_runtime_maps.get('Cpus_allowed_list')\n"
+        "            result['observed'] = cpus_allowed is not None\n"
+        "            result['source'] = 'refined_runtime_maps.Cpus_allowed_list' if cpus_allowed is not None else 'unsupported'\n"
+        "            result['value'] = cpus_allowed\n"
+        "            return result\n"
+        "        if target == 'openblas_get_parallel':\n"
+        "            hints = []\n"
+        "            if 'OPENMP DISPLAY ENVIRONMENT BEGIN' in combined_output:\n"
+        "                hints.append('openmp_runtime_output_present')\n"
+        "            for key in ('OPENBLAS_NUM_THREADS', 'GOTO_NUM_THREADS', 'OMP_NUM_THREADS'):\n"
+        "                if key in active_env:\n"
+        "                    hints.append(f'{key}=' + str(active_env.get(key)))\n"
+        "            result['observed'] = bool(hints)\n"
+        "            result['source'] = 'runtime_output+active_env' if hints else 'unsupported'\n"
+        "            result['value'] = hints or None\n"
+        "            return result\n"
+        "        if target == 'openblas_get_config':\n"
+        "            value = {key: active_env.get(key) for key in ('OPENBLAS_NUM_THREADS', 'GOTO_NUM_THREADS', 'OMP_NUM_THREADS') if key in active_env}\n"
+        "            result['observed'] = bool(value)\n"
+        "            result['source'] = 'active_env' if value else 'unsupported'\n"
+        "            result['value'] = value or None\n"
+        "            return result\n"
+        "        if target == 'openblas_get_corename':\n"
+        "            matches = [line.strip() for line in lines if 'core' in line.lower() or 'target' in line.lower()]\n"
+        "            result['observed'] = bool(matches)\n"
+        "            result['source'] = 'runtime_output' if matches else 'unsupported'\n"
+        "            result['value'] = matches[:8] if matches else None\n"
+        "            result['excerpt'] = matches[:8]\n"
+        "            return result\n"
+        "        matches = [line.strip() for line in lines if target.lower() in line.lower()]\n"
+        "        result['observed'] = bool(matches)\n"
+        "        result['source'] = 'runtime_output' if matches else 'unsupported'\n"
+        "        result['value'] = matches[:8] if matches else None\n"
+        "        result['excerpt'] = matches[:8]\n"
+        "        return result\n"
+        "    return result\n"
+        "profiles = []\n"
+        "for plan in plans:\n"
+        "    signals = plan.get('validation_signals', []) if isinstance(plan, dict) else []\n"
+        "    signal_results = [_signal_result(signal) for signal in signals if isinstance(signal, dict)]\n"
+        "    findings = [f\"{item['ref']} observed via {item['source']}\" for item in signal_results if item.get('observed')]\n"
+        "    missing = [item.get('ref') for item in signal_results if not item.get('observed')]\n"
+        "    profiles.append({\n"
+        "        'hypothesis_id': plan.get('hypothesis_id'),\n"
+        "        'resource': plan.get('resource'),\n"
+        "        'libraries': plan.get('libraries'),\n"
+        "        'report_env': plan.get('report_controls', []),\n"
+        "        'signal_results': signal_results,\n"
+        "        'findings': findings,\n"
+        "        'missing_signals': missing,\n"
+        "    })\n"
+        "print(json.dumps({'profiles': profiles, 'report_env': report_env}))\n"
+    )
+
+
+async def _run_contract_hypothesis_validation(
+    agent: SysPilotAgent,
+    hypothesis_profiles: list[dict[str, Any]],
+    profiling_json: dict[str, Any],
+    stdout: str,
+    stderr: str,
+    report_env: dict[str, str],
+    active_env: dict[str, str],
+) -> tuple[dict[str, Any], int, list[str]]:
+    if not hypothesis_profiles:
+        return {}, 0, []
+
+    script = _build_contract_hypothesis_validation_script(
+        hypothesis_profiles,
+        profiling_json,
+        stdout,
+        stderr,
+        report_env,
+        active_env,
+    )
+    try:
+        script_result = await agent._execute_tool(
+            "skill_dynamic_script",
+            {"script_type": "python", "script": script},
+        )
+    except Exception as exc:
+        return (
+            {
+                "success": False,
+                "error": str(exc),
+                "profiles": [],
+                "report_env": report_env,
+            },
+            1,
+            ["skill_dynamic_script.contract_validation"],
+        )
+
+    result_payload: dict[str, Any] = {
+        "success": bool(script_result.get("success", False))
+        if isinstance(script_result, dict)
+        else False,
+        "error": str(script_result.get("error", "")).strip()
+        if isinstance(script_result, dict)
+        else "",
+        "summary": str(script_result.get("summary", "")).strip()
+        if isinstance(script_result, dict)
+        else "",
+        "profiles": [],
+        "report_env": report_env,
+    }
+    if isinstance(script_result, dict):
+        output = str(script_result.get("output", "")).strip()
+        if output:
+            parsed = _extract_json_object(output)
+            if parsed and isinstance(parsed.get("profiles"), list):
+                result_payload["profiles"] = parsed.get("profiles", [])
+                parsed_report_env = parsed.get("report_env")
+                if isinstance(parsed_report_env, dict):
+                    result_payload["report_env"] = {
+                        str(key): _stringify_env_value(value)
+                        for key, value in parsed_report_env.items()
+                        if str(key).strip()
+                    }
+        if not result_payload["profiles"] and output:
+            result_payload["raw_output_excerpt"] = output[:1000]
+    return result_payload, 1, ["skill_dynamic_script.contract_validation"]
 
 
 def _summarize_spawn_runtime_output(
@@ -2098,6 +2371,14 @@ def _parse_spawn_actions(response: str) -> dict[str, Any]:
             if value:
                 evidence.append(value)
 
+    hypothesis_refs_raw = parsed.get("hypothesis_refs", [])
+    hypothesis_refs: list[str] = []
+    if isinstance(hypothesis_refs_raw, list):
+        for item in hypothesis_refs_raw:
+            value = str(item).strip()
+            if value:
+                hypothesis_refs.append(value)
+
     actions_raw = parsed.get("actions", [])
     if not isinstance(actions_raw, list):
         return {
@@ -2106,6 +2387,7 @@ def _parse_spawn_actions(response: str) -> dict[str, Any]:
             "summary": summary,
             "manual_citation": manual_citation,
             "evidence": evidence,
+            "hypothesis_refs": hypothesis_refs,
             "actions": [],
             "skipped_actions": [],
         }
@@ -2153,6 +2435,7 @@ def _parse_spawn_actions(response: str) -> dict[str, Any]:
             "summary": summary,
             "manual_citation": manual_citation,
             "evidence": evidence,
+            "hypothesis_refs": hypothesis_refs,
             "actions": [],
             "skipped_actions": skipped_actions,
         }
@@ -2163,6 +2446,7 @@ def _parse_spawn_actions(response: str) -> dict[str, Any]:
         "summary": summary,
         "manual_citation": manual_citation,
         "evidence": evidence,
+        "hypothesis_refs": hypothesis_refs,
         "actions": normalized_actions,
         "skipped_actions": skipped_actions,
     }
@@ -2457,9 +2741,12 @@ async def _run_live_profiling_pipeline(
     timeout: int,
     workdir: str | None = None,
     env_overrides: dict[str, str] | None = None,
+    hypothesis_profiles: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     started_at = time.monotonic()
-    env = _build_spawn_profiling_env(env_overrides)
+    selected_hypothesis_profiles = hypothesis_profiles or []
+    report_env_overrides = _collect_contract_report_env(selected_hypothesis_profiles)
+    env = _build_spawn_profiling_env(env_overrides, report_env_overrides)
 
     proc = await asyncio.create_subprocess_exec(
         *command_parts,
@@ -2689,6 +2976,41 @@ async def _run_live_profiling_pipeline(
         "process_tree_targets": process_targets,
         "key_findings": key_findings,
     }
+
+    if selected_hypothesis_profiles:
+        (
+            validation_result,
+            validation_tool_calls,
+            validation_tools,
+        ) = await _run_contract_hypothesis_validation(
+            agent,
+            selected_hypothesis_profiles,
+            profiling_json,
+            stdout,
+            stderr,
+            report_env_overrides,
+            {
+                **(
+                    {key: _stringify_env_value(value) for key, value in env_overrides.items()}
+                    if env_overrides
+                    else {}
+                ),
+                **report_env_overrides,
+            },
+        )
+        agent_tool_calls += validation_tool_calls
+        tools_used.extend(validation_tools)
+        profiling_json["tools_used"] = tools_used
+        profiling_json["contract_hypothesis_validation"] = validation_result
+        if validation_result.get("profiles"):
+            key_findings.append(
+                f"contract-guided validation evaluated {len(validation_result.get('profiles', []))} hypothesis profile(s)"
+            )
+        elif validation_result.get("error"):
+            key_findings.append(
+                f"contract-guided validation unavailable: {validation_result.get('error')}"
+            )
+        profiling_json["key_findings"] = key_findings
     profiling_text = json.dumps(profiling_json)
 
     return {
@@ -2713,6 +3035,7 @@ async def _run_spawn_tune_loop_async(
     workdir: str | None = None,
     sink: OutputSink | None = None,
     event_emitter: _TuneEmitter | None = None,
+    structured_context_bundle: dict[str, object] | None = None,
 ) -> None:
     if sink is None:
         sink = make_output_sink(ui_mode=TuneUIMode.PLAIN, console=console)
@@ -2757,7 +3080,11 @@ async def _run_spawn_tune_loop_async(
         title="Starting",
     )
 
-    manual_content = _build_spawn_manual_context(manuals)
+    manual_content = (
+        json.dumps(structured_context_bundle, indent=2)
+        if structured_context_bundle
+        else _build_spawn_manual_context(manuals)
+    )
     if not manual_content and manuals and agent.context.loaded_manuals:
         for manual_name in manuals:
             if manual_name in agent.context.loaded_manuals:
@@ -2868,6 +3195,7 @@ async def _run_spawn_tune_loop_async(
     stagnation_iterations = 0
     convergence_patience = 2
     min_improvement_pct = 1.0
+    active_hypothesis_refs: list[str] = []
 
     for iteration in range(1, max_iterations + 1):
         _emit_tune_event(
@@ -2898,12 +3226,17 @@ async def _run_spawn_tune_loop_async(
                 "iteration": iteration,
             },
         )
+        selected_hypothesis_profiles = _extract_hypothesis_profiles(
+            structured_context_bundle,
+            active_hypothesis_refs,
+        )
         profiling_artifacts = await _run_live_profiling_pipeline(
             agent,
             current_command_parts,
             timeout,
             workdir=workdir,
             env_overrides=current_env_overrides,
+            hypothesis_profiles=selected_hypothesis_profiles,
         )
         _emit_tune_event(
             event_emitter,
@@ -2984,6 +3317,31 @@ async def _run_spawn_tune_loop_async(
         if target_pids:
             sink.print(f"  Profiling targets: {target_pids} (primary={primary_pid})")
 
+        contract_validation = (
+            profiling_json.get("contract_hypothesis_validation", {})
+            if isinstance(profiling_json, dict)
+            else {}
+        )
+        if isinstance(contract_validation, dict) and contract_validation.get("profiles"):
+            profiles = contract_validation.get("profiles", [])
+            sink.print(f"  Contract-guided validation profiles: {len(profiles)}")
+            if isinstance(profiles, list):
+                for profile in profiles[:3]:
+                    if not isinstance(profile, dict):
+                        continue
+                    observed = 0
+                    signal_results = profile.get("signal_results", [])
+                    if isinstance(signal_results, list):
+                        observed = sum(
+                            1
+                            for item in signal_results
+                            if isinstance(item, dict) and bool(item.get("observed"))
+                        )
+                    total = len(signal_results) if isinstance(signal_results, list) else 0
+                    sink.print(
+                        f"    - {profile.get('hypothesis_id')}: observed {observed}/{total} signal(s)"
+                    )
+
         history_text = "\n".join(iteration_summaries[-6:]) if iteration_summaries else "(none)"
         tried_commands = [list(parts) for parts, _ in list(seen_trials)[-12:]]
 
@@ -3008,12 +3366,16 @@ async def _run_spawn_tune_loop_async(
 ## Refined Profiling Evidence
 {json.dumps(profiling_json, indent=2) if profiling_json else profiling_text[:2500]}
 
+## Contract Hypothesis Validation
+{json.dumps(contract_validation, indent=2) if contract_validation else "(No contract-guided validation findings)"}
+
 ## Loaded Manual Evidence
 {manual_content if manual_content else "(No manual content provided)"}
 
 ## Rules
 - Use only profiling evidence and loaded manuals.
 - Loaded manual evidence may be a structured JSON context bundle instead of raw markdown excerpts; use the structured bundle first when present.
+- Contract hypothesis validation, when present, is runtime-generated structured evidence. Prefer it over inferring raw DSL semantics yourself.
 - Re-profile is performed each iteration; propose next-step actions for this iteration.
 - Avoid recommending exact commands already tried.
 - Keep workload-defining arguments fixed (model/input/token counts/repetitions/output mode) so comparisons stay fair.
@@ -3027,6 +3389,7 @@ async def _run_spawn_tune_loop_async(
   "summary": "short decision summary",
   "manual_citation": "one concrete rule from loaded manual(s)",
   "evidence": ["concise evidence item", "..."],
+  "hypothesis_refs": ["optional hypothesis ids to prioritize next profiling round"],
   "actions": [
     {{
       "config_type": "numactl | env_var | command_prefix | command",
@@ -3048,6 +3411,7 @@ async def _run_spawn_tune_loop_async(
                 "summary": "Deterministic benchmark mode: skipped agent analysis.",
                 "manual_citation": "",
                 "evidence": ["SYSPILOT_BENCH_DETERMINISTIC=1"],
+                "hypothesis_refs": [],
                 "actions": [],
                 "skipped_actions": [],
             }
@@ -3066,6 +3430,7 @@ async def _run_spawn_tune_loop_async(
                     "summary": f"LLM tuning analysis unavailable: {exc}",
                     "manual_citation": "",
                     "evidence": [],
+                    "hypothesis_refs": [],
                     "actions": [],
                     "skipped_actions": [],
                 }
@@ -3122,6 +3487,9 @@ async def _run_spawn_tune_loop_async(
         if recommendation["evidence"]:
             for evidence_item in recommendation["evidence"][:5]:
                 sink.print(f"  Evidence: {evidence_item}")
+        active_hypothesis_refs = recommendation.get("hypothesis_refs", [])
+        if active_hypothesis_refs:
+            sink.print(f"  Next hypothesis focus: {active_hypothesis_refs}")
 
         actions = recommendation["actions"]
         if not actions:
@@ -3559,6 +3927,7 @@ def _run_spawn_tune_loop(
     workdir: Path | None = None,
     sink: OutputSink | None = None,
     event_emitter: _TuneEmitter | None = None,
+    structured_context_bundle: dict[str, object] | None = None,
 ) -> None:
     workdir_str = str(workdir) if workdir else None
     asyncio.run(
@@ -3572,6 +3941,7 @@ def _run_spawn_tune_loop(
             workdir=workdir_str,
             sink=sink,
             event_emitter=event_emitter,
+            structured_context_bundle=structured_context_bundle,
         )
     )
 

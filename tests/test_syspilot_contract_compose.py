@@ -127,6 +127,7 @@ def test_contract_context_bundle_exposes_profile_actions_conflicts(tmp_path: Pat
     assert context["candidate_actions"]
     assert context["conflicts"]
     assert context["validation"]
+    assert context["hypothesis_profiles"]
 
 
 def test_composed_contract_id_hydrates_library_refs_for_context(tmp_path: Path) -> None:
@@ -152,6 +153,7 @@ def test_composed_contract_id_hydrates_library_refs_for_context(tmp_path: Path) 
     assert context["candidate_actions"]
     assert context["conflicts"]
     assert context["validation"]
+    assert context["hypothesis_profiles"]
     candidate_titles = {
         item["title"]
         for item in cast(list[dict[str, object]], context["candidate_actions"])

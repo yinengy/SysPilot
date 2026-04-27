@@ -82,6 +82,7 @@ Current source-pack examples:
 - Spawn-mode tuning now prefers a structured LPCL `build_agent_context(...)` bundle when `contracts/<name>/contract.yaml` exists.
 - A composed contract like `contracts/openmp_openblas_composed/contract.yaml` can now be passed directly as a runtime knowledge input; SysPilot resolves `selected_contracts` plus hypothesis refs back into concrete controls, signals, recipes, assumptions, and shared-resource facts before building the agent context bundle.
 - Composed contracts may now include multiple instances of the same library contract. SysPilot writes deterministic `contract_instances` metadata and uses instance-qualified refs like `openmp_1.*` and `openmp_2.*` so duplicate libraries remain distinguishable at both compose time and runtime query time.
+- Spawn-mode tuning now derives `hypothesis_profiles` from composed contract conflicts, enables report-style controls for those profiles, and runs contract-guided validation scripts during the profiling phase so each round can feed structured hypothesis evidence back into the next tuning decision.
 - When structured contract context is available, tune no longer needs matching raw library manuals to be present.
 - If no contract artifact exists, spawn mode falls back to the structured manual bundle when `manual/<name>/manual.json` exists.
 - If neither structured contract nor structured manual artifacts exist, spawn mode falls back to the current markdown-excerpt behavior.

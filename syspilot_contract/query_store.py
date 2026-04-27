@@ -297,6 +297,7 @@ class ContractStore:
                 )
 
         conflicts: list[dict[str, object]] = []
+        hypothesis_profiles: list[dict[str, object]] = []
         if composed is not None:
             for item in composed.hypotheses:
                 resolved_overlaps = []
@@ -382,6 +383,28 @@ class ContractStore:
                 text = (
                     f"{item.kind} {item.resource} {item.phase} controls {' '.join(control_names)} "
                     f"signals {' '.join(signal_titles)} recipes {' '.join(recipe_titles)}"
+                )
+                report_controls = [
+                    candidate
+                    for candidate in resolved_candidate_controls
+                    if isinstance(candidate.get("control"), dict)
+                    and candidate["control"].get("kind") == "env"
+                    and isinstance(candidate["control"].get("effect"), dict)
+                    and candidate["control"]["effect"].get("op") == "report"
+                    and candidate["control"].get("activation_value") is not None
+                ]
+                hypothesis_profiles.append(
+                    {
+                        "hypothesis_id": item.id,
+                        "resource": item.resource,
+                        "phase": item.phase,
+                        "libraries": item.libraries,
+                        "validation_signals": resolved_validation_signals,
+                        "report_controls": report_controls,
+                        "candidate_controls": resolved_candidate_controls,
+                        "candidate_recipes": resolved_candidate_recipes,
+                        "source_refs": item.source_refs,
+                    }
                 )
                 conflicts.append(
                     {
@@ -522,6 +545,7 @@ class ContractStore:
         return {
             "summary": summary,
             "shared_resources": shared_resources,
+            "hypothesis_profiles": hypothesis_profiles,
             "profile_first": _rank(observability),
             "candidate_actions": _rank(candidate_actions),
             "conflicts": _rank(conflicts),

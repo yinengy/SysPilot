@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -22,6 +23,9 @@ class _DummyAgent:
     async def step(self, prompt: str) -> _DummyResponse:
         _ = prompt
         return _DummyResponse('{"summary":"none","manual_citation":"","evidence":[],"actions":[]}')
+
+    def enable_llm_prompt_logging(self, path: Path) -> Path:
+        return path
 
 
 def _noop(*args: object, **kwargs: object) -> None:

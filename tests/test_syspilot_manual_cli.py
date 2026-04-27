@@ -8,10 +8,18 @@ from unittest.mock import patch
 
 from click.testing import CliRunner
 
-from syspilot.cli import cli, _build_spawn_profiling_env, _summarize_spawn_runtime_output
+from syspilot.cli import (
+    cli,
+    _build_spawn_profiling_env,
+    _collect_contract_report_env,
+    _extract_hypothesis_profiles,
+    _parse_spawn_actions,
+    _summarize_spawn_runtime_output,
+)
 from syspilot.core.agent import SysPilotAgent
 from syspilot.core.llm import LLMTimeoutError
 from syspilot_contract.compose_contracts import compose_contracts
+from syspilot_contract.integration import build_agent_context_bundle
 from syspilot_contract.integration import write_contract_bundle
 from syspilot_contract.schemas import LibraryContract as LibraryContractDSL
 from syspilot_manual.integration import write_manual_bundle
@@ -674,6 +682,52 @@ def test_build_spawn_profiling_env_enables_openmp_observability() -> None:
     assert env["OMP_NUM_THREADS"] == "8"
     assert env["OMP_DISPLAY_ENV"] == "true"
     assert env["OMP_DISPLAY_AFFINITY"] == "true"
+
+
+def test_contract_hypothesis_profiles_drive_report_env(tmp_path: Path) -> None:
+    bundle = {
+        "hypothesis_profiles": [
+            {
+                "hypothesis_id": "h_threads",
+                "report_controls": [
+                    {
+                        "control": {
+                            "name": "OMP_DISPLAY_ENV",
+                            "activation_value": "true",
+                        }
+                    },
+                    {
+                        "control": {
+                            "name": "OMP_DISPLAY_AFFINITY",
+                            "activation_value": True,
+                        }
+                    },
+                ],
+            }
+        ]
+    }
+    profiles = _extract_hypothesis_profiles(bundle)
+    report_env = _collect_contract_report_env(profiles)
+
+    assert profiles
+    assert report_env == {"OMP_DISPLAY_ENV": "true", "OMP_DISPLAY_AFFINITY": "true"}
+
+
+def test_parse_spawn_actions_preserves_hypothesis_refs() -> None:
+    parsed = _parse_spawn_actions(
+        json.dumps(
+            {
+                "summary": "focus next profiling round",
+                "manual_citation": "use hypothesis evidence",
+                "evidence": ["validation incomplete"],
+                "hypothesis_refs": ["h_worker_pool_openblas_openmp_compute"],
+                "actions": [],
+            }
+        )
+    )
+
+    assert parsed["valid"] is True
+    assert parsed["hypothesis_refs"] == ["h_worker_pool_openblas_openmp_compute"]
 
 
 def test_summarize_spawn_runtime_output_extracts_openmp_signals() -> None:
