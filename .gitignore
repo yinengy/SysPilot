@@ -98,3 +98,10 @@ contracts/*
 
 # OpenCode
 .sisyphus
+
+# Artifacts
+CP2K
+experiments/*/*/artifact
+experiments/*/*/env
+experiments/*/*/runs
+experiments/*/*/work
