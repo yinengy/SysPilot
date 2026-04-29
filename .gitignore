@@ -105,3 +105,5 @@ experiments/*/*/artifact
 experiments/*/*/env
 experiments/*/*/runs
 experiments/*/*/work
+artifacts
+contract_sources

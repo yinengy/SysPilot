@@ -177,6 +177,24 @@ def _validation_signal_refs(
     return sorted(dict.fromkeys(signal_refs))
 
 
+def _recipe_validation_signal_refs(
+    left: LibraryContract,
+    right: LibraryContract,
+    recipe_refs: list[str],
+) -> list[str]:
+    selected_recipe_refs = set(recipe_refs)
+    signal_refs: list[str] = []
+    for contract in (left, right):
+        known_signal_ids = {signal.id for signal in contract.signals}
+        for recipe in contract.recipes:
+            if _recipe_ref(contract, recipe.id) not in selected_recipe_refs:
+                continue
+            for signal_id in recipe.collect:
+                if signal_id in known_signal_ids:
+                    signal_refs.append(_signal_ref(contract, signal_id))
+    return sorted(dict.fromkeys(signal_refs))
+
+
 def derive_conflict_hypotheses(contracts: list[LibraryContract]) -> list[ConflictHypothesis]:
     hypotheses: list[ConflictHypothesis] = []
     seen: set[tuple[str, str, str]] = set()
@@ -242,6 +260,20 @@ def derive_conflict_hypotheses(contracts: list[LibraryContract]) -> list[Conflic
                         if signal.resource == left_use.resource
                     }
                 )
+                candidate_recipe_refs = _candidate_recipe_refs(
+                    left,
+                    right,
+                    left_use.resource,
+                    controls,
+                )
+                validation_refs = _validation_signal_refs(left, right, left_use.resource)
+                if not validation_refs:
+                    validation_refs = _recipe_validation_signal_refs(
+                        left, right, candidate_recipe_refs
+                    )
+                if not validation_refs:
+                    continue
+
                 hypotheses.append(
                     ConflictHypothesis(
                         id=f"h_{_slugify(left_use.resource)}_{_slugify(left.contract)}_{_slugify(right.contract)}_{_slugify(phase)}",
@@ -260,16 +292,9 @@ def derive_conflict_hypotheses(contracts: list[LibraryContract]) -> list[Conflic
                             violated_assumptions=violated_assumptions,
                             colliding_controls=sorted(set(colliding_controls)),
                         ),
-                        validate=HypothesisValidation(
-                            collect=_validation_signal_refs(left, right, left_use.resource)
-                        ),
+                        validate=HypothesisValidation(collect=validation_refs),
                         candidate_control_refs=sorted(set(colliding_controls)),
-                        candidate_recipe_refs=_candidate_recipe_refs(
-                            left,
-                            right,
-                            left_use.resource,
-                            controls,
-                        ),
+                        candidate_recipe_refs=candidate_recipe_refs,
                         source_refs=source_refs,
                     )
                 )

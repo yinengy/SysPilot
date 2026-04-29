@@ -157,6 +157,167 @@ class OpenAIProvider(BaseLLMProvider):
             for tool in tools
         ]
 
+    def _request_timeout_seconds(self) -> float:
+        return max(float(self.config.timeout_seconds), 0.001)
+
+    def _should_use_stream_fallback(self) -> bool:
+        return self.config.model.strip().lower().startswith("gpt-5")
+
+    def _extract_message_content(self, content: Any) -> str:
+        if isinstance(content, str):
+            return content
+
+        if not isinstance(content, list):
+            return ""
+
+        text_parts: list[str] = []
+        for part in content:
+            if isinstance(part, dict):
+                part_type = part.get("type")
+                text = part.get("text")
+            else:
+                part_type = getattr(part, "type", None)
+                text = getattr(part, "text", None)
+
+            if not isinstance(text, str) or not text:
+                continue
+
+            if part_type in (None, "text", "input_text", "output_text"):
+                text_parts.append(text)
+
+        return "".join(text_parts)
+
+    def _convert_tool_calls(self, raw_tool_calls: Any) -> list[dict[str, Any]]:
+        tool_calls: list[dict[str, Any]] = []
+        for tc in raw_tool_calls or []:
+            function = getattr(tc, "function", None)
+            if function is None and isinstance(tc, dict):
+                function = tc.get("function")
+
+            call_id = getattr(tc, "id", None)
+            if call_id is None and isinstance(tc, dict):
+                call_id = tc.get("id")
+
+            name = getattr(function, "name", None)
+            arguments = getattr(function, "arguments", None)
+            if isinstance(function, dict):
+                name = function.get("name")
+                arguments = function.get("arguments")
+
+            if not isinstance(call_id, str) or not isinstance(name, str):
+                continue
+
+            tool_calls.append(
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": arguments if isinstance(arguments, str) else "{}",
+                    },
+                }
+            )
+        return tool_calls
+
+    def _extract_usage(self, usage: Any) -> dict[str, int] | None:
+        if usage is None:
+            return None
+
+        if isinstance(usage, dict):
+            prompt_tokens = usage.get("prompt_tokens")
+            completion_tokens = usage.get("completion_tokens")
+            total_tokens = usage.get("total_tokens")
+        else:
+            prompt_tokens = getattr(usage, "prompt_tokens", None)
+            completion_tokens = getattr(usage, "completion_tokens", None)
+            total_tokens = getattr(usage, "total_tokens", None)
+
+        if prompt_tokens is None or completion_tokens is None or total_tokens is None:
+            return None
+
+        return {
+            "prompt_tokens": int(prompt_tokens),
+            "completion_tokens": int(completion_tokens),
+            "total_tokens": int(total_tokens),
+        }
+
+    async def _consume_streamed_chat_completion(
+        self, stream: AsyncIterator[Any]
+    ) -> tuple[str, list[dict[str, Any]], str, dict[str, int] | None]:
+        content_parts: list[str] = []
+        partial_tool_calls: dict[int, dict[str, Any]] = {}
+        finish_reason = "stop"
+        usage: dict[str, int] | None = None
+
+        async for chunk in stream:
+            chunk_usage = self._extract_usage(getattr(chunk, "usage", None))
+            if chunk_usage is not None:
+                usage = chunk_usage
+
+            for choice in getattr(chunk, "choices", []) or []:
+                current_finish_reason = getattr(choice, "finish_reason", None)
+                if isinstance(current_finish_reason, str) and current_finish_reason:
+                    finish_reason = current_finish_reason
+
+                delta = getattr(choice, "delta", None)
+                if delta is None:
+                    continue
+
+                delta_content = getattr(delta, "content", None)
+                text = self._extract_message_content(delta_content)
+                if not text and isinstance(delta_content, str):
+                    text = delta_content
+                if text:
+                    content_parts.append(text)
+
+                for tc in getattr(delta, "tool_calls", None) or []:
+                    if isinstance(tc, dict):
+                        index = tc.get("index", 0)
+                        call_id = tc.get("id")
+                        call_type = tc.get("type")
+                        function = tc.get("function") or {}
+                    else:
+                        index = getattr(tc, "index", 0)
+                        call_id = getattr(tc, "id", None)
+                        call_type = getattr(tc, "type", None)
+                        function = getattr(tc, "function", None) or {}
+
+                    existing = partial_tool_calls.setdefault(
+                        int(index),
+                        {
+                            "id": None,
+                            "type": "function",
+                            "function": {"name": "", "arguments": ""},
+                        },
+                    )
+
+                    if isinstance(call_id, str) and call_id:
+                        existing["id"] = call_id
+                    if isinstance(call_type, str) and call_type:
+                        existing["type"] = call_type
+
+                    if isinstance(function, dict):
+                        name = function.get("name")
+                        arguments = function.get("arguments")
+                    else:
+                        name = getattr(function, "name", None)
+                        arguments = getattr(function, "arguments", None)
+
+                    if isinstance(name, str) and name:
+                        existing["function"]["name"] = name
+                    if isinstance(arguments, str) and arguments:
+                        existing["function"]["arguments"] += arguments
+
+        tool_calls = [
+            item
+            for _, item in sorted(partial_tool_calls.items())
+            if isinstance(item.get("id"), str)
+            and item["id"]
+            and isinstance(item.get("function", {}).get("name"), str)
+            and item["function"]["name"]
+        ]
+        return "".join(content_parts), tool_calls, finish_reason, usage
+
     async def chat(
         self,
         messages: list[Message],
@@ -171,38 +332,39 @@ class OpenAIProvider(BaseLLMProvider):
             "max_tokens": self.config.max_tokens,
             **kwargs,
         }
+        request_kwargs.setdefault("timeout", self._request_timeout_seconds())
 
         if tools:
             request_kwargs["tools"] = self._convert_tools(tools)
 
+        if self._should_use_stream_fallback():
+            stream = await self.client.chat.completions.create(**{**request_kwargs, "stream": True})
+            (
+                streamed_content,
+                streamed_tool_calls,
+                streamed_finish_reason,
+                streamed_usage,
+            ) = await self._consume_streamed_chat_completion(stream)
+            return LLMResponse(
+                content=streamed_content,
+                tool_calls=streamed_tool_calls or None,
+                finish_reason=streamed_finish_reason,
+                usage=streamed_usage,
+            )
+
         response = await self.client.chat.completions.create(**request_kwargs)
         choice = response.choices[0]
 
-        tool_calls = None
-        if choice.message.tool_calls:
-            tool_calls = [
-                {
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments,
-                    },
-                }
-                for tc in choice.message.tool_calls
-            ]
+        tool_calls = self._convert_tool_calls(choice.message.tool_calls)
+        content = self._extract_message_content(choice.message.content)
+        finish_reason = choice.finish_reason or "stop"
+        usage = self._extract_usage(response.usage)
 
         return LLMResponse(
-            content=choice.message.content or "",
-            tool_calls=tool_calls,
-            finish_reason=choice.finish_reason,
-            usage={
-                "prompt_tokens": response.usage.prompt_tokens,
-                "completion_tokens": response.usage.completion_tokens,
-                "total_tokens": response.usage.total_tokens,
-            }
-            if response.usage
-            else None,
+            content=content,
+            tool_calls=tool_calls or None,
+            finish_reason=finish_reason,
+            usage=usage,
         )
 
     async def stream_chat(
@@ -220,13 +382,20 @@ class OpenAIProvider(BaseLLMProvider):
             "stream": True,
             **kwargs,
         }
+        request_kwargs.setdefault("timeout", self._request_timeout_seconds())
 
         if tools:
             request_kwargs["tools"] = self._convert_tools(tools)
 
         async for chunk in await self.client.chat.completions.create(**request_kwargs):
-            if chunk.choices and chunk.choices[0].delta.content:
-                yield chunk.choices[0].delta.content
+            if not chunk.choices:
+                continue
+            delta_content = getattr(chunk.choices[0].delta, "content", None)
+            text = self._extract_message_content(delta_content)
+            if not text and isinstance(delta_content, str):
+                text = delta_content
+            if text:
+                yield text
 
 
 class AnthropicProvider(BaseLLMProvider):

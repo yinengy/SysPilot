@@ -83,6 +83,76 @@ def _contract(name: str, control_name: str, role: str = "consume") -> LibraryCon
     )
 
 
+def _affinity_contract(name: str, control_name: str) -> LibraryContract:
+    return LibraryContract.model_validate(
+        {
+            "contract": name,
+            "version": "lpcl/v0",
+            "contract_type": "library",
+            "source_artifacts": [
+                {"source_id": f"{name}_doc", "path": f"docs/{name}.md", "kind": "doc"}
+            ],
+            "uses": [
+                {
+                    "id": "affinity",
+                    "resource": "cpu.affinity",
+                    "phase": "compute",
+                    "scope": "process",
+                    "role": "pin",
+                    "sharing": "partitionable",
+                    "demand": {"kind": "unknown"},
+                    "source_refs": [f"{name}_doc:chunk_001"],
+                }
+            ],
+            "assumptions": [
+                {
+                    "id": "affinity_ok",
+                    "predicate": {
+                        "kind": "affinity_compatible",
+                        "resource": "cpu.affinity",
+                        "phase": "compute",
+                    },
+                    "source_refs": [f"{name}_doc:chunk_001"],
+                }
+            ],
+            "controls": [
+                {
+                    "id": f"{name}_affinity_control",
+                    "name": control_name,
+                    "kind": "env",
+                    "type": "string",
+                    "affects": ["affinity"],
+                    "effect": {"op": "select", "resource": "cpu.affinity", "strength": "strong"},
+                    "scope": "process",
+                    "source_refs": [f"{name}_doc:chunk_001"],
+                }
+            ],
+            "signals": [
+                {
+                    "id": f"{name}_timing_signal",
+                    "metric": f"{name}.timing",
+                    "resource": "cpu.thread",
+                    "indicates": "runtime timing for placement comparison",
+                    "probe": {"kind": "command", "target": "log"},
+                    "source_refs": [f"{name}_doc:chunk_001"],
+                }
+            ],
+            "recipes": [
+                {
+                    "id": f"{name}_affinity_recipe",
+                    "hypothesis_kind": "shared_resource_conflict",
+                    "collect": [f"{name}_timing_signal"],
+                    "control_refs": [f"{name}_affinity_control"],
+                    "actions": [f"compare placement with {control_name}"],
+                    "accept_if": "runtime improves",
+                    "rollback_if": "runtime regresses",
+                    "source_refs": [f"{name}_doc:chunk_001"],
+                }
+            ],
+        }
+    )
+
+
 def test_compose_order_independent() -> None:
     openmp = _contract("OpenMP", "OMP_NUM_THREADS")
     openblas = _contract("OpenBLAS", "OPENBLAS_NUM_THREADS")
@@ -128,6 +198,18 @@ def test_contract_context_bundle_exposes_profile_actions_conflicts(tmp_path: Pat
     assert context["conflicts"]
     assert context["validation"]
     assert context["hypothesis_profiles"]
+
+
+def test_composer_falls_back_to_recipe_signals_when_resource_specific_signals_absent() -> None:
+    gromacs = _affinity_contract("Gromacs", "GMX_PIN")
+    cp2k = _affinity_contract("CP2K", "OMP_PLACES")
+
+    hypotheses = derive_conflict_hypotheses([gromacs, cp2k])
+
+    assert hypotheses
+    assert hypotheses[0].resource == "cpu.affinity"
+    assert "Gromacs.Gromacs_timing_signal" in hypotheses[0].validation.collect
+    assert "CP2K.CP2K_timing_signal" in hypotheses[0].validation.collect
 
 
 def test_composed_contract_id_hydrates_library_refs_for_context(tmp_path: Path) -> None:

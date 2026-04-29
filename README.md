@@ -151,6 +151,7 @@ syspilot tune \
 - Stops by convergence (non-improving iteration patience) or `--max-iterations`
 - Compares baseline vs best-found configuration side-by-side
 - `--parse-output` uses LLM to extract app-specific metrics (e.g., tokens/sec) from stdout
+- If `--command` begins with `env KEY=VALUE ...`, SysPilot now treats those assignments as tunable baseline environment overrides instead of opaque command tokens, so spawn-mode env tuning can adjust the user-specified starting values across candidate trials.
 
 ### Tune UI Overhead Gate
 

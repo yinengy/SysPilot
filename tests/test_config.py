@@ -1,7 +1,15 @@
+import json
+
 import pytest
 from syspilot.core.config import SysPilotConfig, LLMConfig, LLMProvider
 from syspilot.core.llm import LLMInterface
-from syspilot.cli import _default_llm_config_path, _manual_pipeline_llm_config
+from syspilot.cli import (
+    _default_llm_config_path,
+    _load_cli_config,
+    _load_default_llm_config,
+    _merge_llm_config_with_repo_defaults,
+    _manual_pipeline_llm_config,
+)
 
 
 def test_default_config():
@@ -103,6 +111,41 @@ def test_default_llm_config_path_points_to_repo_config():
     assert _default_llm_config_path().parent.name == "config"
 
 
+def test_load_default_llm_config_reads_repo_config_file():
+    repo_config = json.loads(_default_llm_config_path().read_text(encoding="utf-8"))
+
+    config = _load_default_llm_config()
+
+    assert config.provider.value == repo_config["provider"]
+    assert config.model == repo_config["model"]
+    assert config.timeout_seconds == repo_config["timeout_seconds"]
+    assert config.max_retries == repo_config["max_retries"]
+
+
+def test_merge_llm_config_with_repo_defaults_uses_repo_values_when_yaml_missing_llm():
+    repo_llm = _load_default_llm_config()
+
+    merged = _merge_llm_config_with_repo_defaults({"monitoring": {"interval_seconds": 1.0}})
+
+    assert merged.provider == repo_llm.provider
+    assert merged.model == repo_llm.model
+    assert merged.base_url == repo_llm.base_url
+    assert merged.timeout_seconds == repo_llm.timeout_seconds
+
+
+def test_merge_llm_config_with_repo_defaults_overlays_partial_yaml_llm():
+    repo_llm = _load_default_llm_config()
+
+    merged = _merge_llm_config_with_repo_defaults(
+        {"llm": {"timeout_seconds": 120.0, "model": "gpt-5.4"}}
+    )
+
+    assert merged.provider == repo_llm.provider
+    assert merged.base_url == repo_llm.base_url
+    assert merged.timeout_seconds == 120.0
+    assert merged.model == "gpt-5.4"
+
+
 def test_manual_pipeline_llm_config_enforces_minimum_timeout_and_retry():
     base = LLMConfig(timeout_seconds=30.0, max_retries=0)
     tuned = _manual_pipeline_llm_config(base, minimum_timeout_seconds=180.0)
@@ -110,3 +153,17 @@ def test_manual_pipeline_llm_config_enforces_minimum_timeout_and_retry():
     assert tuned.max_retries == 1
     assert base.timeout_seconds == 30.0
     assert base.max_retries == 0
+
+
+def test_load_cli_config_with_yaml_keeps_repo_llm_defaults(tmp_path):
+    config_path = tmp_path / "syspilot.yaml"
+    config_path.write_text("monitoring:\n  interval_seconds: 1.0\n", encoding="utf-8")
+
+    loaded = _load_cli_config(str(config_path))
+    repo_llm = _load_default_llm_config()
+
+    assert loaded.monitoring.interval_seconds == 1.0
+    assert loaded.llm.provider == repo_llm.provider
+    assert loaded.llm.model == repo_llm.model
+    assert loaded.llm.base_url == repo_llm.base_url
+    assert loaded.llm.timeout_seconds == repo_llm.timeout_seconds

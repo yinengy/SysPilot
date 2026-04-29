@@ -17,6 +17,7 @@ from typing import Any, Protocol
 
 import click
 import psutil
+import yaml
 from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
@@ -65,6 +66,47 @@ def _load_default_llm_config() -> LLMConfig:
     if default_path.exists():
         return LLMConfig.from_file(default_path)
     return LLMConfig.from_file()
+
+
+def _merge_llm_config_with_repo_defaults(data: dict[str, Any]) -> LLMConfig:
+    repo_llm = _load_default_llm_config()
+    llm_data = data.get("llm")
+    if not isinstance(llm_data, dict):
+        return repo_llm
+
+    merged = {
+        "provider": repo_llm.provider.value,
+        "model": repo_llm.model,
+        "api_key": repo_llm.api_key,
+        "base_url": repo_llm.base_url,
+        "openai_auth_file": repo_llm.openai_auth_file,
+        "temperature": repo_llm.temperature,
+        "max_tokens": repo_llm.max_tokens,
+        "timeout_seconds": repo_llm.timeout_seconds,
+        "max_retries": repo_llm.max_retries,
+        "debug_conversation": repo_llm.debug_conversation,
+        "debug_markdown_file": repo_llm.debug_markdown_file,
+    }
+    merged.update(llm_data)
+    return LLMConfig.from_dict(merged)
+
+
+def _load_cli_config(config_path: str | None) -> SysPilotConfig:
+    if not config_path:
+        sys_config = SysPilotConfig()
+        sys_config.llm = _load_default_llm_config()
+        return sys_config
+
+    path = Path(config_path)
+    with open(path) as f:
+        raw_data = yaml.safe_load(f) or {}
+
+    if not isinstance(raw_data, dict):
+        raise ValueError(f"Config file must contain a mapping at top level: {path}")
+
+    config = SysPilotConfig.from_dict(raw_data)
+    config.llm = _merge_llm_config_with_repo_defaults(raw_data)
+    return config
 
 
 def _manual_pipeline_llm_config(base: LLMConfig, minimum_timeout_seconds: float) -> LLMConfig:
@@ -242,13 +284,7 @@ def cli(
 ) -> None:
     ctx.ensure_object(dict)
 
-    if config:
-        ctx.obj["config"] = SysPilotConfig.from_yaml(Path(config))
-    else:
-        # Load defaults, but try to find LLM config
-        sys_config = SysPilotConfig()
-        sys_config.llm = _load_default_llm_config()
-        ctx.obj["config"] = sys_config
+    ctx.obj["config"] = _load_cli_config(config)
 
     ctx.obj["config"].log_level = log_level
     if debug_llm or debug_llm_md:
@@ -810,7 +846,7 @@ def synthesize_contract_cmd(
     from syspilot_manual.llm_client import ManualLLMClient
 
     llm_client = ManualLLMClient(
-        config=_manual_pipeline_llm_config(ctx.obj["config"].llm, minimum_timeout_seconds=180.0),
+        config=_manual_pipeline_llm_config(ctx.obj["config"].llm, minimum_timeout_seconds=420.0),
         prompt_dir=_contract_prompt_dir(),
     )
     resolved_contract_id = contract_id or _slugify_manual_id(library)
@@ -2052,7 +2088,7 @@ def _to_token_list(value: Any) -> list[str]:
     return []
 
 
-_SPAWN_HELP_OPTION_CACHE: dict[str, set[str] | None] = {}
+_SPAWN_HELP_OPTION_CACHE: dict[tuple[str, ...], set[str] | None] = {}
 
 _LLAMA_BENCH_OPTION_ALIASES: dict[str, str] = {
     "-m": "model",
@@ -2209,15 +2245,58 @@ def _parse_cli_command_signature(
     return options, positionals
 
 
-def _discover_supported_cli_options(executable: str) -> set[str] | None:
-    cached = _SPAWN_HELP_OPTION_CACHE.get(executable)
-    if executable in _SPAWN_HELP_OPTION_CACHE:
+def _help_target_tokens(command_tokens: list[str]) -> tuple[str, ...]:
+    if not command_tokens:
+        return tuple()
+
+    help_target = [command_tokens[0]]
+    idx = 1
+    while idx < len(command_tokens):
+        token = command_tokens[idx]
+        if _is_option_token(token):
+            break
+        help_target.append(token)
+        idx += 1
+    return tuple(help_target)
+
+
+def _is_env_assignment_token(token: str) -> bool:
+    if "=" not in token:
+        return False
+    name, _ = token.split("=", 1)
+    return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name))
+
+
+def _extract_inline_env_assignments(command_tokens: list[str]) -> tuple[list[str], dict[str, str]]:
+    if not command_tokens or command_tokens[0] != "env":
+        return list(command_tokens), {}
+
+    idx = 1
+    env_overrides: dict[str, str] = {}
+    while idx < len(command_tokens) and _is_env_assignment_token(command_tokens[idx]):
+        name, value = command_tokens[idx].split("=", 1)
+        env_overrides[name] = value
+        idx += 1
+
+    remaining = command_tokens[idx:]
+    if not remaining or remaining[0].startswith("-"):
+        return list(command_tokens), {}
+
+    return remaining, env_overrides
+
+
+def _discover_supported_cli_options(help_target: tuple[str, ...]) -> set[str] | None:
+    cached = _SPAWN_HELP_OPTION_CACHE.get(help_target)
+    if help_target in _SPAWN_HELP_OPTION_CACHE:
         return cached
+
+    if not help_target:
+        return None
 
     for help_flag in ("--help", "-h"):
         try:
             completed = subprocess.run(
-                [executable, help_flag],
+                [*help_target, help_flag],
                 capture_output=True,
                 text=True,
                 timeout=3,
@@ -2236,10 +2315,10 @@ def _discover_supported_cli_options(executable: str) -> set[str] | None:
         )
         options = set(matches)
         if options:
-            _SPAWN_HELP_OPTION_CACHE[executable] = options
+            _SPAWN_HELP_OPTION_CACHE[help_target] = options
             return options
 
-    _SPAWN_HELP_OPTION_CACHE[executable] = None
+    _SPAWN_HELP_OPTION_CACHE[help_target] = None
     return None
 
 
@@ -2247,7 +2326,10 @@ def _validate_cli_options_against_help(command_tokens: list[str]) -> list[str]:
     if not command_tokens:
         return ["candidate command was empty"]
 
-    supported_options = _discover_supported_cli_options(command_tokens[0])
+    help_target = _help_target_tokens(command_tokens)
+    supported_options = _discover_supported_cli_options(help_target)
+    if not supported_options and len(help_target) > 1:
+        supported_options = _discover_supported_cli_options((command_tokens[0],))
     if not supported_options:
         return []
 
@@ -2455,6 +2537,7 @@ def _parse_spawn_actions(response: str) -> dict[str, Any]:
 def _build_spawn_execution_plan(
     base_command: list[str],
     actions: list[dict[str, Any]],
+    base_env_overrides: dict[str, str] | None = None,
 ) -> tuple[list[str], dict[str, str], list[str], list[str]]:
     if not base_command:
         return [], {}, [], ["base command was empty"]
@@ -2462,7 +2545,7 @@ def _build_spawn_execution_plan(
     prefix_tokens: list[str] = []
     command_tokens = list(base_command)
     command_replaced = False
-    env_overrides: dict[str, str] = {}
+    env_overrides: dict[str, str] = dict(base_env_overrides or {})
     applied: list[str] = []
     skipped: list[str] = []
 
@@ -2540,24 +2623,29 @@ def _build_spawn_candidates(
     base_command: list[str],
     actions: list[dict[str, Any]],
     max_candidates: int,
+    base_env_overrides: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     if max_candidates < 1:
         return []
 
+    alternative_action_types = {"command", "command_prefix", "numactl"}
     shared_actions: list[dict[str, Any]] = []
-    command_actions: list[dict[str, Any]] = []
+    alternative_actions: list[dict[str, Any]] = []
 
     for action in actions:
-        if str(action.get("config_type", "")).strip().lower() == "command":
-            command_actions.append(action)
+        config_type = str(action.get("config_type", "")).strip().lower()
+        if config_type in alternative_action_types:
+            alternative_actions.append(action)
         else:
             shared_actions.append(action)
 
     candidate_action_sets: list[list[dict[str, Any]]] = []
-    if command_actions:
-        candidate_action_sets.extend([shared_actions + [action] for action in command_actions])
+    if alternative_actions:
+        candidate_action_sets.extend([shared_actions + [action] for action in alternative_actions])
     elif shared_actions:
-        candidate_action_sets.append(shared_actions)
+        candidate_action_sets.extend(
+            [shared_actions[:idx] for idx in range(1, len(shared_actions) + 1)]
+        )
 
     candidates: list[dict[str, Any]] = []
     seen: set[tuple[tuple[str, ...], tuple[tuple[str, str], ...]]] = set()
@@ -2566,11 +2654,12 @@ def _build_spawn_candidates(
         tuned_cmd, env_overrides, applied_actions, skipped_actions = _build_spawn_execution_plan(
             base_command,
             action_set,
+            base_env_overrides=base_env_overrides,
         )
         if not tuned_cmd:
             continue
 
-        if tuned_cmd == base_command and not env_overrides:
+        if tuned_cmd == base_command and env_overrides == dict(base_env_overrides or {}):
             continue
 
         key = _command_key(tuned_cmd, env_overrides)
@@ -3055,6 +3144,27 @@ async def _run_spawn_tune_loop_async(
         sink.print("[red]Spawn command is empty after parsing[/red]")
         return
 
+    cmd_parts, inline_env_overrides = _extract_inline_env_assignments(cmd_parts)
+    if not cmd_parts:
+        _emit_tune_event(
+            event_emitter,
+            "error",
+            {
+                "mode": "spawn",
+                "phase": "spawn.command_parse",
+                "message": "command contained only inline env assignments",
+            },
+        )
+        _emit_tune_event(
+            event_emitter,
+            "run.finished",
+            {"mode": "spawn", "status": "invalid_input"},
+        )
+        sink.print("[red]Spawn command contained only inline env assignments[/red]")
+        return
+    if inline_env_overrides:
+        sink.print(f"[cyan]Detected inline environment baseline: {inline_env_overrides}[/cyan]")
+
     loaded_manual_names = sorted(agent.context.loaded_manuals.keys())
 
     _emit_tune_event(
@@ -3067,6 +3177,7 @@ async def _run_spawn_tune_loop_async(
             "max_iterations": max_iterations,
             "timeout_s": timeout,
             "loaded_manuals": loaded_manual_names,
+            "baseline_env_overrides": dict(inline_env_overrides),
         },
     )
 
@@ -3112,6 +3223,7 @@ async def _run_spawn_tune_loop_async(
         cmd_parts,
         timeout,
         workdir=workdir,
+        env_overrides=inline_env_overrides,
     )
     _emit_tune_event(
         event_emitter,
@@ -3176,7 +3288,7 @@ async def _run_spawn_tune_loop_async(
     sink.print(f"  Output: {len(baseline_stdout)} bytes")
 
     current_command_parts = list(cmd_parts)
-    current_env_overrides: dict[str, str] = {}
+    current_env_overrides: dict[str, str] = dict(inline_env_overrides)
     current_time = baseline_time
     current_stdout = baseline_stdout
     current_stderr = baseline_stderr
@@ -3351,6 +3463,9 @@ async def _run_spawn_tune_loop_async(
 ## Current Command
 {" ".join(current_command_parts)}
 
+## Current Environment Overrides
+{json.dumps(current_env_overrides, indent=2, sort_keys=True) if current_env_overrides else "(none)"}
+
 ## Current Wall Time
 {current_time:.2f}s
 
@@ -3510,6 +3625,7 @@ async def _run_spawn_tune_loop_async(
             current_command_parts,
             actions,
             max_candidates=max_iterations,
+            base_env_overrides=current_env_overrides,
         )
         candidate_plans = [
             candidate

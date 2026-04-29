@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any, AsyncIterator
 
 import pytest
@@ -12,6 +13,7 @@ from syspilot.core.llm import (
     LLMResponse,
     LLMTimeoutError,
     Message,
+    OpenAIProvider,
     ToolDefinition,
 )
 from syspilot.core.openai_auth_provider import OpenAIAuthProvider
@@ -153,6 +155,37 @@ class _FakeOpenAIAuthClient:
         self.closed = True
 
 
+class _FakeOpenAIStream:
+    def __init__(self, chunks: list[object]) -> None:
+        self._chunks = chunks
+        self._index = 0
+
+    def __aiter__(self) -> "_FakeOpenAIStream":
+        return self
+
+    async def __anext__(self) -> object:
+        if self._index >= len(self._chunks):
+            raise StopAsyncIteration
+        chunk = self._chunks[self._index]
+        self._index += 1
+        return chunk
+
+
+class _FakeOpenAIChatCompletions:
+    def __init__(self, responses: list[object]) -> None:
+        self.responses = responses
+        self.calls: list[dict[str, Any]] = []
+
+    async def create(self, **kwargs: Any) -> object:
+        self.calls.append(kwargs)
+        return self.responses.pop(0)
+
+
+class _FakeOpenAIClient:
+    def __init__(self, responses: list[object]) -> None:
+        self.chat = SimpleNamespace(completions=_FakeOpenAIChatCompletions(responses))
+
+
 @pytest.mark.asyncio
 async def test_debug_markdown_transcript_written(tmp_path):
     md_path = tmp_path / "llm_debug.md"
@@ -274,3 +307,108 @@ async def test_openai_auth_stream_chat_times_out_hung_stream() -> None:
             pass
 
     assert client.closed is True
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_uses_stream_first_for_gpt5_completion() -> None:
+    provider = OpenAIProvider(
+        LLMConfig(
+            provider=LLMProvider.OPENAI,
+            model="gpt-5.4",
+            api_key="test",
+            timeout_seconds=12.5,
+        )
+    )
+    stream = _FakeOpenAIStream(
+        [
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content="OK", tool_calls=None),
+                        finish_reason=None,
+                    )
+                ],
+                usage=SimpleNamespace(prompt_tokens=3, completion_tokens=1, total_tokens=4),
+            ),
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content=None, tool_calls=None),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=None,
+            ),
+        ]
+    )
+    provider._client = _FakeOpenAIClient([stream])
+
+    response = await provider.chat([Message(role="user", content="hello")])
+
+    assert response.content == "OK"
+    assert response.finish_reason == "stop"
+    assert response.usage == {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
+    assert len(provider.client.chat.completions.calls) == 1
+    assert provider.client.chat.completions.calls[0]["stream"] is True
+    assert provider.client.chat.completions.calls[0]["timeout"] == 12.5
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_extracts_text_from_typed_content_parts() -> None:
+    provider = OpenAIProvider(
+        LLMConfig(provider=LLMProvider.OPENAI, model="gpt-4o", api_key="test")
+    )
+    typed_content_response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=[
+                        {"type": "output_text", "text": "hello"},
+                        {"type": "text", "text": " world"},
+                    ],
+                    tool_calls=None,
+                ),
+                finish_reason="stop",
+            )
+        ],
+        usage=SimpleNamespace(prompt_tokens=3, completion_tokens=2, total_tokens=5),
+    )
+    provider._client = _FakeOpenAIClient([typed_content_response])
+
+    response = await provider.chat([Message(role="user", content="hello")])
+
+    assert response.content == "hello world"
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_passes_timeout_to_stream_chat_request() -> None:
+    provider = OpenAIProvider(
+        LLMConfig(
+            provider=LLMProvider.OPENAI,
+            model="gpt-5.4",
+            api_key="test",
+            timeout_seconds=7.25,
+        )
+    )
+    stream = _FakeOpenAIStream(
+        [
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content="hello", tool_calls=None),
+                        finish_reason=None,
+                    )
+                ],
+                usage=None,
+            )
+        ]
+    )
+    provider._client = _FakeOpenAIClient([stream])
+
+    chunks: list[str] = []
+    async for chunk in provider.stream_chat([Message(role="user", content="hello")]):
+        chunks.append(chunk)
+
+    assert chunks == ["hello"]
+    assert provider.client.chat.completions.calls[0]["stream"] is True
+    assert provider.client.chat.completions.calls[0]["timeout"] == 7.25

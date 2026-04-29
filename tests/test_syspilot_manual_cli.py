@@ -4,18 +4,21 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import patch
 
 from click.testing import CliRunner
 
 from syspilot.cli import (
     cli,
+    _load_default_llm_config,
     _build_spawn_profiling_env,
     _collect_contract_report_env,
     _extract_hypothesis_profiles,
     _parse_spawn_actions,
     _summarize_spawn_runtime_output,
 )
+from syspilot.core.config import SysPilotConfig
 from syspilot.core.agent import SysPilotAgent
 from syspilot.core.llm import LLMTimeoutError
 from syspilot_contract.compose_contracts import compose_contracts
@@ -706,7 +709,7 @@ def test_contract_hypothesis_profiles_drive_report_env(tmp_path: Path) -> None:
             }
         ]
     }
-    profiles = _extract_hypothesis_profiles(bundle)
+    profiles = _extract_hypothesis_profiles(cast(dict[str, object], bundle))
     report_env = _collect_contract_report_env(profiles)
 
     assert profiles
@@ -796,3 +799,47 @@ def test_spawn_mode_degrades_to_no_actions_when_llm_analysis_fails() -> None:
     assert result.exit_code == 0
     assert "Agent tuning analysis unavailable:" in result.output
     assert "recommended no actionable tuning" in result.output.lower()
+
+
+def test_tune_mode_uses_repo_llm_config_even_with_yaml_config(tmp_path: Path) -> None:
+    runner = CliRunner()
+    _DummyAgent.instances.clear()
+    repo_llm = _load_default_llm_config()
+    config_path = tmp_path / "syspilot.yaml"
+    config_path.write_text("monitoring:\n  interval_seconds: 1.0\n", encoding="utf-8")
+
+    with (
+        patch("syspilot.cli.SysPilotAgent", _DummyAgent),
+        patch("syspilot.cli._register_default_skills", _noop),
+        patch("syspilot.cli._register_profiling_tools", _noop),
+        patch("syspilot.cli._register_tuning_tools", _noop),
+        patch("syspilot.cli._run_live_profiling_pipeline", _fake_live_profile),
+        patch("syspilot.cli._run_command", _fake_run_command),
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "--config",
+                str(config_path),
+                "tune",
+                "--ui-mode",
+                "plain",
+                "--command",
+                "echo hi",
+                "--max-iterations",
+                "1",
+                "--timeout",
+                "1",
+                "--no-parse-output",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert _DummyAgent.instances
+    config = cast(SysPilotConfig, _DummyAgent.instances[0].config)
+    llm_config = config.llm
+    assert llm_config.provider == repo_llm.provider
+    assert llm_config.model == repo_llm.model
+    assert llm_config.base_url == repo_llm.base_url
+    assert llm_config.timeout_seconds == repo_llm.timeout_seconds
+    assert llm_config.max_retries == repo_llm.max_retries
