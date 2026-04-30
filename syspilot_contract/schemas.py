@@ -1,26 +1,29 @@
 from __future__ import annotations
 
-from typing import Any, Annotated, Literal, cast
+from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
-CONTRACT_VERSION = "lpcl/v0"
+CONTRACT_VERSION = "lpcl/v1"
 
 RESOURCE_TYPES: tuple[str, ...] = (
-    "cpu.core",
-    "cpu.thread",
-    "cpu.affinity",
-    "gpu.device",
-    "gpu.stream",
+    "cpu.compute",
+    "cpu.placement",
+    "gpu.compute",
+    "gpu.memory",
     "mem.capacity",
     "mem.bandwidth",
-    "mem.allocator",
     "io.bandwidth",
     "io.queue",
-    "net.bandwidth",
-    "worker.pool",
-    "cache.capacity",
+)
+
+COMPONENT_KINDS: tuple[str, ...] = (
+    "executor",
+    "queue",
+    "allocator",
+    "backend",
+    "cache",
 )
 
 PHASES: tuple[str, ...] = (
@@ -41,123 +44,165 @@ SCOPES: tuple[str, ...] = (
     "system",
 )
 
-ROLES: tuple[str, ...] = (
-    "consume",
-    "reserve",
-    "pin",
-    "serialize",
-    "buffer",
-    "amplify",
+SHARE_MODES: tuple[str, ...] = (
+    "shared",
+    "exclusive",
+    "partitioned",
+    "process_global",
 )
 
-SHARING_MODES: tuple[str, ...] = (
-    "shareable",
-    "partitionable",
+PREDICATE_KINDS: tuple[str, ...] = (
+    "total_at_most",
+    "competitors_at_most",
     "exclusive",
-    "global",
+    "not_nested",
+    "placement_compatible",
+)
+
+CONTROL_KINDS: tuple[str, ...] = (
+    "env",
+    "api",
+    "config",
+    "cli",
+    "vlc",
+)
+
+CONTROL_TYPES: tuple[str, ...] = (
+    "int",
+    "float",
+    "bool",
+    "string",
+    "enum",
+    "set",
+)
+
+EFFECT_KINDS: tuple[str, ...] = (
+    "set",
+    "increase",
+    "decrease",
+    "partition",
+    "disable",
+    "enable",
+)
+
+PROBE_KINDS: tuple[str, ...] = (
+    "api",
+    "perf",
+    "os",
+    "log",
+    "profiler",
+    "benchmark",
+    "manual",
+)
+
+HYPOTHESIS_KINDS: tuple[str, ...] = (
+    "shared_cpu_compute_conflict",
+    "cpu_placement_conflict",
+    "shared_gpu_compute_conflict",
+    "gpu_memory_pressure",
+    "host_memory_capacity_pressure",
+    "memory_bandwidth_contention",
+    "io_bandwidth_contention",
+    "io_queue_contention",
+)
+
+PHASE_OR_MIXED: tuple[str, ...] = PHASES + ("mixed",)
+
+RESOURCE_TO_HYPOTHESIS_KIND: dict[str, str] = {
+    "cpu.compute": "shared_cpu_compute_conflict",
+    "cpu.placement": "cpu_placement_conflict",
+    "gpu.compute": "shared_gpu_compute_conflict",
+    "gpu.memory": "gpu_memory_pressure",
+    "mem.capacity": "host_memory_capacity_pressure",
+    "mem.bandwidth": "memory_bandwidth_contention",
+    "io.bandwidth": "io_bandwidth_contention",
+    "io.queue": "io_queue_contention",
+}
+
+LEGACY_RESOURCE_ERRORS: dict[str, str] = {
+    "worker.pool": "Invalid resource worker.pool. worker.pool is a component, not a resource.",
+    "cpu.thread": "Invalid resource cpu.thread. Use resource cpu.compute with demand.dimension = workers.",
+    "cpu.affinity": "Invalid resource cpu.affinity. Use resource cpu.placement.",
+    "gpu.device": "Invalid resource gpu.device. Use resource gpu.compute.",
+    "gpu.stream": "Invalid resource gpu.stream. Model GPU streams as queue components using gpu.compute.",
+    "mem.allocator": "Invalid resource mem.allocator. mem.allocator is a component, not a resource.",
+    "net.bandwidth": "Invalid resource net.bandwidth. Use resource io.bandwidth.",
+    "cache.capacity": "Invalid resource cache.capacity. cache is a component; use mem.capacity for host memory pressure.",
+    "cpu.core": "Invalid resource cpu.core. Use cpu.compute or cpu.placement depending on whether the claim is execution or placement related.",
+}
+
+EXECUTOR_WORKER_CONTROL_NAMES: set[str] = {
+    "OPENBLAS_NUM_THREADS",
+    "GOTO_NUM_THREADS",
+    "OPENBLAS_DEFAULT_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "OMP_THREAD_LIMIT",
+    "MKL_NUM_THREADS",
+    "MKL_DOMAIN_NUM_THREADS",
+    "openblas_set_num_threads",
+    "goto_set_num_threads",
+    "mkl_set_num_threads",
+    "mkl_domain_set_num_threads",
+    "mkl_set_num_threads_local",
+    "-nt",
+    "-ntmpi",
+    "-ntomp",
+    "-ntomp_pme",
+    "-npme",
+    "nthread",
+}
+
+TARGET_RESERVED_PREFIXES: tuple[str, ...] = (
+    "components",
+    "uses",
+    "assumptions",
+    "controls",
+    "signals",
+    "recipes",
 )
 
 ResourceType = Literal[
-    "cpu.core",
-    "cpu.thread",
-    "cpu.affinity",
-    "gpu.device",
-    "gpu.stream",
+    "cpu.compute",
+    "cpu.placement",
+    "gpu.compute",
+    "gpu.memory",
     "mem.capacity",
     "mem.bandwidth",
-    "mem.allocator",
     "io.bandwidth",
     "io.queue",
-    "net.bandwidth",
-    "worker.pool",
-    "cache.capacity",
 ]
 
+ComponentKind = Literal["executor", "queue", "allocator", "backend", "cache"]
 PhaseName = Literal[
-    "init",
-    "compute",
-    "communication",
-    "flush",
-    "background",
-    "teardown",
-    "unknown",
+    "init", "compute", "communication", "flush", "background", "teardown", "unknown"
 ]
-
-ScopeName = Literal[
-    "thread",
-    "process",
-    "library",
-    "device",
-    "system",
-]
-
-RoleName = Literal[
-    "consume",
-    "reserve",
-    "pin",
-    "serialize",
-    "buffer",
-    "amplify",
-]
-
-SharingMode = Literal[
-    "shareable",
-    "partitionable",
-    "exclusive",
-    "global",
-]
-
-DemandKind = Literal[
-    "fixed",
-    "range",
-    "scaled_by",
-    "proportional_to",
-    "burst",
-    "unknown",
-]
-
-HostSymbol = Literal[
-    "host.physical_cores",
-    "host.visible_cpus",
-    "host.numa_nodes",
-]
-
-ControlValueType = Literal[
-    "int",
-    "bool",
-    "enum",
-    "string",
-    "cpu_set",
-    "numa_node_set",
-]
-
-ProbeKind = Literal[
-    "command",
-    "procfs",
-    "runtime_env",
-]
-
-RecipeHypothesisKind = Literal[
-    "baseline_validation",
-    "parameter_sweep",
-    "validation",
-    "starting_point",
-    "shared_resource_conflict",
-]
-
-ConflictHypothesisKind = Literal["shared_resource_conflict"]
-
+ScopeName = Literal["thread", "process", "library", "device", "system"]
+ShareMode = Literal["shared", "exclusive", "partitioned", "process_global"]
 PredicateKind = Literal[
-    "max_competitors",
-    "budget_at_most",
-    "dedicated_partition",
-    "affinity_compatible",
+    "total_at_most",
+    "competitors_at_most",
+    "exclusive",
     "not_nested",
+    "placement_compatible",
+]
+ControlKind = Literal["env", "api", "config", "cli", "vlc"]
+ControlType = Literal["int", "float", "bool", "string", "enum", "set"]
+EffectKind = Literal["set", "increase", "decrease", "partition", "disable", "enable"]
+ProbeKind = Literal["api", "perf", "os", "log", "profiler", "benchmark", "manual"]
+HypothesisKind = Literal[
+    "shared_cpu_compute_conflict",
+    "cpu_placement_conflict",
+    "shared_gpu_compute_conflict",
+    "gpu_memory_pressure",
+    "host_memory_capacity_pressure",
+    "memory_bandwidth_contention",
+    "io_bandwidth_contention",
+    "io_queue_contention",
 ]
 
 
 def _clean_strings(values: list[str]) -> list[str]:
-    cleaned = [value.strip() for value in values if value and value.strip()]
+    cleaned = [str(value).strip() for value in values if str(value).strip()]
     seen: set[str] = set()
     ordered: list[str] = []
     for value in cleaned:
@@ -166,6 +211,207 @@ def _clean_strings(values: list[str]) -> list[str]:
         seen.add(value)
         ordered.append(value)
     return ordered
+
+
+def _normalize_condition(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, list):
+        parts = _clean_strings([str(item) for item in value])
+        return "; ".join(parts) if parts else None
+    text = str(value).strip()
+    return text or None
+
+
+def _require_non_empty_evidence(evidence: list[str], label: str) -> list[str]:
+    cleaned = _clean_strings(evidence)
+    if not cleaned:
+        raise ValueError(f"{label} must include non-empty evidence")
+    return cleaned
+
+
+def _is_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _is_symbol(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _is_number_or_symbol(value: object) -> bool:
+    return _is_number(value) or _is_symbol(value)
+
+
+def _validate_resource(resource: str) -> str:
+    if resource in RESOURCE_TYPES:
+        return resource
+    if resource in LEGACY_RESOURCE_ERRORS:
+        raise ValueError(LEGACY_RESOURCE_ERRORS[resource])
+    raise ValueError(f"Unknown resource {resource}. Allowed resources: {', '.join(RESOURCE_TYPES)}")
+
+
+def _validate_enum(value: str, allowed: tuple[str, ...], label: str) -> str:
+    text = str(value).strip()
+    if text not in allowed:
+        raise ValueError(f"Unknown {label} {text}. Allowed values: {', '.join(allowed)}")
+    return text
+
+
+def _resource_root(target: str) -> str | None:
+    parts = target.split(".")
+    if len(parts) < 2:
+        return None
+    root = ".".join(parts[:2])
+    return root if root in RESOURCE_TYPES else None
+
+
+def _duplicate_id_errors(section: str, ids: list[str]) -> list[str]:
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for item_id in ids:
+        if item_id in seen and item_id not in duplicates:
+            duplicates.append(item_id)
+        seen.add(item_id)
+    return [f"Duplicate {section} id {item_id}" for item_id in duplicates]
+
+
+def _resources_for_target(target: str, contract: "LibraryContract") -> list[str]:
+    if target in RESOURCE_TYPES:
+        return [target]
+    root = _resource_root(target)
+    if root is not None:
+        return [root]
+
+    use_by_id = {item.id: item for item in contract.uses}
+    component_ids = {item.id for item in contract.components}
+    if target in use_by_id:
+        return [use_by_id[target].resource]
+
+    head = target.split(".", 1)[0]
+    if head in use_by_id:
+        return [use_by_id[head].resource]
+    if head in component_ids:
+        resources = sorted({item.resource for item in contract.uses if item.by == head})
+        return resources
+    return []
+
+
+def _target_exists(target: str, contract: "LibraryContract") -> bool:
+    if target in RESOURCE_TYPES:
+        return True
+    if _resource_root(target) is not None:
+        return True
+    use_ids = {item.id for item in contract.uses}
+    component_ids = {item.id for item in contract.components}
+    if target in use_ids or target in component_ids:
+        return True
+    head = target.split(".", 1)[0]
+    return head in use_ids or head in component_ids
+
+
+def _looks_like_worker_control(name: str) -> bool:
+    stripped = name.strip()
+    upper = stripped.upper()
+    if any(token in upper for token in ("TIMEOUT", "BLOCKTIME", "WAIT_POLICY")):
+        return False
+    if stripped in EXECUTOR_WORKER_CONTROL_NAMES:
+        return True
+    lower = stripped.lower()
+    return "THREAD" in upper or lower.endswith("nthread") or lower.endswith("workers")
+
+
+def _validate_component_attrs(attrs: dict[str, Any]) -> dict[str, Any]:
+    for key in attrs:
+        if key in TARGET_RESERVED_PREFIXES:
+            raise ValueError("Component attrs must not contain nested LPCL declarations")
+    return attrs
+
+
+def _validate_use_demand(resource: str, demand: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(demand, dict):
+        raise ValueError("Use demand must be an object")
+
+    dimension = demand.get("dimension")
+    if resource == "cpu.compute":
+        if (
+            dimension != "workers"
+            or not _is_number_or_symbol(demand.get("min"))
+            or not _is_number_or_symbol(demand.get("max"))
+        ):
+            raise ValueError(
+                "Invalid demand schema for cpu.compute. Use {dimension: workers, min: <number_or_symbol>, max: <number_or_symbol>}."
+            )
+    elif resource == "cpu.placement":
+        if dimension != "core_set" or not _is_symbol(demand.get("source")):
+            raise ValueError(
+                "Invalid demand schema for cpu.placement. Use {dimension: core_set, source: <string_or_symbol>}."
+            )
+    elif resource == "gpu.compute":
+        if dimension == "devices":
+            if not _is_number_or_symbol(demand.get("min")) or not _is_number_or_symbol(
+                demand.get("max")
+            ):
+                raise ValueError(
+                    "Invalid demand schema for gpu.compute. devices demand requires min and max."
+                )
+        elif dimension == "partition":
+            if not _is_symbol(demand.get("source")):
+                raise ValueError(
+                    "Invalid demand schema for gpu.compute. partition demand requires source."
+                )
+        else:
+            raise ValueError(
+                "Invalid demand schema for gpu.compute. Use {dimension: devices, min, max} or {dimension: partition, source}."
+            )
+    elif resource in {"gpu.memory", "mem.capacity"}:
+        if (
+            dimension != "bytes"
+            or not _is_number_or_symbol(demand.get("min"))
+            or not _is_number_or_symbol(demand.get("max"))
+        ):
+            raise ValueError(
+                f"Invalid demand schema for {resource}. Use {{dimension: bytes, min: <number_or_symbol>, max: <number_or_symbol>}}."
+            )
+    elif resource == "mem.bandwidth":
+        if dimension != "intensity" or not (
+            _is_number_or_symbol(demand.get("value")) or demand.get("value") == "unknown"
+        ):
+            raise ValueError(
+                "Invalid demand schema for mem.bandwidth. Use {dimension: intensity, value: <number_or_symbol_or_unknown>}."
+            )
+    elif resource == "io.bandwidth":
+        if (
+            dimension != "bandwidth"
+            or not _is_number_or_symbol(demand.get("min"))
+            or not _is_number_or_symbol(demand.get("max"))
+        ):
+            raise ValueError(
+                "Invalid demand schema for io.bandwidth. Use {dimension: bandwidth, min: <number_or_symbol>, max: <number_or_symbol>}."
+            )
+    elif resource == "io.queue":
+        if (
+            dimension != "depth"
+            or not _is_number_or_symbol(demand.get("min"))
+            or not _is_number_or_symbol(demand.get("max"))
+        ):
+            raise ValueError(
+                "Invalid demand schema for io.queue. Use {dimension: depth, min: <number_or_symbol>, max: <number_or_symbol>}."
+            )
+    return demand
+
+
+def _validate_predicate(resource: str, predicate: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(predicate, dict):
+        raise ValueError("Assumption predicate must be an object")
+    kind = _validate_enum(str(predicate.get("kind", "")).strip(), PREDICATE_KINDS, "predicate kind")
+    if kind in {"total_at_most", "competitors_at_most"}:
+        if not _is_number_or_symbol(predicate.get("value")):
+            raise ValueError(f"Predicate {kind} requires a value")
+    if kind == "not_nested" and resource not in {"cpu.compute", "gpu.compute"}:
+        raise ValueError(f"Predicate not_nested is not valid for resource {resource}")
+    if kind == "placement_compatible" and resource != "cpu.placement":
+        raise ValueError(f"Predicate placement_compatible is not valid for resource {resource}")
+    return predicate
 
 
 class ContractBaseModel(BaseModel):
@@ -178,233 +424,304 @@ class SourceArtifact(ContractBaseModel):
     kind: Literal["doc", "code_hint", "metadata"]
 
 
-class FixedDemand(ContractBaseModel):
-    kind: Literal["fixed"] = "fixed"
-    value: int = Field(ge=0)
+class Component(ContractBaseModel):
+    id: str
+    kind: str
+    attrs: dict[str, Any] = Field(default_factory=dict)
+    evidence: list[str]
 
+    @field_validator("kind", mode="after")
+    @classmethod
+    def _validate_kind(cls, value: str) -> str:
+        return _validate_enum(value, COMPONENT_KINDS, "component kind")
 
-class RangeDemand(ContractBaseModel):
-    kind: Literal["range"] = "range"
-    lower: int | HostSymbol
-    upper: int | HostSymbol
+    @field_validator("attrs", mode="after")
+    @classmethod
+    def _validate_attrs(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return _validate_component_attrs(value)
 
-
-class ScaledByDemand(ContractBaseModel):
-    kind: Literal["scaled_by"] = "scaled_by"
-    knob: str
-    lower: int | HostSymbol
-    upper: int | HostSymbol
-
-
-class ProportionalToDemand(ContractBaseModel):
-    kind: Literal["proportional_to"] = "proportional_to"
-    metric: str
-
-
-class BurstDemand(ContractBaseModel):
-    kind: Literal["burst"] = "burst"
-    trigger: str
-
-
-class UnknownDemand(ContractBaseModel):
-    kind: Literal["unknown"] = "unknown"
-
-
-DemandExpression = Annotated[
-    FixedDemand | RangeDemand | ScaledByDemand | ProportionalToDemand | BurstDemand | UnknownDemand,
-    Field(discriminator="kind"),
-]
+    @field_validator("evidence", mode="after")
+    @classmethod
+    def _validate_evidence(cls, values: list[str]) -> list[str]:
+        return _require_non_empty_evidence(values, "Components")
 
 
 class ResourceUse(ContractBaseModel):
     id: str
-    resource: ResourceType
-    phase: PhaseName
-    scope: ScopeName
-    role: RoleName
-    sharing: SharingMode
-    demand: DemandExpression
-    when: list[str] = Field(default_factory=list)
-    source_refs: list[str]
+    resource: str
+    by: str
+    phase: str
+    scope: str
+    demand: dict[str, Any]
+    share: str
+    when: str | None = None
+    evidence: list[str]
 
-    @field_validator("when", "source_refs", mode="after")
+    @field_validator("resource", mode="after")
     @classmethod
-    def _normalize_string_lists(cls, values: list[str]) -> list[str]:
-        return _clean_strings(values)
+    def _validate_resource_value(cls, value: str) -> str:
+        return _validate_resource(value)
+
+    @field_validator("phase", mode="after")
+    @classmethod
+    def _validate_phase(cls, value: str) -> str:
+        return _validate_enum(value, PHASES, "phase")
+
+    @field_validator("scope", mode="after")
+    @classmethod
+    def _validate_scope(cls, value: str) -> str:
+        return _validate_enum(value, SCOPES, "scope")
+
+    @field_validator("share", mode="after")
+    @classmethod
+    def _validate_share(cls, value: str) -> str:
+        return _validate_enum(value, SHARE_MODES, "share mode")
+
+    @field_validator("when", mode="before")
+    @classmethod
+    def _normalize_when(cls, value: Any) -> str | None:
+        return _normalize_condition(value)
+
+    @field_validator("evidence", mode="after")
+    @classmethod
+    def _validate_evidence(cls, values: list[str]) -> list[str]:
+        return _require_non_empty_evidence(values, "Uses")
 
     @model_validator(mode="after")
-    def _require_source_refs(self) -> "ResourceUse":
-        if not self.source_refs:
-            raise ValueError("Resource uses require source_refs")
+    def _validate_demand_shape(self) -> "ResourceUse":
+        self.demand = _validate_use_demand(self.resource, self.demand)
         return self
-
-
-class MaxCompetitorsPredicate(ContractBaseModel):
-    kind: Literal["max_competitors"] = "max_competitors"
-    resource: ResourceType
-    phase: PhaseName
-    value: int = Field(ge=1)
-
-
-class BudgetAtMostPredicate(ContractBaseModel):
-    kind: Literal["budget_at_most"] = "budget_at_most"
-    resource: ResourceType
-    phase: PhaseName
-    value: int | HostSymbol
-
-
-class DedicatedPartitionPredicate(ContractBaseModel):
-    kind: Literal["dedicated_partition"] = "dedicated_partition"
-    resource: ResourceType
-    phase: PhaseName
-
-
-class AffinityCompatiblePredicate(ContractBaseModel):
-    kind: Literal["affinity_compatible"] = "affinity_compatible"
-    resource: ResourceType
-    phase: PhaseName
-
-
-class NotNestedPredicate(ContractBaseModel):
-    kind: Literal["not_nested"] = "not_nested"
-    resource: ResourceType
-    phase: PhaseName
-
-
-PredicateExpression = Annotated[
-    MaxCompetitorsPredicate
-    | BudgetAtMostPredicate
-    | DedicatedPartitionPredicate
-    | AffinityCompatiblePredicate
-    | NotNestedPredicate,
-    Field(discriminator="kind"),
-]
 
 
 class Assumption(ContractBaseModel):
     id: str
-    predicate: PredicateExpression
-    when: list[str] = Field(default_factory=list)
-    source_refs: list[str]
+    resource: str
+    predicate: dict[str, Any]
+    when: str | None = None
+    evidence: list[str]
 
-    @field_validator("when", "source_refs", mode="after")
+    @field_validator("resource", mode="after")
     @classmethod
-    def _normalize_string_lists(cls, values: list[str]) -> list[str]:
-        return _clean_strings(values)
+    def _validate_resource_value(cls, value: str) -> str:
+        return _validate_resource(value)
+
+    @field_validator("when", mode="before")
+    @classmethod
+    def _normalize_when(cls, value: Any) -> str | None:
+        return _normalize_condition(value)
+
+    @field_validator("evidence", mode="after")
+    @classmethod
+    def _validate_evidence(cls, values: list[str]) -> list[str]:
+        return _require_non_empty_evidence(values, "Assumptions")
 
     @model_validator(mode="after")
-    def _require_source_refs(self) -> "Assumption":
-        if not self.source_refs:
-            raise ValueError("Assumptions require source_refs")
+    def _validate_predicate_shape(self) -> "Assumption":
+        self.predicate = _validate_predicate(self.resource, self.predicate)
         return self
 
 
 class ControlEffect(ContractBaseModel):
-    op: Literal["increase", "decrease", "constrain", "select", "report", "coordinate"]
-    resource: ResourceType
-    strength: Literal["weak", "moderate", "strong"] = "moderate"
+    kind: str
+    value: Any | None = None
+    resource: str | None = None
 
+    @field_validator("kind", mode="after")
+    @classmethod
+    def _validate_kind(cls, value: str) -> str:
+        return _validate_enum(value, EFFECT_KINDS, "effect kind")
 
-class SignalProbe(ContractBaseModel):
-    kind: ProbeKind
-    target: str
+    @field_validator("resource", mode="after")
+    @classmethod
+    def _validate_resource_value(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _validate_resource(value)
+
+    @model_validator(mode="after")
+    def _validate_shape(self) -> "ControlEffect":
+        if self.kind == "set" and self.value is None:
+            raise ValueError("Control effect set requires a value")
+        if self.kind == "partition" and self.resource is None:
+            raise ValueError("Control effect partition requires a resource")
+        return self
 
 
 class Control(ContractBaseModel):
     id: str
     name: str
-    kind: Literal["env", "config", "api", "cli", "runtime"]
-    type: ControlValueType
-    affects: list[str] = Field(default_factory=list)
+    kind: str
+    type: str
+    target: str
     effect: ControlEffect
-    scope: ScopeName
-    allowed_values: list[str] = Field(default_factory=list)
-    activation_value: str | int | bool | None = None
-    source_refs: list[str]
+    when: str | None = None
+    evidence: list[str]
 
-    @field_validator("affects", "allowed_values", "source_refs", mode="after")
+    @field_validator("kind", mode="after")
     @classmethod
-    def _normalize_string_lists(cls, values: list[str]) -> list[str]:
-        return _clean_strings(values)
+    def _validate_kind(cls, value: str) -> str:
+        return _validate_enum(value, CONTROL_KINDS, "control kind")
 
-    @model_validator(mode="after")
-    def _require_references(self) -> "Control":
-        if "=" in self.name:
-            raise ValueError("Controls must use canonical knob names without inline values")
-        if not self.affects:
-            raise ValueError("Controls require at least one affected use")
-        if not self.source_refs:
-            raise ValueError("Controls require source_refs")
-        return self
+    @field_validator("type", mode="after")
+    @classmethod
+    def _validate_type(cls, value: str) -> str:
+        return _validate_enum(value, CONTROL_TYPES, "control type")
+
+    @field_validator("when", mode="before")
+    @classmethod
+    def _normalize_when(cls, value: Any) -> str | None:
+        return _normalize_condition(value)
+
+    @field_validator("evidence", mode="after")
+    @classmethod
+    def _validate_evidence(cls, values: list[str]) -> list[str]:
+        return _require_non_empty_evidence(values, "Controls")
+
+
+class SignalProbe(ContractBaseModel):
+    kind: str
+    name: str
+
+    @field_validator("kind", mode="after")
+    @classmethod
+    def _validate_kind(cls, value: str) -> str:
+        return _validate_enum(value, PROBE_KINDS, "probe kind")
+
+    @field_validator("name", mode="after")
+    @classmethod
+    def _validate_name(cls, value: str) -> str:
+        text = str(value).strip()
+        if not text:
+            raise ValueError("Probe name must not be empty")
+        return text
 
 
 class Signal(ContractBaseModel):
     id: str
+    target: str
     metric: str
-    resource: ResourceType
     indicates: str
     probe: SignalProbe
-    source_refs: list[str]
+    when: str | None = None
+    evidence: list[str]
 
-    @field_validator("source_refs", mode="after")
+    @field_validator("when", mode="before")
     @classmethod
-    def _normalize_string_lists(cls, values: list[str]) -> list[str]:
-        return _clean_strings(values)
+    def _normalize_when(cls, value: Any) -> str | None:
+        return _normalize_condition(value)
 
-    @model_validator(mode="after")
-    def _require_source_refs(self) -> "Signal":
-        if not self.source_refs:
-            raise ValueError("Signals require source_refs")
-        return self
+    @field_validator("evidence", mode="after")
+    @classmethod
+    def _validate_evidence(cls, values: list[str]) -> list[str]:
+        return _require_non_empty_evidence(values, "Signals")
 
 
 class Recipe(ContractBaseModel):
     id: str
-    hypothesis_kind: RecipeHypothesisKind
+    hypothesis_kind: str = Field(alias="for", serialization_alias="for")
     collect: list[str] = Field(default_factory=list)
-    control_refs: list[str] = Field(default_factory=list)
     actions: list[str] = Field(default_factory=list)
-    accept_if: str
-    rollback_if: str
-    source_refs: list[str]
+    accept: str
+    rollback: str
+    when: str | None = None
+    evidence: list[str]
 
-    @field_validator("collect", "control_refs", "actions", "source_refs", mode="after")
+    @field_validator("hypothesis_kind", mode="after")
     @classmethod
-    def _normalize_string_lists(cls, values: list[str]) -> list[str]:
+    def _validate_hypothesis_kind(cls, value: str) -> str:
+        return _validate_enum(value, HYPOTHESIS_KINDS, "hypothesis kind")
+
+    @field_validator("collect", "actions", mode="after")
+    @classmethod
+    def _normalize_lists(cls, values: list[str]) -> list[str]:
         return _clean_strings(values)
 
+    @field_validator("when", mode="before")
+    @classmethod
+    def _normalize_when(cls, value: Any) -> str | None:
+        return _normalize_condition(value)
+
+    @field_validator("evidence", mode="after")
+    @classmethod
+    def _validate_evidence(cls, values: list[str]) -> list[str]:
+        return _require_non_empty_evidence(values, "Recipes")
+
     @model_validator(mode="after")
-    def _require_recipe_content(self) -> "Recipe":
+    def _validate_content(self) -> "Recipe":
         if not self.collect:
-            raise ValueError("Recipes require at least one collected signal")
+            raise ValueError("Recipes must collect at least one signal")
         if not self.actions:
-            raise ValueError("Recipes require at least one action")
-        if not self.source_refs:
-            raise ValueError("Recipes require source_refs")
+            raise ValueError("Recipes must include at least one action")
         return self
 
 
 class LibraryContract(ContractBaseModel):
-    version: Literal["lpcl/v0"] = CONTRACT_VERSION
+    version: Literal["lpcl/v1"] = CONTRACT_VERSION
     contract: str
-    contract_type: Literal["library"] = "library"
-    source_artifacts: list[SourceArtifact] = Field(default_factory=list)
+    contract_type: Literal["library"] = Field(
+        default="library", alias="type", serialization_alias="type"
+    )
+    components: list[Component] = Field(default_factory=list)
     uses: list[ResourceUse] = Field(default_factory=list)
     assumptions: list[Assumption] = Field(default_factory=list)
     controls: list[Control] = Field(default_factory=list)
     signals: list[Signal] = Field(default_factory=list)
     recipes: list[Recipe] = Field(default_factory=list)
+    source_artifacts: list[SourceArtifact] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def _require_sections(self) -> "LibraryContract":
-        if not self.source_artifacts:
-            raise ValueError("source_artifacts must not be empty")
-        if not self.uses:
-            raise ValueError("uses must not be empty")
-        if not self.controls:
-            raise ValueError("controls must not be empty")
-        if not self.signals:
-            raise ValueError("signals must not be empty")
+    def _validate_graph(self) -> "LibraryContract":
+        issues: list[str] = []
+        issues.extend(_duplicate_id_errors("component", [item.id for item in self.components]))
+        issues.extend(_duplicate_id_errors("use", [item.id for item in self.uses]))
+        issues.extend(_duplicate_id_errors("assumption", [item.id for item in self.assumptions]))
+        issues.extend(_duplicate_id_errors("control", [item.id for item in self.controls]))
+        issues.extend(_duplicate_id_errors("signal", [item.id for item in self.signals]))
+        issues.extend(_duplicate_id_errors("recipe", [item.id for item in self.recipes]))
+
+        component_ids = {item.id for item in self.components}
+        signal_ids = {item.id for item in self.signals}
+
+        for item in self.uses:
+            if item.by not in component_ids:
+                issues.append(f"Use {item.id} references missing component {item.by}.")
+
+        for control in self.controls:
+            if not _target_exists(control.target, self):
+                if control.target == "cpu.thread" and _looks_like_worker_control(control.name):
+                    issues.append(
+                        f"Control {control.name} should target an executor workers attribute, not cpu.thread."
+                    )
+                elif control.target == "worker.pool":
+                    issues.append(
+                        f"Control {control.name} should target a component or component attribute, not worker.pool."
+                    )
+                else:
+                    issues.append(f"Control {control.id} targets nonexistent {control.target}.")
+            elif not _resources_for_target(control.target, self):
+                issues.append(
+                    f"Control {control.id} target {control.target} could not be mapped to a resource."
+                )
+            elif _looks_like_worker_control(control.name) and not control.target.endswith(
+                ".workers"
+            ):
+                issues.append(
+                    f"Control {control.name} should target an executor workers attribute, not {control.target}."
+                )
+
+        for signal in self.signals:
+            if not _target_exists(signal.target, self):
+                issues.append(f"Signal {signal.id} targets nonexistent {signal.target}.")
+
+        for recipe in self.recipes:
+            missing_signals = [item for item in recipe.collect if item not in signal_ids]
+            if missing_signals:
+                issues.append(
+                    f"Recipe {recipe.id} collects missing signals: {', '.join(sorted(missing_signals))}."
+                )
+
+        if issues:
+            raise ValueError("; ".join(issues))
         return self
 
 
@@ -414,36 +731,70 @@ class ContractInstance(ContractBaseModel):
 
 
 class SharedResourceItem(ContractBaseModel):
-    resource: ResourceType
-    phase: PhaseName
-    libraries: list[str] = Field(default_factory=list)
-    use_refs: list[str] = Field(default_factory=list)
-    source_refs: list[str]
+    resource: str
+    phase: str
+    contracts: list[str] = Field(default_factory=list)
+    components: list[str] = Field(default_factory=list)
+    uses: list[str] = Field(default_factory=list)
+    evidence: list[str] = Field(default_factory=list)
 
-    @field_validator("libraries", "use_refs", "source_refs", mode="after")
+    @field_validator("resource", mode="after")
     @classmethod
-    def _normalize_string_lists(cls, values: list[str]) -> list[str]:
+    def _validate_resource_value(cls, value: str) -> str:
+        return _validate_resource(value)
+
+    @field_validator("phase", mode="after")
+    @classmethod
+    def _validate_phase(cls, value: str) -> str:
+        return _validate_enum(value, PHASES, "phase")
+
+    @field_validator("contracts", "components", "uses", "evidence", mode="after")
+    @classmethod
+    def _normalize_lists(cls, values: list[str]) -> list[str]:
         return _clean_strings(values)
 
 
 class HypothesisOverlap(ContractBaseModel):
     uses: list[str] = Field(default_factory=list)
+    components: list[str] = Field(default_factory=list)
+    contracts: list[str] = Field(default_factory=list)
 
-    @field_validator("uses", mode="after")
+    @field_validator("uses", "components", "contracts", mode="after")
     @classmethod
-    def _normalize_string_lists(cls, values: list[str]) -> list[str]:
+    def _normalize_lists(cls, values: list[str]) -> list[str]:
+        return _clean_strings(values)
+
+
+class AssumptionViolation(ContractBaseModel):
+    assumption: str
+    conflicting_uses: list[str] = Field(default_factory=list)
+
+    @field_validator("conflicting_uses", mode="after")
+    @classmethod
+    def _normalize_lists(cls, values: list[str]) -> list[str]:
+        return _clean_strings(values)
+
+
+class ControlCollision(ContractBaseModel):
+    resource: str
+    dimension: str
+    controls: list[str] = Field(default_factory=list)
+
+    @field_validator("resource", mode="after")
+    @classmethod
+    def _validate_resource_value(cls, value: str) -> str:
+        return _validate_resource(value)
+
+    @field_validator("controls", mode="after")
+    @classmethod
+    def _normalize_lists(cls, values: list[str]) -> list[str]:
         return _clean_strings(values)
 
 
 class HypothesisBasis(ContractBaseModel):
     overlaps: list[HypothesisOverlap] = Field(default_factory=list)
-    violated_assumptions: list[str] = Field(default_factory=list)
-    colliding_controls: list[str] = Field(default_factory=list)
-
-    @field_validator("violated_assumptions", "colliding_controls", mode="after")
-    @classmethod
-    def _normalize_string_lists(cls, values: list[str]) -> list[str]:
-        return _clean_strings(values)
+    assumption_violations: list[AssumptionViolation] = Field(default_factory=list)
+    control_collisions: list[ControlCollision] = Field(default_factory=list)
 
 
 class HypothesisValidation(ContractBaseModel):
@@ -451,46 +802,71 @@ class HypothesisValidation(ContractBaseModel):
 
     @field_validator("collect", mode="after")
     @classmethod
-    def _normalize_string_lists(cls, values: list[str]) -> list[str]:
+    def _normalize_lists(cls, values: list[str]) -> list[str]:
         return _clean_strings(values)
 
 
 class ConflictHypothesis(ContractBaseModel):
     id: str
-    kind: ConflictHypothesisKind
-    resource: ResourceType
-    phase: PhaseName
-    libraries: list[str] = Field(default_factory=list)
+    kind: str
+    resource: str
+    phase: str
+    contracts: list[str] = Field(default_factory=list)
+    components: list[str] = Field(default_factory=list)
+    uses: list[str] = Field(default_factory=list)
     basis: HypothesisBasis
     validation: HypothesisValidation = Field(alias="validate", serialization_alias="validate")
-    candidate_control_refs: list[str] = Field(default_factory=list)
-    candidate_recipe_refs: list[str] = Field(default_factory=list)
-    source_refs: list[str]
+    candidate_actions: list[str] = Field(default_factory=list)
+    recipes: list[str] = Field(default_factory=list)
+    evidence: list[str] = Field(default_factory=list)
+
+    @field_validator("kind", mode="after")
+    @classmethod
+    def _validate_kind(cls, value: str) -> str:
+        return _validate_enum(value, HYPOTHESIS_KINDS, "hypothesis kind")
+
+    @field_validator("resource", mode="after")
+    @classmethod
+    def _validate_resource_value(cls, value: str) -> str:
+        return _validate_resource(value)
+
+    @field_validator("phase", mode="after")
+    @classmethod
+    def _validate_phase(cls, value: str) -> str:
+        return _validate_enum(value, PHASE_OR_MIXED, "hypothesis phase")
 
     @field_validator(
-        "libraries",
-        "candidate_control_refs",
-        "candidate_recipe_refs",
-        "source_refs",
-        mode="after",
+        "contracts", "components", "uses", "candidate_actions", "recipes", "evidence", mode="after"
     )
     @classmethod
-    def _normalize_string_lists(cls, values: list[str]) -> list[str]:
+    def _normalize_lists(cls, values: list[str]) -> list[str]:
         return _clean_strings(values)
 
     @model_validator(mode="after")
-    def _require_hypothesis_content(self) -> "ConflictHypothesis":
-        if not self.libraries:
-            raise ValueError("Conflict hypotheses require libraries")
-        if not self.source_refs:
-            raise ValueError("Conflict hypotheses require source_refs")
+    def _validate_content(self) -> "ConflictHypothesis":
+        if not self.contracts:
+            raise ValueError("Conflict hypotheses must include contracts")
+        if not self.components:
+            raise ValueError("Conflict hypotheses must include components")
+        if not self.uses:
+            raise ValueError("Conflict hypotheses must include uses")
+        if not self.validation.collect:
+            raise ValueError("Conflict hypotheses must include validation signals")
+        if (
+            not self.basis.overlaps
+            and not self.basis.assumption_violations
+            and not self.basis.control_collisions
+        ):
+            raise ValueError("Conflict hypotheses must include supporting basis items")
         return self
 
 
 class ComposedContract(ContractBaseModel):
-    version: Literal["lpcl/v0"] = CONTRACT_VERSION
+    version: Literal["lpcl/v1"] = CONTRACT_VERSION
     contract: str
-    contract_type: Literal["composed"] = "composed"
+    contract_type: Literal["composed"] = Field(
+        default="composed", alias="type", serialization_alias="type"
+    )
     selected_contracts: list[str] = Field(default_factory=list)
     contract_instances: list[ContractInstance] = Field(default_factory=list)
     shared_resources: list[SharedResourceItem] = Field(default_factory=list)
@@ -498,11 +874,11 @@ class ComposedContract(ContractBaseModel):
 
     @field_validator("selected_contracts", mode="after")
     @classmethod
-    def _normalize_string_lists(cls, values: list[str]) -> list[str]:
+    def _normalize_selected_contracts(cls, values: list[str]) -> list[str]:
         return _clean_strings(values)
 
     @model_validator(mode="after")
-    def _require_selected_contracts(self) -> "ComposedContract":
+    def _validate_contract_instances(self) -> "ComposedContract":
         if not self.selected_contracts:
             raise ValueError("selected_contracts must not be empty")
         if not self.contract_instances:
@@ -533,7 +909,7 @@ class ContractVerificationResult(ContractBaseModel):
 
     @field_validator("issues", mode="after")
     @classmethod
-    def _normalize_verification_issues(cls, values: list[str]) -> list[str]:
+    def _normalize_issues(cls, values: list[str]) -> list[str]:
         return _clean_strings(values)
 
 

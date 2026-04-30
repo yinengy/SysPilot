@@ -1,111 +1,104 @@
-import json
-from pathlib import Path
 from textwrap import dedent
 
 import pytest
 
 from syspilot_contract.checker import dump_contract_yaml, validate_contract_text
+from syspilot_contract.migration import migrate_contract_payload
 from syspilot_contract.schemas import LibraryContract, SourceArtifact
 from syspilot_contract.synthesize_contract import synthesize_library_contract
 from syspilot_manual.schemas import EvidenceItem
 
 
-def _library_contract() -> LibraryContract:
-    return LibraryContract.model_validate(
-        {
-            "contract": "OpenMP",
-            "version": "lpcl/v0",
-            "contract_type": "library",
-            "source_artifacts": [{"source_id": "doc_001", "path": "docs/openmp.md", "kind": "doc"}],
-            "uses": [
-                {
-                    "id": "threads",
-                    "resource": "cpu.thread",
-                    "phase": "compute",
-                    "scope": "process",
-                    "role": "consume",
-                    "sharing": "partitionable",
-                    "demand": {
-                        "kind": "scaled_by",
-                        "knob": "OMP_NUM_THREADS",
-                        "lower": 1,
-                        "upper": "host.physical_cores",
-                    },
-                    "source_refs": ["doc_001:chunk_001"],
-                }
-            ],
-            "assumptions": [
-                {
-                    "id": "solo_compute_pool",
-                    "predicate": {
-                        "kind": "max_competitors",
-                        "resource": "cpu.thread",
-                        "phase": "compute",
-                        "value": 1,
-                    },
-                    "source_refs": ["doc_001:chunk_001"],
-                }
-            ],
-            "controls": [
-                {
-                    "id": "omp_num_threads",
-                    "name": "OMP_NUM_THREADS",
-                    "kind": "env",
-                    "type": "int",
-                    "affects": ["threads"],
-                    "effect": {
-                        "op": "increase",
-                        "resource": "cpu.thread",
-                        "strength": "strong",
-                    },
-                    "scope": "process",
-                    "source_refs": ["doc_001:chunk_001"],
-                }
-            ],
-            "signals": [
-                {
-                    "id": "display_env",
-                    "metric": "openmp.display_env",
-                    "resource": "cpu.thread",
-                    "indicates": "effective thread settings",
-                    "probe": {"kind": "runtime_env", "target": "OMP_DISPLAY_ENV"},
-                    "source_refs": ["doc_001:chunk_001"],
-                }
-            ],
-            "recipes": [
-                {
-                    "id": "reduce_oversubscription",
-                    "hypothesis_kind": "shared_resource_conflict",
-                    "collect": ["display_env"],
-                    "control_refs": ["omp_num_threads"],
-                    "actions": ["decrease OMP_NUM_THREADS"],
-                    "accept_if": "throughput improves",
-                    "rollback_if": "throughput regresses",
-                    "source_refs": ["doc_001:chunk_001"],
-                }
-            ],
-        }
-    )
+def _openblas_contract_payload() -> dict[str, object]:
+    return {
+        "version": "lpcl/v1",
+        "contract": "OpenBLAS",
+        "type": "library",
+        "components": [
+            {
+                "id": "blas_threads",
+                "kind": "executor",
+                "attrs": {
+                    "executor_kind": "thread_pool",
+                    "backend": "unknown",
+                    "workers": {"min": 1, "max": "host.cpu_slots"},
+                },
+                "evidence": ["doc_001:chunk_001"],
+            }
+        ],
+        "uses": [
+            {
+                "id": "blas_cpu_compute",
+                "resource": "cpu.compute",
+                "by": "blas_threads",
+                "phase": "compute",
+                "scope": "process",
+                "demand": {"dimension": "workers", "min": 1, "max": "host.cpu_slots"},
+                "share": "shared",
+                "evidence": ["doc_001:chunk_001"],
+            }
+        ],
+        "assumptions": [
+            {
+                "id": "avoid_nested_parallelism",
+                "resource": "cpu.compute",
+                "predicate": {"kind": "not_nested"},
+                "evidence": ["doc_001:chunk_001"],
+            }
+        ],
+        "controls": [
+            {
+                "id": "openblas_num_threads",
+                "name": "OPENBLAS_NUM_THREADS",
+                "kind": "env",
+                "type": "int",
+                "target": "blas_threads.workers",
+                "effect": {"kind": "set", "value": "input"},
+                "evidence": ["doc_001:chunk_001"],
+            }
+        ],
+        "signals": [
+            {
+                "id": "openblas_num_threads_signal",
+                "target": "blas_threads.workers",
+                "metric": "active_thread_count",
+                "indicates": "effective_worker_count",
+                "probe": {"kind": "api", "name": "openblas_get_num_threads"},
+                "evidence": ["doc_001:chunk_001"],
+            }
+        ],
+        "recipes": [
+            {
+                "id": "avoid_nested_parallel_oversubscription",
+                "for": "shared_cpu_compute_conflict",
+                "collect": ["openblas_num_threads_signal"],
+                "actions": ["set OPENBLAS_NUM_THREADS to 1"],
+                "accept": "effective_worker_count == 1 and throughput_not_worse",
+                "rollback": "throughput_worse",
+                "evidence": ["doc_001:chunk_001"],
+            }
+        ],
+    }
 
 
 def test_contract_yaml_round_trip_validates() -> None:
-    contract = _library_contract()
+    contract = LibraryContract.model_validate(_openblas_contract_payload())
     parsed, result = validate_contract_text(dump_contract_yaml(contract))
 
     assert result.valid is True
     assert parsed is not None
-    assert getattr(parsed, "contract", None) == "OpenMP"
+    assert getattr(parsed, "contract", None) == "OpenBLAS"
 
 
 def test_checker_rejects_duplicate_yaml_keys() -> None:
     _, result = validate_contract_text(
         dedent(
             """
-            contract: OpenMP
+            contract: OpenBLAS
             contract: Duplicate
-            version: lpcl/v0
-            contract_type: library
-            source_artifacts: []
+            version: lpcl/v1
+            type: library
+            components: []
             uses: []
             assumptions: []
             controls: []
@@ -119,269 +112,310 @@ def test_checker_rejects_duplicate_yaml_keys() -> None:
     assert any("duplicate key 'contract'" in issue for issue in result.issues)
 
 
-def test_checker_reports_semantic_reference_errors() -> None:
+def test_validator_rejects_worker_pool_resource() -> None:
     _, result = validate_contract_text(
         dedent(
             """
-            version: lpcl/v0
-            contract: OpenMP
-            contract_type: library
-            source_artifacts:
-              - source_id: doc_001
-                path: docs/openmp.md
-                kind: doc
+        version: lpcl/v1
+        contract: OpenBLAS
+        type: library
+        components:
+          - id: blas_threads
+            kind: executor
+            attrs: {}
+            evidence: [doc_001:chunk_001]
+        uses:
+          - id: blas_worker_pool
+            resource: worker.pool
+            by: blas_threads
+            phase: compute
+            scope: process
+            demand:
+              dimension: workers
+              min: 1
+              max: host.cpu_slots
+            share: shared
+            evidence: [doc_001:chunk_001]
+        assumptions: []
+        controls: []
+        signals: []
+        recipes: []
+        """
+        )
+    )
+
+    assert result.valid is False
+    assert any("worker.pool is a component, not a resource" in issue for issue in result.issues)
+
+
+def test_validator_rejects_cpu_thread_resource() -> None:
+    _, result = validate_contract_text(
+        dedent(
+            """
+            version: lpcl/v1
+            contract: OpenBLAS
+            type: library
+            components:
+              - id: blas_threads
+                kind: executor
+                attrs: {}
+                evidence: [doc_001:chunk_001]
             uses:
-              - id: threads
+              - id: blas_cpu_threads
                 resource: cpu.thread
+                by: blas_threads
                 phase: compute
                 scope: process
-                role: consume
-                sharing: partitionable
                 demand:
-                  kind: scaled_by
-                  knob: OMP_NUM_THREADS
-                  lower: 1
-                  upper: host.physical_cores
-                source_refs: ["doc_001:chunk_001"]
+                  dimension: workers
+                  min: 1
+                  max: host.cpu_slots
+                share: shared
+                evidence: [doc_001:chunk_001]
             assumptions: []
-            controls:
-              - id: omp_num_threads
-                name: OMP_NUM_THREADS
-                kind: env
-                type: int
-                affects: [missing_use]
-                effect:
-                  op: increase
-                  resource: cpu.thread
-                  strength: strong
-                scope: process
-                source_refs: ["doc_001:chunk_001"]
-            signals:
-              - id: display_env
-                metric: openmp.display_env
-                resource: cpu.thread
-                indicates: effective thread settings
-                probe:
-                  kind: runtime_env
-                  target: OMP_DISPLAY_ENV
-                source_refs: ["doc_001:chunk_001"]
-            recipes:
-              - id: reduce_oversubscription
-                hypothesis_kind: shared_resource_conflict
-                collect: [missing_signal]
-                control_refs: [missing_control]
-                actions: ["decrease OMP_NUM_THREADS"]
-                accept_if: throughput improves
-                rollback_if: throughput regresses
-                source_refs: ["doc_001:chunk_001"]
+            controls: []
+            signals: []
+            recipes: []
             """
         )
     )
 
     assert result.valid is False
-    assert any("affects unknown uses" in issue for issue in result.issues)
-    assert any("collects unknown signals" in issue for issue in result.issues)
-    assert any("references unknown controls" in issue for issue in result.issues)
+    assert any(
+        "Use resource cpu.compute with demand.dimension = workers" in issue
+        for issue in result.issues
+    )
 
 
-class _FakeContractLLM:
-    def __init__(self, response: str) -> None:
-        self.response = response
+def test_validator_rejects_missing_evidence() -> None:
+    _, result = validate_contract_text(
+        dedent(
+            """
+            version: lpcl/v1
+            contract: OpenBLAS
+            type: library
+            components:
+              - id: blas_threads
+                kind: executor
+                attrs: {}
+                evidence: [doc_001:chunk_001]
+            uses:
+              - id: blas_cpu_compute
+                resource: cpu.compute
+                by: blas_threads
+                phase: compute
+                scope: process
+                demand:
+                  dimension: workers
+                  min: 1
+                  max: host.cpu_slots
+                share: shared
+                evidence: []
+            assumptions: []
+            controls: []
+            signals: []
+            recipes: []
+            """
+        )
+    )
 
+    assert result.valid is False
+
+
+def test_validator_rejects_use_referencing_missing_component() -> None:
+    _, result = validate_contract_text(
+        dedent(
+            """
+            version: lpcl/v1
+            contract: OpenBLAS
+            type: library
+            components: []
+            uses:
+              - id: blas_cpu_compute
+                resource: cpu.compute
+                by: nonexistent_executor
+                phase: compute
+                scope: process
+                demand:
+                  dimension: workers
+                  min: 1
+                  max: host.cpu_slots
+                share: shared
+                evidence: [doc_001:chunk_001]
+            assumptions: []
+            controls: []
+            signals: []
+            recipes: []
+            """
+        )
+    )
+
+    assert result.valid is False
+    assert any(
+        "references missing component nonexistent_executor" in issue for issue in result.issues
+    )
+
+
+def test_validator_rejects_recipe_collecting_missing_signal() -> None:
+    _, result = validate_contract_text(
+        dedent(
+            """
+            version: lpcl/v1
+            contract: OpenBLAS
+            type: library
+            components:
+              - id: blas_threads
+                kind: executor
+                attrs: {}
+                evidence: [doc_001:chunk_001]
+            uses:
+              - id: blas_cpu_compute
+                resource: cpu.compute
+                by: blas_threads
+                phase: compute
+                scope: process
+                demand:
+                  dimension: workers
+                  min: 1
+                  max: host.cpu_slots
+                share: shared
+                evidence: [doc_001:chunk_001]
+            assumptions: []
+            controls: []
+            signals: []
+            recipes:
+              - id: avoid_nested_parallel_oversubscription
+                for: shared_cpu_compute_conflict
+                collect: [missing_signal]
+                actions: [set OPENBLAS_NUM_THREADS to 1]
+                accept: effective_worker_count == 1 and throughput_not_worse
+                rollback: throughput_worse
+                evidence: [doc_001:chunk_001]
+            """
+        )
+    )
+
+    assert result.valid is False
+    assert any("collects missing signals" in issue for issue in result.issues)
+
+
+def test_old_schema_migration_maps_cpu_thread_to_cpu_compute_workers() -> None:
+    migrated = migrate_contract_payload(
+        {
+            "version": "lpcl/v0",
+            "contract": "OpenMP",
+            "contract_type": "library",
+            "source_artifacts": [],
+            "uses": [
+                {
+                    "id": "threads",
+                    "resource": "cpu.thread",
+                    "phase": "compute",
+                    "scope": "process",
+                    "role": "consume",
+                    "sharing": "partitionable",
+                    "demand": {
+                        "kind": "scaled_by",
+                        "knob": "OMP_NUM_THREADS",
+                        "lower": 1,
+                        "upper": "host.cpu_slots",
+                    },
+                    "source_refs": ["doc_001:chunk_001"],
+                }
+            ],
+            "assumptions": [],
+            "controls": [
+                {
+                    "id": "omp_num_threads",
+                    "name": "OMP_NUM_THREADS",
+                    "kind": "env",
+                    "type": "int",
+                    "affects": ["threads"],
+                    "effect": {"op": "increase", "resource": "cpu.thread", "strength": "strong"},
+                    "scope": "process",
+                    "source_refs": ["doc_001:chunk_001"],
+                }
+            ],
+            "signals": [],
+            "recipes": [],
+        }
+    )
+
+    assert migrated["version"] == "lpcl/v1"
+    assert migrated["uses"][0]["resource"] == "cpu.compute"  # type: ignore[index]
+    assert migrated["uses"][0]["demand"]["dimension"] == "workers"  # type: ignore[index]
+    assert str(migrated["controls"][0]["target"]).endswith(".workers")  # type: ignore[index]
+
+
+class _YamlContractLLM:
     async def complete_prompt(self, prompt_name: str, payload: dict[str, object]) -> str:
         _ = payload
         if prompt_name == "verify_contract.txt":
-            return json.dumps(
-                {
-                    "valid": False,
-                    "issues": ["unable to repair"],
-                    "repaired_contract": json.loads(self.response),
-                }
-            )
-        return self.response
-
-
-class _RepairingContractLLM:
-    def __init__(self, repaired_contract: dict[str, object]) -> None:
-        self.repaired_contract = repaired_contract
-        self.prompt_names: list[str] = []
-
-    async def complete_prompt(self, prompt_name: str, payload: dict[str, object]) -> str:
-        self.prompt_names.append(prompt_name)
-        if prompt_name == "synthesize_contract.txt":
-            return json.dumps(
-                {
-                    "contract": "ignored",
-                    "version": "lpcl/v0",
-                    "contract_type": "library",
-                    "source_artifacts": [
-                        {"source_id": "doc_001", "path": "docs/openmp.md", "kind": "doc"}
-                    ],
-                    "uses": [
-                        {
-                            "id": "threads",
-                            "resource": "cpu.thread",
-                            "phase": "compute",
-                            "scope": "process",
-                            "role": "consume",
-                            "sharing": "partitionable",
-                            "demand": {
-                                "kind": "scaled_by",
-                                "knob": "OMP_NUM_THREADS",
-                                "lower": 1,
-                                "upper": "visible processors",
-                            },
-                            "source_refs": ["doc_001:chunk_001"],
-                        }
-                    ],
-                    "assumptions": [],
-                    "controls": [
-                        {
-                            "id": "omp_num_threads",
-                            "name": "OMP_NUM_THREADS",
-                            "kind": "env",
-                            "type": "integer",
-                            "affects": ["missing_use"],
-                            "effect": {
-                                "op": "increase",
-                                "resource": "cpu.thread",
-                                "strength": "strong",
-                            },
-                            "scope": "process",
-                            "source_refs": ["doc_001:chunk_001"],
-                        }
-                    ],
-                    "signals": [
-                        {
-                            "id": "display_env",
-                            "metric": "openmp.display_env",
-                            "resource": "cpu.thread",
-                            "indicates": "effective thread settings",
-                            "tool": "OMP_DISPLAY_ENV",
-                            "source_refs": ["doc_001:chunk_001"],
-                        }
-                    ],
-                    "recipes": [
-                        {
-                            "id": "repair_me",
-                            "hypothesis_kind": "shared_cpu_thread_conflict",
-                            "collect": ["missing_signal"],
-                            "control_refs": ["missing_control"],
-                            "actions": ["decrease OMP_NUM_THREADS"],
-                            "accept_if": "throughput improves",
-                            "rollback_if": "throughput regresses",
-                            "source_refs": ["doc_001:chunk_001"],
-                        }
-                    ],
-                }
-            )
-        if prompt_name == "verify_contract.txt":
-            invalid_sections = payload.get("invalid_sections")
-            assert isinstance(invalid_sections, list)
-            assert "controls" in invalid_sections or "recipes" in invalid_sections
-            return json.dumps(
-                {
-                    "valid": False,
-                    "issues": ["repaired invalid refs"],
-                    "repaired_contract": self.repaired_contract,
-                }
-            )
-        raise AssertionError(prompt_name)
-
-
-@pytest.mark.asyncio
-async def test_synthesizer_fails_when_incomplete_recipes_cannot_be_repaired() -> None:
-    llm = _FakeContractLLM(
-        """
-        {
-          "contract": "ignored",
-          "version": "lpcl/v0",
-          "contract_type": "library",
-          "source_artifacts": [{"source_id": "doc_001", "path": "docs/openmp.md", "kind": "doc"}],
-          "uses": [{
-            "id": "threads",
-            "resource": "cpu.thread",
-            "phase": "compute",
-            "scope": "process",
-            "role": "consume",
-            "sharing": "partitionable",
-            "demand": {"kind": "scaled_by", "knob": "OMP_NUM_THREADS", "lower": 1, "upper": "host.physical_cores"},
-            "source_refs": ["doc_001:chunk_001"]
-          }],
-          "assumptions": [],
-          "controls": [{
-            "id": "omp_num_threads",
-            "name": "OMP_NUM_THREADS",
-            "kind": "env",
-            "type": "int",
-            "affects": ["threads"],
-            "effect": {"op": "increase", "resource": "cpu.thread", "strength": "strong"},
-            "scope": "process",
-            "source_refs": ["doc_001:chunk_001"]
-          }],
-          "signals": [{
-            "id": "display_env",
-            "metric": "openmp.display_env",
-            "resource": "cpu.thread",
-            "indicates": "effective thread settings",
-            "tool": "OMP_DISPLAY_ENV",
-            "source_refs": ["doc_001:chunk_001"]
-          }],
-          "recipes": [
-            {
-              "id": "drop_me",
-              "hypothesis_kind": "shared_cpu_thread_conflict",
-              "collect": [],
-              "control_refs": [],
-              "actions": ["decrease OMP_NUM_THREADS"],
-              "accept_if": "throughput improves",
-              "rollback_if": "throughput regresses",
-              "source_refs": ["doc_001:chunk_001"]
-            },
-            {
-              "id": "keep_me",
-              "hypothesis_kind": "shared_cpu_thread_conflict",
-              "collect": ["display_env"],
-              "control_refs": [],
-              "actions": ["decrease OMP_NUM_THREADS"],
-              "accept_if": "throughput improves",
-              "rollback_if": "throughput regresses",
-              "source_refs": ["doc_001:chunk_001"]
-            }
-          ]
-        }
-        """
-    )
-
-    with pytest.raises(ValueError, match="Contract verification failed after repair attempts"):
-        await synthesize_library_contract(
-            "OpenMP",
-            [SourceArtifact(source_id="doc_001", path="docs/openmp.md", kind="doc")],
-            [
-                EvidenceItem.model_validate(
-                    {
-                        "evidence_id": "ev_001",
-                        "library_name": "OpenMP",
-                        "chunk_id": "doc_001:chunk_001",
-                        "kind": "intervention",
-                        "title": "Tune threads",
-                        "content": "Set OMP_NUM_THREADS carefully.",
-                        "keywords": ["OMP_NUM_THREADS"],
-                        "resource_domains": ["cpu_threads"],
-                        "source_quote": "Set OMP_NUM_THREADS carefully.",
-                        "source_refs": ["doc_001:chunk_001"],
-                    }
-                )
-            ],
-            llm,
+            raise AssertionError("verify should not be needed")
+        return dedent(
+            """
+            version: lpcl/v1
+            contract: ignored
+            type: library
+            components:
+              - id: omp_executor
+                kind: executor
+                attrs:
+                  workers: OMP_NUM_THREADS
+                evidence: [doc_001:chunk_001]
+            uses:
+              - id: omp_cpu_compute
+                resource: cpu.compute
+                by: omp_executor
+                phase: compute
+                scope: process
+                demand:
+                  dimension: workers
+                  min: 1
+                  max: OMP_NUM_THREADS
+                share: shared
+                evidence: [doc_001:chunk_001]
+            assumptions:
+              - id: placement_ok
+                resource: cpu.placement
+                predicate:
+                  kind: placement_compatible
+                  source: should_be_removed
+                evidence: [doc_001:chunk_001]
+            controls:
+              - id: ctl_omp_num_threads
+                name: OMP_NUM_THREADS
+                kind: env
+                type: string
+                target: omp_executor.attrs.workers
+                effect:
+                  kind: set
+                  value: OMP_NUM_THREADS
+                  resource: cpu.compute
+                evidence: [doc_001:chunk_001]
+            signals:
+              - id: sig_omp_display_env
+                target: omp_executor
+                metric: effective_runtime_settings
+                indicates: configured settings
+                probe:
+                  kind: log
+                  name: OMP_DISPLAY_ENV
+                evidence: [doc_001:chunk_001]
+            recipes:
+              - id: recipe_shared_cpu_compute_conflict
+                for: shared_cpu_compute_conflict
+                collect: [sig_omp_display_env]
+                actions: [Record effective settings]
+                accept: stable runtime
+                rollback: revert change
+                evidence: [doc_001:chunk_001]
+            """
         )
 
 
 @pytest.mark.asyncio
-async def test_synthesizer_repairs_invalid_contract_via_verify_prompt() -> None:
-    repaired_contract = _library_contract().model_dump(mode="json")
-    llm = _RepairingContractLLM(repaired_contract)
-
+async def test_synthesizer_accepts_yaml_and_canonicalizes_v1_fields() -> None:
     contract = await synthesize_library_contract(
         "OpenMP",
         [SourceArtifact(source_id="doc_001", path="docs/openmp.md", kind="doc")],
@@ -401,10 +435,12 @@ async def test_synthesizer_repairs_invalid_contract_via_verify_prompt() -> None:
                 }
             )
         ],
-        llm,
+        _YamlContractLLM(),
     )
 
-    assert llm.prompt_names == ["synthesize_contract.txt", "verify_contract.txt"]
-    assert contract.controls[0].affects == ["threads"]
-    assert contract.recipes[0].collect == ["display_env"]
-    assert contract.signals[0].probe.target == "OMP_DISPLAY_ENV"
+    assert contract.controls[0].target == "omp_executor.workers"
+    assert contract.controls[0].effect.model_dump(mode="json", exclude_none=True) == {
+        "kind": "set",
+        "value": "OMP_NUM_THREADS",
+    }
+    assert contract.assumptions[0].predicate == {"kind": "placement_compatible"}

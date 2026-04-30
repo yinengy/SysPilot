@@ -2,101 +2,30 @@ from __future__ import annotations
 
 from collections import defaultdict
 from copy import deepcopy
-import re
 from typing import Any
 
 from pydantic import ValidationError
 
-from syspilot_contract.checker import check_contract
+from syspilot_contract.checker import check_contract, parse_contract_yaml
 from syspilot_contract.schemas import (
+    COMPONENT_KINDS,
+    CONTRACT_VERSION,
+    CONTROL_KINDS,
+    CONTROL_TYPES,
     ContractVerificationResult,
+    EFFECT_KINDS,
+    HYPOTHESIS_KINDS,
     LibraryContract,
+    PHASES,
+    PREDICATE_KINDS,
+    PROBE_KINDS,
+    RESOURCE_TYPES,
+    SCOPES,
+    SHARE_MODES,
     SourceArtifact,
 )
-from syspilot_manual.llm_client import ManualLLMProtocol, extract_json_object
+from syspilot_manual.llm_client import ManualLLMProtocol
 from syspilot_manual.schemas import EvidenceItem
-
-
-_HOST_SYMBOL_ALIASES = {
-    "host.physical_cores": "host.physical_cores",
-    "physical cores": "host.physical_cores",
-    "physical core count": "host.physical_cores",
-    "host.visible_cpus": "host.visible_cpus",
-    "visible cpus": "host.visible_cpus",
-    "visible cpu count": "host.visible_cpus",
-    "visible processors": "host.visible_cpus",
-    "visible processor count": "host.visible_cpus",
-    "available cpus": "host.visible_cpus",
-    "host.numa_nodes": "host.numa_nodes",
-    "numa nodes": "host.numa_nodes",
-    "available numa nodes": "host.numa_nodes",
-}
-
-_CONTROL_TYPE_ALIASES = {
-    "int": "int",
-    "integer": "int",
-    "bool": "bool",
-    "boolean": "bool",
-    "enum": "enum",
-    "string": "string",
-    "cpu_set": "cpu_set",
-    "cpuset": "cpu_set",
-    "numa_node_set": "numa_node_set",
-    "numa nodes": "numa_node_set",
-    "thread_count": "int",
-    "parallelism_cap": "int",
-    "nested_parallelism_cap": "int",
-    "wait_policy": "enum",
-    "affinity_policy": "enum",
-    "placement_set": "string",
-    "runtime_specific_affinity": "enum",
-    "hardware_subset": "string",
-    "observability": "bool",
-    "observability_format": "string",
-    "numa_node_cpu_binding": "numa_node_set",
-    "physical_cpu_binding": "cpu_set",
-    "strict_memory_binding": "numa_node_set",
-    "preferred_memory_policy": "numa_node_set",
-    "local_memory_preference": "bool",
-    "interleaved_memory_policy": "numa_node_set",
-}
-
-_KNOWN_CONTROL_TYPES = {
-    "OMP_NUM_THREADS": "int",
-    "OMP_THREAD_LIMIT": "int",
-    "OMP_MAX_ACTIVE_LEVELS": "int",
-    "OMP_PLACES": "string",
-    "OMP_PROC_BIND": "enum",
-    "GOMP_CPU_AFFINITY": "cpu_set",
-    "KMP_AFFINITY": "enum",
-    "KMP_HW_SUBSET": "string",
-    "KMP_BLOCKTIME": "int",
-    "OMP_DISPLAY_ENV": "enum",
-    "OMP_DISPLAY_AFFINITY": "bool",
-    "OMP_AFFINITY_FORMAT": "string",
-    "KMP_SETTINGS": "bool",
-    "--cpunodebind": "numa_node_set",
-    "--physcpubind": "cpu_set",
-    "--membind": "numa_node_set",
-    "--preferred": "numa_node_set",
-    "--localalloc": "bool",
-    "--interleave": "numa_node_set",
-}
-
-_KNOWN_CONTROL_ALLOWED_VALUES = {
-    "OMP_PROC_BIND": ["false", "true", "master", "close", "spread", "primary"],
-    "OMP_DISPLAY_ENV": ["false", "true", "verbose"],
-}
-
-_RECIPE_KIND_ALIASES = {
-    "shared_cpu_thread_conflict": "shared_resource_conflict",
-    "shared_resource_conflict": "shared_resource_conflict",
-    "baseline_validation": "baseline_validation",
-    "parameter_sweep": "parameter_sweep",
-    "validation": "validation",
-    "starting_point": "starting_point",
-    "comparison": "parameter_sweep",
-}
 
 
 def _clean_id_list(values: object) -> list[str]:
@@ -105,59 +34,14 @@ def _clean_id_list(values: object) -> list[str]:
     return [str(value).strip() for value in values if str(value).strip()]
 
 
-def _normalize_host_symbol(value: object) -> object:
-    if isinstance(value, int):
-        return value
-    text = str(value).strip()
-    alias = _HOST_SYMBOL_ALIASES.get(text.lower())
-    return alias or text
-
-
-def _normalize_activation_value(raw_value: object, control_type: str) -> str | int | bool | None:
-    if raw_value is None:
+def _normalize_condition(value: object) -> str | None:
+    if value is None:
         return None
-    if control_type == "int":
-        text = str(raw_value).strip()
-        if re.fullmatch(r"-?\d+", text):
-            return int(text)
-        return text
-    if control_type == "bool":
-        text = str(raw_value).strip().lower()
-        if text in {"1", "true", "yes", "on", "enabled"}:
-            return True
-        if text in {"0", "false", "no", "off", "disabled"}:
-            return False
-        return str(raw_value).strip()
-    return str(raw_value).strip()
-
-
-def _canonical_probe(tool_value: object) -> dict[str, str]:
-    text = str(tool_value).strip()
-    target = text.split("=", 1)[0].strip() if "=" in text else text
-    if text.startswith("/proc/"):
-        return {"kind": "procfs", "target": text}
-    if re.fullmatch(r"[A-Z0-9_]+=?.*", text) and "/" not in text and not text.startswith("--"):
-        return {"kind": "runtime_env", "target": target}
-    return {"kind": "command", "target": text}
-
-
-def _infer_control_refs(actions: list[str], controls: list[dict[str, Any]]) -> list[str]:
-    refs: list[str] = []
-    for control in controls:
-        control_id = str(control.get("id", "")).strip()
-        control_name = str(control.get("name", "")).strip()
-        if not control_id or not control_name:
-            continue
-        if any(control_name in action for action in actions):
-            refs.append(control_id)
-    seen: set[str] = set()
-    ordered: list[str] = []
-    for item in refs:
-        if item in seen:
-            continue
-        seen.add(item)
-        ordered.append(item)
-    return ordered
+    if isinstance(value, list):
+        parts = _clean_id_list(value)
+        return "; ".join(parts) if parts else None
+    text = str(value).strip()
+    return text or None
 
 
 def _sanitize_contract_payload(payload: object) -> dict[str, Any]:
@@ -165,35 +49,41 @@ def _sanitize_contract_payload(payload: object) -> dict[str, Any]:
         raise ValueError("Contract synthesis returned a non-object payload")
     sanitized = deepcopy(payload)
 
-    def _normalize_source_ref_items(section: str) -> None:
+    if "type" not in sanitized and "contract_type" in sanitized:
+        sanitized["type"] = sanitized.pop("contract_type")
+
+    for section in ("components", "uses", "assumptions", "controls", "signals", "recipes"):
         raw_items = sanitized.get(section)
         if not isinstance(raw_items, list):
-            return
+            continue
         normalized_items: list[object] = []
         for item in raw_items:
             if not isinstance(item, dict):
                 normalized_items.append(item)
                 continue
             filtered_item = dict(item)
-            filtered_item["source_refs"] = _clean_id_list(item.get("source_refs"))
+            if "evidence" not in filtered_item and "source_refs" in filtered_item:
+                filtered_item["evidence"] = _clean_id_list(filtered_item.pop("source_refs"))
+            if "when" in filtered_item:
+                filtered_item["when"] = _normalize_condition(filtered_item.get("when"))
+            if section == "signals":
+                probe = filtered_item.get("probe")
+                if not isinstance(probe, dict):
+                    probe = {}
+                if "name" not in probe and "target" in probe:
+                    probe["name"] = probe.pop("target")
+                if not probe.get("name") and filtered_item.get("tool"):
+                    probe["name"] = filtered_item.pop("tool")
+                filtered_item["probe"] = probe
+            if section == "recipes":
+                if "for" not in filtered_item and "hypothesis_kind" in filtered_item:
+                    filtered_item["for"] = filtered_item.pop("hypothesis_kind")
+                if "accept" not in filtered_item and "accept_if" in filtered_item:
+                    filtered_item["accept"] = filtered_item.pop("accept_if")
+                if "rollback" not in filtered_item and "rollback_if" in filtered_item:
+                    filtered_item["rollback"] = filtered_item.pop("rollback_if")
             normalized_items.append(filtered_item)
         sanitized[section] = normalized_items
-
-    for section in ("uses", "assumptions", "signals"):
-        _normalize_source_ref_items(section)
-
-    raw_uses = sanitized.get("uses")
-    if isinstance(raw_uses, list):
-        for item in raw_uses:
-            if not isinstance(item, dict):
-                continue
-            demand = item.get("demand")
-            if not isinstance(demand, dict):
-                continue
-            if "lower" in demand:
-                demand["lower"] = _normalize_host_symbol(demand["lower"])
-            if "upper" in demand:
-                demand["upper"] = _normalize_host_symbol(demand["upper"])
 
     raw_assumptions = sanitized.get("assumptions")
     if isinstance(raw_assumptions, list):
@@ -201,94 +91,35 @@ def _sanitize_contract_payload(payload: object) -> dict[str, Any]:
             if not isinstance(item, dict):
                 continue
             predicate = item.get("predicate")
-            if isinstance(predicate, dict) and "value" in predicate:
-                predicate["value"] = _normalize_host_symbol(predicate["value"])
+            if not isinstance(predicate, dict):
+                continue
+            kind = str(predicate.get("kind", "")).strip()
+            if kind in {"total_at_most", "competitors_at_most"}:
+                item["predicate"] = {"kind": kind, "value": predicate.get("value")}
+            elif kind in {"exclusive", "not_nested", "placement_compatible"}:
+                item["predicate"] = {"kind": kind}
 
     raw_controls = sanitized.get("controls")
     if isinstance(raw_controls, list):
-        filtered_controls: list[object] = []
         for item in raw_controls:
             if not isinstance(item, dict):
-                filtered_controls.append(item)
                 continue
-            affects = _clean_id_list(item.get("affects"))
-            source_refs = _clean_id_list(item.get("source_refs"))
-            raw_name = str(item.get("name", "")).strip()
-            activation_value = item.get("activation_value")
-            if "=" in raw_name and activation_value is None:
-                raw_name, activation_value = raw_name.split("=", 1)
-                raw_name = raw_name.strip()
-                activation_value = str(activation_value).strip()
-            raw_type = str(item.get("type", "")).strip().lower()
-            control_type = (
-                _KNOWN_CONTROL_TYPES.get(raw_name)
-                or _CONTROL_TYPE_ALIASES.get(raw_type)
-                or ("enum" if activation_value is not None else "string")
-            )
-            filtered_item = dict(item)
-            filtered_item["name"] = raw_name
-            filtered_item["type"] = control_type
-            filtered_item["affects"] = affects
-            filtered_item["allowed_values"] = _clean_id_list(item.get("allowed_values"))
-            if not filtered_item["allowed_values"] and raw_name in _KNOWN_CONTROL_ALLOWED_VALUES:
-                filtered_item["allowed_values"] = _KNOWN_CONTROL_ALLOWED_VALUES[raw_name]
-            filtered_item["activation_value"] = _normalize_activation_value(
-                activation_value,
-                control_type,
-            )
-            filtered_item["source_refs"] = source_refs
-            filtered_controls.append(filtered_item)
-        sanitized["controls"] = filtered_controls
-
-    raw_signals = sanitized.get("signals")
-    if isinstance(raw_signals, list):
-        filtered_signals: list[object] = []
-        for item in raw_signals:
-            if not isinstance(item, dict):
-                filtered_signals.append(item)
+            target = str(item.get("target", "")).strip()
+            if ".attrs." in target:
+                item["target"] = target.replace(".attrs.", ".")
+            effect = item.get("effect")
+            if not isinstance(effect, dict):
                 continue
-            source_refs = _clean_id_list(item.get("source_refs"))
-            filtered_item = dict(item)
-            probe = filtered_item.get("probe")
-            if not isinstance(probe, dict):
-                probe = _canonical_probe(filtered_item.pop("tool", ""))
-            filtered_item["probe"] = {
-                "kind": str(probe.get("kind", "command")).strip(),
-                "target": str(probe.get("target", "")).strip(),
-            }
-            filtered_item["source_refs"] = source_refs
-            filtered_signals.append(filtered_item)
-        sanitized["signals"] = filtered_signals
-
-    raw_recipes = sanitized.get("recipes")
-    if isinstance(raw_recipes, list):
-        filtered_recipes: list[object] = []
-        controls_payload = sanitized.get("controls")
-        controls: list[dict[str, Any]] = (
-            [item for item in controls_payload if isinstance(item, dict)]
-            if isinstance(controls_payload, list)
-            else []
-        )
-        for item in raw_recipes:
-            if not isinstance(item, dict):
-                filtered_recipes.append(item)
-                continue
-            collect = _clean_id_list(item.get("collect"))
-            actions = _clean_id_list(item.get("actions"))
-            source_refs = _clean_id_list(item.get("source_refs"))
-            hypothesis_kind = _RECIPE_KIND_ALIASES.get(
-                str(item.get("hypothesis_kind", "")).strip().lower(),
-                "validation",
-            )
-            filtered_item = dict(item)
-            filtered_item["hypothesis_kind"] = hypothesis_kind
-            filtered_item["collect"] = collect
-            control_refs = _clean_id_list(item.get("control_refs"))
-            filtered_item["control_refs"] = control_refs or _infer_control_refs(actions, controls)
-            filtered_item["actions"] = actions
-            filtered_item["source_refs"] = source_refs
-            filtered_recipes.append(filtered_item)
-        sanitized["recipes"] = filtered_recipes
+            kind = str(effect.get("kind", "")).strip()
+            if kind == "set":
+                item["effect"] = {"kind": "set", "value": effect.get("value", "input")}
+            elif kind == "partition":
+                filtered_effect: dict[str, Any] = {"kind": "partition"}
+                if effect.get("resource") is not None:
+                    filtered_effect["resource"] = effect.get("resource")
+                item["effect"] = filtered_effect
+            elif kind in {"increase", "decrease", "disable", "enable"}:
+                item["effect"] = {"kind": kind}
     return sanitized
 
 
@@ -345,15 +176,15 @@ def _format_validation_issues(exc: ValidationError) -> list[str]:
 def _invalid_sections(issues: list[str]) -> list[str]:
     sections: list[str] = []
     valid_sections = {
-        "source_artifacts",
+        "contract",
+        "type",
+        "version",
+        "components",
         "uses",
         "assumptions",
         "controls",
         "signals",
         "recipes",
-        "contract",
-        "contract_type",
-        "version",
     }
     for issue in issues:
         prefix = issue.split(":", 1)[0].split(".", 1)[0].strip()
@@ -377,7 +208,7 @@ def _normalized_library_contract(
         update={
             "contract": contract_name,
             "contract_type": "library",
-            "version": "lpcl/v0",
+            "version": CONTRACT_VERSION,
             "source_artifacts": source_artifacts,
         }
     )
@@ -405,7 +236,7 @@ async def _repair_library_contract_payload(
         "repair_schema": ContractVerificationResult.model_json_schema(),
     }
     response_text = await llm_client.complete_prompt("verify_contract.txt", repair_payload)
-    parsed = extract_json_object(response_text)
+    parsed = parse_contract_yaml(response_text)
     verification = ContractVerificationResult.model_validate(parsed)
 
     if verification.valid and verification.repaired_contract is None:
@@ -435,38 +266,21 @@ async def synthesize_library_contract(
         "source_artifacts": [artifact.model_dump(mode="json") for artifact in source_artifacts],
         "evidence_items": _selected_evidence_payload(evidence_items),
         "schema": LibraryContract.model_json_schema(),
-        "host_symbol_vocab": [
-            "host.physical_cores",
-            "host.visible_cpus",
-            "host.numa_nodes",
-        ],
-        "control_type_vocab": ["int", "bool", "enum", "string", "cpu_set", "numa_node_set"],
-        "probe_kind_vocab": ["command", "procfs", "runtime_env"],
-        "recipe_hypothesis_vocab": [
-            "baseline_validation",
-            "parameter_sweep",
-            "validation",
-            "starting_point",
-            "shared_resource_conflict",
-        ],
-        "resource_vocab": [
-            "cpu.core",
-            "cpu.thread",
-            "cpu.affinity",
-            "gpu.device",
-            "gpu.stream",
-            "mem.capacity",
-            "mem.bandwidth",
-            "mem.allocator",
-            "io.bandwidth",
-            "io.queue",
-            "net.bandwidth",
-            "worker.pool",
-            "cache.capacity",
-        ],
+        "version": CONTRACT_VERSION,
+        "resource_vocab": list(RESOURCE_TYPES),
+        "component_kind_vocab": list(COMPONENT_KINDS),
+        "phase_vocab": list(PHASES),
+        "scope_vocab": list(SCOPES),
+        "share_vocab": list(SHARE_MODES),
+        "predicate_vocab": list(PREDICATE_KINDS),
+        "control_kind_vocab": list(CONTROL_KINDS),
+        "control_type_vocab": list(CONTROL_TYPES),
+        "effect_kind_vocab": list(EFFECT_KINDS),
+        "probe_kind_vocab": list(PROBE_KINDS),
+        "hypothesis_kind_vocab": list(HYPOTHESIS_KINDS),
     }
     response_text = await llm_client.complete_prompt("synthesize_contract.txt", payload)
-    current_payload = extract_json_object(response_text)
+    current_payload = parse_contract_yaml(response_text)
 
     for attempt in range(max_repair_attempts + 1):
         verified, issues, sanitized = _normalized_library_contract(

@@ -1,4 +1,4 @@
-You are verifying a generated LPCL library contract.
+You are verifying a generated LPCL v1 library contract.
 
 Return JSON only in this shape:
 {
@@ -16,17 +16,36 @@ If the contract is invalid:
 
 Repair rules:
 - Change only the sections listed in invalid_sections unless another section must change to keep refs consistent
-- Preserve valid ids, ordering, and source_refs whenever possible
-- Keep the canonical LPCL vocabularies and typed fields
+- Preserve valid ids, ordering, and evidence whenever possible
+- Never invent new resources, component kinds, probe kinds, or hypothesis kinds
 - Never emit markdown fences or commentary
 - Return JSON only
 
+LPCL v1 ontology:
+- resources: cpu.compute, cpu.placement, gpu.compute, gpu.memory, mem.capacity, mem.bandwidth, io.bandwidth, io.queue
+- component kinds: executor, queue, allocator, backend, cache
+- phases: init, compute, communication, flush, background, teardown, unknown
+- scopes: thread, process, library, device, system
+- share modes: shared, exclusive, partitioned, process_global
+- control kinds: env, api, config, cli, vlc
+- control types: int, float, bool, string, enum, set
+- effect kinds: set, increase, decrease, partition, disable, enable
+- probe kinds: api, perf, os, log, profiler, benchmark, manual
+- recipe.for values:
+  - shared_cpu_compute_conflict
+  - cpu_placement_conflict
+  - shared_gpu_compute_conflict
+  - gpu_memory_pressure
+  - host_memory_capacity_pressure
+  - memory_bandwidth_contention
+  - io_bandwidth_contention
+  - io_queue_contention
+
 Canonicalization requirements:
-- control.name must be the canonical knob token only
-- control.type must be one of: int, bool, enum, string, cpu_set, numa_node_set
-- if a control needs a specific enabling value, put it in activation_value instead of inline in name
-- signals must use probe.kind + probe.target, not a free-form tool field
-- probe.kind must be one of: command, procfs, runtime_env
+- threads/workers/thread pools/OpenMP teams are components, not resources
+- cpu.thread is invalid; use cpu.compute with demand.dimension=workers
+- worker.pool is invalid as a resource; use a component plus cpu.compute
+- cpu.affinity is invalid; use cpu.placement
+- controls must target components, component attrs, uses, use demand paths, or valid resources
+- signals must use probe.kind + probe.name
 - recipes.collect must reference signal ids
-- recipes.control_refs should reference control ids when the recipe changes or validates controls
-- use host symbols when needed: host.physical_cores, host.visible_cpus, host.numa_nodes

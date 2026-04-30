@@ -6,6 +6,7 @@ from pathlib import Path
 import yaml
 from pydantic import ValidationError
 
+from syspilot_contract.migration import migrate_contract_payload
 from syspilot_contract.schemas import (
     AnyContract,
     ComposedContract,
@@ -40,13 +41,7 @@ _UniqueKeySafeLoader.add_constructor(
 
 
 def _path_string(path: tuple[object, ...]) -> str:
-    parts: list[str] = []
-    for item in path:
-        if isinstance(item, int):
-            parts.append(str(item))
-        else:
-            parts.append(str(item))
-    return ".".join(parts)
+    return ".".join(str(item) for item in path)
 
 
 def _issues_from_validation_error(exc: ValidationError) -> list[str]:
@@ -73,22 +68,34 @@ def parse_contract_yaml(text: str) -> object:
     return payload
 
 
-def validate_contract_payload(payload: object) -> AnyContract:
+def _normalized_payload(payload: object, *, allow_migration: bool = True) -> dict[str, object]:
     if not isinstance(payload, dict):
         raise ValueError("contract document must be a mapping")
-    contract_type = str(payload.get("contract_type", "library")).strip() or "library"
+    normalized = migrate_contract_payload(payload) if allow_migration else dict(payload)
+    contract_type = normalized.get("type")
+    if contract_type not in {"library", "composed"}:
+        raise ValueError(f"Unknown contract type {contract_type}")
+    return normalized
+
+
+def validate_contract_payload(payload: object, *, allow_migration: bool = True) -> AnyContract:
+    normalized = _normalized_payload(payload, allow_migration=allow_migration)
+    contract_type = normalized.get("type")
     if contract_type == "composed":
-        return ComposedContract.model_validate(payload)
-    return LibraryContract.model_validate(payload)
+        return ComposedContract.model_validate(normalized)
+    return LibraryContract.model_validate(normalized)
 
 
-def load_contract(path: Path) -> AnyContract:
-    return validate_contract_payload(parse_contract_yaml(path.read_text(encoding="utf-8")))
+def load_contract(path: Path, *, allow_migration: bool = True) -> AnyContract:
+    return validate_contract_payload(
+        parse_contract_yaml(path.read_text(encoding="utf-8")),
+        allow_migration=allow_migration,
+    )
 
 
 def dump_contract_yaml(contract: AnyContract) -> str:
     return yaml.safe_dump(
-        contract.model_dump(mode="json", by_alias=True),
+        contract.model_dump(mode="json", by_alias=True, exclude_none=True),
         sort_keys=False,
         allow_unicode=True,
     )
@@ -103,61 +110,22 @@ def _duplicate_id_issues(section: str, ids: list[str]) -> list[str]:
     ]
 
 
-def _ref_library(ref: str) -> str | None:
+def _ref_contract(ref: str) -> str | None:
     if "." not in ref:
         return None
-    library, _ = ref.split(".", 1)
-    library = library.strip()
-    return library or None
+    contract_name, _ = ref.split(".", 1)
+    contract_name = contract_name.strip()
+    return contract_name or None
 
 
 def _check_library_contract(contract: LibraryContract) -> list[str]:
     issues: list[str] = []
+    issues.extend(_duplicate_id_issues("components", [item.id for item in contract.components]))
     issues.extend(_duplicate_id_issues("uses", [item.id for item in contract.uses]))
     issues.extend(_duplicate_id_issues("assumptions", [item.id for item in contract.assumptions]))
     issues.extend(_duplicate_id_issues("controls", [item.id for item in contract.controls]))
     issues.extend(_duplicate_id_issues("signals", [item.id for item in contract.signals]))
     issues.extend(_duplicate_id_issues("recipes", [item.id for item in contract.recipes]))
-
-    use_by_id = {item.id: item for item in contract.uses}
-    signal_ids = {item.id for item in contract.signals}
-    control_ids = {item.id for item in contract.controls}
-
-    for control in contract.controls:
-        missing_uses = [item for item in control.affects if item not in use_by_id]
-        if missing_uses:
-            issues.append(
-                f"controls:{control.id} affects unknown uses: {', '.join(sorted(missing_uses))}"
-            )
-        affected_resources = {
-            use_by_id[item].resource for item in control.affects if item in use_by_id
-        }
-        if affected_resources and control.effect.resource not in affected_resources:
-            issues.append(
-                f"controls:{control.id} effect.resource={control.effect.resource} does not match affected uses"
-            )
-        if (
-            control.type == "enum"
-            and control.allowed_values
-            and isinstance(control.activation_value, str)
-            and control.activation_value not in control.allowed_values
-        ):
-            issues.append(
-                f"controls:{control.id} activation_value={control.activation_value} is not in allowed_values"
-            )
-
-    for recipe in contract.recipes:
-        missing_signals = [item for item in recipe.collect if item not in signal_ids]
-        if missing_signals:
-            issues.append(
-                f"recipes:{recipe.id} collects unknown signals: {', '.join(sorted(missing_signals))}"
-            )
-        missing_controls = [item for item in recipe.control_refs if item not in control_ids]
-        if missing_controls:
-            issues.append(
-                f"recipes:{recipe.id} references unknown controls: {', '.join(sorted(missing_controls))}"
-            )
-
     return issues
 
 
@@ -168,39 +136,60 @@ def _check_composed_contract(contract: ComposedContract) -> list[str]:
     issues.extend(_duplicate_id_issues("contract_instances", instance_ids))
     if contract.selected_contracts != instance_ids:
         issues.append("selected_contracts must match contract_instances.instance_id order")
+
     for item in contract.shared_resources:
-        unknown_libraries = [library for library in item.libraries if library not in selected]
-        if unknown_libraries:
+        unknown_contracts = [name for name in item.contracts if name not in selected]
+        if unknown_contracts:
             issues.append(
-                f"shared_resources:{item.resource}:{item.phase} references unknown libraries: {', '.join(sorted(unknown_libraries))}"
+                f"shared_resources:{item.resource}:{item.phase} references unknown contracts: {', '.join(sorted(unknown_contracts))}"
             )
+        invalid_refs = [
+            ref
+            for ref in item.uses + item.components
+            if (_ref_contract(ref) is None or _ref_contract(ref) not in selected)
+        ]
+        if invalid_refs:
+            issues.append(
+                f"shared_resources:{item.resource}:{item.phase} has invalid refs: {', '.join(sorted(invalid_refs))}"
+            )
+
     for item in contract.hypotheses:
-        unknown_libraries = [library for library in item.libraries if library not in selected]
-        if unknown_libraries:
+        unknown_contracts = [name for name in item.contracts if name not in selected]
+        if unknown_contracts:
             issues.append(
-                f"hypotheses:{item.id} references unknown libraries: {', '.join(sorted(unknown_libraries))}"
+                f"hypotheses:{item.id} references unknown contracts: {', '.join(sorted(unknown_contracts))}"
             )
-        if (
-            not item.basis.overlaps
-            and not item.basis.violated_assumptions
-            and not item.basis.colliding_controls
-        ):
-            issues.append(f"hypotheses:{item.id} is missing a supporting basis")
-        if not item.validation.collect:
-            issues.append(f"hypotheses:{item.id} must include validation signals")
         ref_sections = {
-            "overlaps": [ref for overlap in item.basis.overlaps for ref in overlap.uses],
-            "violated_assumptions": item.basis.violated_assumptions,
-            "colliding_controls": item.basis.colliding_controls,
+            "components": item.components,
+            "uses": item.uses,
             "validation": item.validation.collect,
-            "candidate_control_refs": item.candidate_control_refs,
-            "candidate_recipe_refs": item.candidate_recipe_refs,
+            "candidate_actions": [ref for ref in item.candidate_actions if "." in ref],
+            "recipes": item.recipes,
+            "overlaps": [
+                ref for overlap in item.basis.overlaps for ref in overlap.uses + overlap.components
+            ],
+            "assumption_violations": [
+                violation.assumption
+                for violation in item.basis.assumption_violations
+                if "." in violation.assumption
+            ]
+            + [
+                ref
+                for violation in item.basis.assumption_violations
+                for ref in violation.conflicting_uses
+            ],
+            "control_collisions": [
+                ref
+                for collision in item.basis.control_collisions
+                for ref in collision.controls
+                if "." in ref
+            ],
         }
         for section_name, refs in ref_sections.items():
             invalid_refs = [
                 ref
                 for ref in refs
-                if (_ref_library(ref) is None or _ref_library(ref) not in selected)
+                if (_ref_contract(ref) is None or _ref_contract(ref) not in selected)
             ]
             if invalid_refs:
                 issues.append(
@@ -218,10 +207,14 @@ def check_contract(contract: AnyContract) -> ContractCheckResult:
     return ContractCheckResult(valid=not issues, issues=issues)
 
 
-def validate_contract_text(text: str) -> tuple[AnyContract | None, ContractCheckResult]:
+def validate_contract_text(
+    text: str,
+    *,
+    allow_migration: bool = True,
+) -> tuple[AnyContract | None, ContractCheckResult]:
     try:
         payload = parse_contract_yaml(text)
-        contract = validate_contract_payload(payload)
+        contract = validate_contract_payload(payload, allow_migration=allow_migration)
     except ValidationError as exc:
         return None, ContractCheckResult(valid=False, issues=_issues_from_validation_error(exc))
     except (ValueError, yaml.YAMLError) as exc:
@@ -230,8 +223,12 @@ def validate_contract_text(text: str) -> tuple[AnyContract | None, ContractCheck
     return contract, result
 
 
-def validate_contract_file(path: Path) -> tuple[AnyContract | None, ContractCheckResult]:
-    return validate_contract_text(path.read_text(encoding="utf-8"))
+def validate_contract_file(
+    path: Path,
+    *,
+    allow_migration: bool = True,
+) -> tuple[AnyContract | None, ContractCheckResult]:
+    return validate_contract_text(path.read_text(encoding="utf-8"), allow_migration=allow_migration)
 
 
 def assert_valid_contract(contract: AnyContract) -> AnyContract:

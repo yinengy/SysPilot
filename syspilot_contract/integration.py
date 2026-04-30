@@ -12,6 +12,7 @@ from syspilot_contract.checker import (
 )
 from syspilot_contract.compose_contracts import compose_contracts
 from syspilot_contract.query_store import ContractStore
+from syspilot_contract.render_contract import render_contract_lpcl
 from syspilot_contract.schemas import AnyContract, ComposedContract, LibraryContract, SourceArtifact
 from syspilot_contract.synthesize_contract import synthesize_library_contract
 from syspilot_manual.integration import (
@@ -63,11 +64,17 @@ def contract_yaml_path(runtime_dir: Path) -> Path:
     return runtime_dir / "contract.yaml"
 
 
+def contract_lpcl_path(runtime_dir: Path) -> Path:
+    return runtime_dir / "contract.lpcl"
+
+
 def write_contract_bundle(
     contract_id: str,
     contract: AnyContract,
     artifact_root: Path,
     contract_root: Path | None = None,
+    *,
+    include_evidence: bool = False,
 ) -> Path:
     contract_root = contract_root or default_contract_root()
     ensure_artifact_dirs(artifact_root)
@@ -80,10 +87,12 @@ def write_contract_bundle(
         composed=isinstance(contract, ComposedContract),
     )
     yaml_text = dump_contract_yaml(contract)
+    lpcl_text = render_contract_lpcl(contract, include_evidence=include_evidence)
 
     for target_dir in (runtime_dir, artifact_dir):
         target_dir.mkdir(parents=True, exist_ok=True)
         contract_yaml_path(target_dir).write_text(yaml_text, encoding="utf-8")
+        contract_lpcl_path(target_dir).write_text(lpcl_text, encoding="utf-8")
     return runtime_dir
 
 
@@ -94,14 +103,19 @@ def load_contract_yaml(path: Path) -> AnyContract:
 def resolve_library_contract_inputs(
     contract_refs: list[str],
     contract_root: Path,
+    *,
+    allow_migration: bool = False,
 ) -> list[LibraryContract]:
     contracts: list[LibraryContract] = []
     for contract_ref in contract_refs:
         candidate = Path(contract_ref).expanduser()
         loaded = (
-            load_contract(candidate)
+            load_contract(candidate, allow_migration=allow_migration)
             if candidate.exists()
-            else load_contract(runtime_contract_dir(contract_root, contract_ref) / "contract.yaml")
+            else load_contract(
+                runtime_contract_dir(contract_root, contract_ref) / "contract.yaml",
+                allow_migration=allow_migration,
+            )
         )
         if not isinstance(loaded, LibraryContract):
             raise TypeError(f"Expected library contract for {contract_ref}")
@@ -116,6 +130,7 @@ async def synthesize_library_contract_bundle(
     llm_client: ManualLLMProtocol,
     *,
     contract_root: Path | None = None,
+    include_evidence: bool = False,
     progress_callback: Callable[[ContractSynthesisProgress], None] | None = None,
 ) -> LibraryContract:
     contract_root = contract_root or default_contract_root()
@@ -165,7 +180,13 @@ async def synthesize_library_contract_bundle(
                 eta_s=1.0,
             )
         )
-    write_contract_bundle(contract_id, verified, artifact_root, contract_root)
+    write_contract_bundle(
+        contract_id,
+        verified,
+        artifact_root,
+        contract_root,
+        include_evidence=include_evidence,
+    )
     if progress_callback is not None:
         progress_callback(
             ContractSynthesisProgress(
@@ -187,11 +208,17 @@ def compose_and_write_contract(
     artifact_root: Path,
     *,
     contract_root: Path | None = None,
+    allow_migration: bool = False,
+    include_evidence: bool = False,
     progress_callback: Callable[[ContractCompositionProgress], None] | None = None,
 ) -> ComposedContract:
     contract_root = contract_root or default_contract_root()
     started_at = time.monotonic()
-    library_contracts = resolve_library_contract_inputs(contract_refs, contract_root)
+    library_contracts = resolve_library_contract_inputs(
+        contract_refs,
+        contract_root,
+        allow_migration=allow_migration,
+    )
     if progress_callback is not None:
         progress_callback(
             ContractCompositionProgress(
@@ -229,7 +256,13 @@ def compose_and_write_contract(
                 eta_s=1.0,
             )
         )
-    write_contract_bundle(contract_id, verified, artifact_root, contract_root)
+    write_contract_bundle(
+        contract_id,
+        verified,
+        artifact_root,
+        contract_root,
+        include_evidence=include_evidence,
+    )
     if progress_callback is not None:
         progress_callback(
             ContractCompositionProgress(

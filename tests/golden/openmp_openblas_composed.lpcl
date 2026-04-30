@@ -1,0 +1,55 @@
+lpcl "lpcl/v1";
+
+contract openmp_openblas : composed {
+  selected_contracts {
+    values = [openblas, openmp];
+  }
+
+  instance openblas {
+    contract = OpenBLAS;
+  }
+
+  instance openmp {
+    contract = OpenMP;
+  }
+
+  shared_resource cpu.compute {
+    phase = compute;
+    contracts = [openblas, openmp];
+    components = [openblas.openblas_executor, openmp.openmp_executor];
+    uses = [openblas.openblas_cpu_compute, openmp.openmp_cpu_compute];
+  }
+
+  hypothesis h_shared_cpu_compute_conflict_openblas_openmp_compute : shared_cpu_compute_conflict {
+    resource = cpu.compute;
+    phase = compute;
+    contracts = [openblas, openmp];
+    components = [openblas.openblas_executor, openmp.openmp_executor];
+    uses = [openblas.openblas_cpu_compute, openmp.openmp_cpu_compute];
+    basis {
+      overlap {
+        uses = [openblas.openblas_cpu_compute, openmp.openmp_cpu_compute];
+        components = [openblas.openblas_executor, openmp.openmp_executor];
+        contracts = [openblas, openmp];
+      }
+      assumption_violation {
+        assumption = openblas.openblas_not_nested;
+        conflicting_uses = [openblas.openblas_cpu_compute, openmp.openmp_cpu_compute];
+      }
+      assumption_violation {
+        assumption = openmp.openmp_not_nested;
+        conflicting_uses = [openblas.openblas_cpu_compute, openmp.openmp_cpu_compute];
+      }
+      control_collision {
+        resource = cpu.compute;
+        dimension = workers;
+        controls = [openblas.openblas_threads_control, openmp.openmp_threads_control];
+      }
+    }
+    validate {
+      collect = [openblas.openblas_thread_count, openmp.openmp_thread_count];
+    }
+    candidate_actions = [openblas.openblas_threads_control, openmp.openmp_threads_control];
+    recipes = [openblas.openblas_recipe, openmp.openmp_recipe];
+  }
+}

@@ -117,45 +117,45 @@ def _library_manual(manual_id: str, library_name: str) -> LibraryManual:
 def _library_contract(
     contract_name: str, control_name: str = "OMP_NUM_THREADS"
 ) -> LibraryContractDSL:
+    prefix = contract_name.lower()
     return LibraryContractDSL.model_validate(
         {
             "contract": contract_name,
-            "version": "lpcl/v0",
-            "contract_type": "library",
-            "source_artifacts": [
+            "version": "lpcl/v1",
+            "type": "library",
+            "components": [
                 {
-                    "source_id": f"{contract_name}_doc",
-                    "path": f"docs/{contract_name}.md",
-                    "kind": "doc",
+                    "id": f"{prefix}_threads",
+                    "kind": "executor",
+                    "attrs": {
+                        "executor_kind": "thread_pool",
+                        "workers": {"min": 1, "max": "host.cpu_slots"},
+                    },
+                    "evidence": [f"{contract_name}_doc:chunk_001"],
                 }
             ],
             "uses": [
                 {
-                    "id": "threads",
-                    "resource": "cpu.thread",
+                    "id": f"{prefix}_cpu_compute",
+                    "resource": "cpu.compute",
+                    "by": f"{prefix}_threads",
                     "phase": "compute",
                     "scope": "process",
-                    "role": "consume",
-                    "sharing": "partitionable",
                     "demand": {
-                        "kind": "scaled_by",
-                        "knob": control_name,
-                        "lower": 1,
-                        "upper": "host.physical_cores",
+                        "dimension": "workers",
+                        "min": 1,
+                        "max": "host.cpu_slots",
                     },
-                    "source_refs": [f"{contract_name}_doc:chunk_001"],
+                    "share": "shared",
+                    "evidence": [f"{contract_name}_doc:chunk_001"],
                 }
             ],
             "assumptions": [
                 {
                     "id": "solo_compute_pool",
-                    "predicate": {
-                        "kind": "max_competitors",
-                        "resource": "cpu.thread",
-                        "phase": "compute",
-                        "value": 1,
-                    },
-                    "source_refs": [f"{contract_name}_doc:chunk_001"],
+                    "resource": "cpu.compute",
+                    "predicate": {"kind": "not_nested"},
+                    "evidence": [f"{contract_name}_doc:chunk_001"],
                 }
             ],
             "controls": [
@@ -164,32 +164,56 @@ def _library_contract(
                     "name": control_name,
                     "kind": "env",
                     "type": "int",
-                    "affects": ["threads"],
-                    "effect": {"op": "increase", "resource": "cpu.thread", "strength": "strong"},
-                    "scope": "process",
-                    "source_refs": [f"{contract_name}_doc:chunk_001"],
-                }
+                    "target": f"{prefix}_threads.workers",
+                    "effect": {"kind": "set", "value": "input"},
+                    "evidence": [f"{contract_name}_doc:chunk_001"],
+                },
+                {
+                    "id": "omp_display_env",
+                    "name": "OMP_DISPLAY_ENV",
+                    "kind": "env",
+                    "type": "enum",
+                    "target": f"{prefix}_threads",
+                    "effect": {"kind": "set", "value": "true"},
+                    "evidence": [f"{contract_name}_doc:chunk_001"],
+                },
+                {
+                    "id": "omp_display_affinity",
+                    "name": "OMP_DISPLAY_AFFINITY",
+                    "kind": "env",
+                    "type": "bool",
+                    "target": f"{prefix}_threads",
+                    "effect": {"kind": "set", "value": True},
+                    "evidence": [f"{contract_name}_doc:chunk_001"],
+                },
             ],
             "signals": [
                 {
                     "id": "ctx_switch_rate",
                     "metric": "os.context_switch_rate",
-                    "resource": "cpu.thread",
+                    "target": "cpu.compute",
                     "indicates": "contention",
-                    "probe": {"kind": "command", "target": "perf"},
-                    "source_refs": [f"{contract_name}_doc:chunk_001"],
-                }
+                    "probe": {"kind": "perf", "name": "perf_stat"},
+                    "evidence": [f"{contract_name}_doc:chunk_001"],
+                },
+                {
+                    "id": "display_env_signal",
+                    "metric": "openmp.display_env",
+                    "target": f"{prefix}_threads",
+                    "indicates": "effective thread settings",
+                    "probe": {"kind": "log", "name": "OMP_DISPLAY_ENV"},
+                    "evidence": [f"{contract_name}_doc:chunk_001"],
+                },
             ],
             "recipes": [
                 {
                     "id": "reduce_oversubscription",
-                    "hypothesis_kind": "shared_resource_conflict",
-                    "collect": ["ctx_switch_rate"],
-                    "control_refs": ["omp_num_threads"],
+                    "for": "shared_cpu_compute_conflict",
+                    "collect": ["ctx_switch_rate", "display_env_signal"],
                     "actions": [f"decrease {control_name}"],
-                    "accept_if": "throughput improves",
-                    "rollback_if": "throughput regresses",
-                    "source_refs": [f"{contract_name}_doc:chunk_001"],
+                    "accept": "throughput improves",
+                    "rollback": "throughput regresses",
+                    "evidence": [f"{contract_name}_doc:chunk_001"],
                 }
             ],
         }
@@ -723,14 +747,14 @@ def test_parse_spawn_actions_preserves_hypothesis_refs() -> None:
                 "summary": "focus next profiling round",
                 "manual_citation": "use hypothesis evidence",
                 "evidence": ["validation incomplete"],
-                "hypothesis_refs": ["h_worker_pool_openblas_openmp_compute"],
+                "hypothesis_refs": ["h_shared_cpu_compute_conflict_openblas_openmp_compute"],
                 "actions": [],
             }
         )
     )
 
     assert parsed["valid"] is True
-    assert parsed["hypothesis_refs"] == ["h_worker_pool_openblas_openmp_compute"]
+    assert parsed["hypothesis_refs"] == ["h_shared_cpu_compute_conflict_openblas_openmp_compute"]
 
 
 def test_summarize_spawn_runtime_output_extracts_openmp_signals() -> None:

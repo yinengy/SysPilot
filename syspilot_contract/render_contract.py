@@ -1,70 +1,100 @@
 from __future__ import annotations
 
+from syspilot_contract.compiler import compile_lpcl
 from syspilot_contract.schemas import ComposedContract, LibraryContract
 
 
-def _describe_demand(use: LibraryContract | ComposedContract, demand: object) -> str:
-    if isinstance(demand, dict):
-        kind = demand.get("kind", "unknown")
-        if kind == "fixed":
-            return f"fixed({demand.get('value')})"
-        if kind == "range":
-            return f"range({demand.get('lower')}, {demand.get('upper')})"
-        if kind == "scaled_by":
-            return f"scaled_by({demand.get('knob')}, {demand.get('lower')}, {demand.get('upper')})"
-        if kind == "proportional_to":
-            return f"proportional_to({demand.get('metric')})"
-        if kind == "burst":
-            return f"burst({demand.get('trigger')})"
+def render_contract_lpcl(
+    contract: LibraryContract | ComposedContract,
+    *,
+    include_evidence: bool = False,
+) -> str:
+    return compile_lpcl(contract, include_evidence=include_evidence)
+
+
+def _describe_demand(demand: dict[str, object]) -> str:
+    dimension = demand.get("dimension")
+    if dimension == "workers":
+        return f"workers [{demand.get('min')}, {demand.get('max')}]"
+    if dimension == "core_set":
+        return f"core_set from {demand.get('source')}"
+    if dimension == "devices":
+        return f"devices [{demand.get('min')}, {demand.get('max')}]"
+    if dimension == "partition":
+        return f"partition from {demand.get('source')}"
+    if dimension == "bytes":
+        return f"bytes [{demand.get('min')}, {demand.get('max')}]"
+    if dimension == "intensity":
+        return f"intensity {demand.get('value')}"
+    if dimension == "bandwidth":
+        return f"bandwidth [{demand.get('min')}, {demand.get('max')}]"
+    if dimension == "depth":
+        return f"depth [{demand.get('min')}, {demand.get('max')}]"
     return "unknown"
 
 
 def render_contract_markdown(contract: LibraryContract | ComposedContract) -> str:
-    lines = [f"# {contract.contract} LPCL Contract", "", "Source of truth: contract.yaml", ""]
     if isinstance(contract, LibraryContract):
-        lines.extend(["## Uses", ""])
+        lines = [
+            f"# Library Performance Contract: {contract.contract}",
+            "",
+            "## Components",
+            "",
+        ]
+        for item in contract.components:
+            attrs = ", ".join(f"{key}={value}" for key, value in item.attrs.items()) or "(none)"
+            lines.append(f"- `{item.id}` (`{item.kind}`): {attrs}")
+        lines.extend(["", "## Shared Resource Uses", ""])
         for item in contract.uses:
-            demand = _describe_demand(contract, item.demand.model_dump(mode="json"))
             lines.append(
-                f"- `{item.id}` → `{item.resource}` during `{item.phase}` at `{item.scope}` scope as `{item.role}`; sharing `{item.sharing}`; demand `{demand}`"
+                f"- `{item.id}`: component `{item.by}` uses `{item.resource}` during `{item.phase}` at `{item.scope}` scope; share `{item.share}`; demand `{_describe_demand(item.demand)}`"
             )
         lines.extend(["", "## Assumptions", ""])
         for item in contract.assumptions:
+            predicate = item.predicate
+            value_suffix = f" value={predicate.get('value')}" if "value" in predicate else ""
             lines.append(
-                f"- `{item.id}` → `{item.predicate.kind}` on `{item.predicate.resource}` during `{item.predicate.phase}`"
+                f"- `{item.id}`: `{predicate.get('kind')}` on `{item.resource}`{value_suffix}"
             )
         lines.extend(["", "## Controls", ""])
         for item in contract.controls:
-            affects = ", ".join(item.affects)
-            activation = (
-                f", activation={item.activation_value}" if item.activation_value is not None else ""
-            )
+            effect = item.effect.model_dump(mode="json", exclude_none=True)
             lines.append(
-                f"- `{item.name}` ({item.kind}, {item.type}{activation}) affects `{affects}` with `{item.effect.op}` on `{item.effect.resource}` at `{item.scope}` scope"
+                f"- `{item.name}` (`{item.kind}`, `{item.type}`) targets `{item.target}` with `{effect}`"
             )
         lines.extend(["", "## Signals", ""])
         for item in contract.signals:
             lines.append(
-                f"- `{item.metric}` via `{item.probe.kind}:{item.probe.target}` watches `{item.resource}` and indicates `{item.indicates}`"
+                f"- `{item.id}`: `{item.metric}` targets `{item.target}` via `{item.probe.kind}:{item.probe.name}` → `{item.indicates}`"
             )
         lines.extend(["", "## Recipes", ""])
         for item in contract.recipes:
             lines.append(
-                f"- `{item.id}` → collect {', '.join(item.collect)}; controls: {', '.join(item.control_refs)}; actions: {', '.join(item.actions)}"
+                f"- `{item.id}` for `{item.hypothesis_kind}`: collect {', '.join(item.collect)}; actions: {', '.join(item.actions)}"
             )
-    else:
-        lines.extend(["## Shared Resources", ""])
-        for item in contract.shared_resources:
-            lines.append(
-                f"- `{item.resource}` / `{item.phase}` shared by {', '.join(item.libraries)}"
-            )
-        lines.extend(["", "## Conflicts", ""])
-        for item in contract.hypotheses:
-            lines.append(
-                f"- `{item.id}` → `{item.resource}` / `{item.phase}` across {', '.join(item.libraries)}; collect {', '.join(item.validation.collect)}"
-            )
-            if item.candidate_control_refs:
-                lines.append(f"  - controls: {', '.join(item.candidate_control_refs)}")
-            if item.candidate_recipe_refs:
-                lines.append(f"  - recipes: {', '.join(item.candidate_recipe_refs)}")
+        return "\n".join(lines).strip() + "\n"
+
+    lines = [
+        f"# Composed Performance Contract: {contract.contract}",
+        "",
+        "## Selected Contracts",
+        "",
+    ]
+    for item in contract.contract_instances:
+        lines.append(f"- `{item.instance_id}` → `{item.contract_id}`")
+    lines.extend(["", "## Derived Conflict Hypotheses", ""])
+    for item in contract.hypotheses:
+        lines.append(
+            f"- `{item.id}`: `{item.kind}` on `{item.resource}` during `{item.phase}` across {', '.join(item.contracts)}"
+        )
+    lines.extend(["", "## Shared Resources", ""])
+    for item in contract.shared_resources:
+        lines.append(f"- `{item.resource}` / `{item.phase}` shared by {', '.join(item.contracts)}")
+    lines.extend(["", "## Validation Plan", ""])
+    for item in contract.hypotheses:
+        lines.append(f"- `{item.id}` collect {', '.join(item.validation.collect)}")
+    lines.extend(["", "## Candidate Actions", ""])
+    for item in contract.hypotheses:
+        action_text = ", ".join(item.candidate_actions) or "(none)"
+        lines.append(f"- `{item.id}`: {action_text}")
     return "\n".join(lines).strip() + "\n"

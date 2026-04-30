@@ -1,0 +1,75 @@
+lpcl "lpcl/v1";
+
+contract openmp : library {
+  component openmp_executor : executor {
+    attrs {
+      workers = OMP_NUM_THREADS;
+      placement_controls = [OMP_PROC_BIND, OMP_PLACES];
+    }
+    evidence = [openmp-icv-thread-controls];
+  }
+
+  use openmp_cpu_compute : cpu.compute {
+    by = openmp_executor;
+    phase = compute;
+    scope = process;
+    demand {
+      dimension = workers;
+      min = 1;
+      max = OMP_NUM_THREADS;
+    }
+    share = shared;
+    evidence = [openmp-icv-thread-controls];
+  }
+
+  use openmp_cpu_placement : cpu.placement {
+    by = openmp_executor;
+    phase = compute;
+    scope = process;
+    demand {
+      dimension = core_set;
+      source = "OMP_PLACES|OMP_PROC_BIND|KMP_AFFINITY|GOMP_CPU_AFFINITY|KMP_HW_SUBSET";
+    }
+    share = partitioned;
+    evidence = [openmp-knob-affinity-binding];
+  }
+
+  assume openmp_assume_external_pinning_compatible : cpu.placement {
+    predicate {
+      kind = placement_compatible;
+    }
+    when = "composing OpenMP placement with lower-layer pinning or visibility restrictions";
+    evidence = [openmp_pinning_conflict];
+  }
+
+  control control_omp_num_threads : env<string> {
+    name = OMP_NUM_THREADS;
+    target = openmp_executor.workers;
+    effect {
+      kind = set;
+      value = "comma-separated positive integers by nested level";
+    }
+    evidence = [openmp-omp-num-threads-list];
+  }
+
+  signal signal_omp_display_env {
+    target = openmp_executor;
+    metric = "effective OpenMP runtime environment";
+    indicates = "actual worker-count-related runtime settings before tuning or comparison";
+    probe {
+      kind = log;
+      name = OMP_DISPLAY_ENV;
+    }
+    evidence = [openmp-obs-display-env];
+  }
+
+  recipe recipe_shared_cpu_compute_conflict {
+    for = shared_cpu_compute_conflict;
+    collect = [signal_omp_display_env];
+    actions = ["Print effective OpenMP runtime settings before tuning.", "Sweep OMP_NUM_THREADS on the same workload."];
+    accept = "Stable or improved workload runtime.";
+    rollback = "Restore prior OMP_NUM_THREADS if performance worsens.";
+    when = "OpenMP throughput or runtime degrades as worker count is increased on the same workload";
+    evidence = [openmp_val_print_effective_env_and_placement];
+  }
+}

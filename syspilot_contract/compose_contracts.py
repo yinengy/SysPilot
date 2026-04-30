@@ -10,14 +10,19 @@ from syspilot_contract.schemas import (
     ConflictHypothesis,
     ContractInstance,
     Control,
+    ControlCollision,
     HypothesisBasis,
     HypothesisOverlap,
     HypothesisValidation,
     LibraryContract,
-    PhaseName,
-    ResourceType,
+    RESOURCE_TO_HYPOTHESIS_KIND,
+    ResourceUse,
     SharedResourceItem,
+    AssumptionViolation,
 )
+
+
+ALLOWED_SHARED_MODES = {"shared", "process_global", "partitioned"}
 
 
 def _slugify(value: str) -> str:
@@ -27,6 +32,10 @@ def _slugify(value: str) -> str:
 
 def _use_ref(contract: LibraryContract, use_id: str) -> str:
     return f"{contract.contract}.{use_id}"
+
+
+def _component_ref(contract: LibraryContract, component_id: str) -> str:
+    return f"{contract.contract}.{component_id}"
 
 
 def _assumption_ref(contract: LibraryContract, assumption_id: str) -> str:
@@ -67,237 +76,423 @@ def _instantiate_contracts(
     return instantiated, instances
 
 
-def _phase_overlaps(left: PhaseName, right: PhaseName) -> bool:
+def _phase_overlaps(left: str, right: str) -> bool:
     return left == right or left == "unknown" or right == "unknown"
 
 
-def _collect_controls_by_resource(contract: LibraryContract) -> dict[ResourceType, list[Control]]:
-    grouped: dict[ResourceType, list[Control]] = defaultdict(list)
-    for control in contract.controls:
-        grouped[control.effect.resource].append(control)
-    return grouped
+def _merged_phase(left: str, right: str) -> str:
+    if left == right:
+        return left
+    if left == "unknown":
+        return right
+    if right == "unknown":
+        return left
+    return "mixed"
 
 
-def derive_shared_resources(contracts: list[LibraryContract]) -> list[SharedResourceItem]:
-    grouped: dict[tuple[ResourceType, PhaseName], list[tuple[LibraryContract, str, list[str]]]] = (
-        defaultdict(list)
-    )
-    for contract in contracts:
-        for item in contract.uses:
-            grouped[(item.resource, item.phase)].append((contract, item.id, item.source_refs))
+def _scope_overlaps(left: str, right: str) -> bool:
+    return left == right or left in {"library", "system"} or right in {"library", "system"}
 
-    shared: list[SharedResourceItem] = []
-    for (resource, phase), entries in sorted(grouped.items(), key=lambda item: item[0]):
-        libraries = sorted({contract.contract for contract, _, _ in entries})
-        if len(libraries) < 2:
+
+def _resource_root(target: str) -> str | None:
+    parts = target.split(".")
+    if len(parts) < 2:
+        return None
+    root = ".".join(parts[:2])
+    return root if root in RESOURCE_TO_HYPOTHESIS_KIND else None
+
+
+def _resources_for_target(contract: LibraryContract, target: str) -> list[str]:
+    if target in RESOURCE_TO_HYPOTHESIS_KIND:
+        return [target]
+    root = _resource_root(target)
+    if root is not None:
+        return [root]
+    use_by_id = {item.id: item for item in contract.uses}
+    if target in use_by_id:
+        return [use_by_id[target].resource]
+    head = target.split(".", 1)[0]
+    if head in use_by_id:
+        return [use_by_id[head].resource]
+    resources = sorted({item.resource for item in contract.uses if item.by == head})
+    return resources
+
+
+def _target_dimension(target: str, resource: str) -> str:
+    if ".workers" in target or resource == "cpu.compute":
+        return "workers"
+    if resource == "cpu.placement":
+        return "core_set"
+    if resource == "gpu.compute":
+        return "devices"
+    if resource in {"gpu.memory", "mem.capacity"}:
+        return "bytes"
+    if resource == "mem.bandwidth":
+        return "intensity"
+    if resource == "io.bandwidth":
+        return "bandwidth"
+    if resource == "io.queue":
+        return "depth"
+    if "." in target:
+        return target.rsplit(".", 1)[-1]
+    return resource
+
+
+def _use_share_allows_overlap(use: ResourceUse) -> bool:
+    return use.share in ALLOWED_SHARED_MODES
+
+
+def _component_ref_for_use(contract: LibraryContract, use: ResourceUse) -> str:
+    return _component_ref(contract, use.by)
+
+
+def _is_unknown_bound(value: object) -> bool:
+    return not isinstance(value, (int, float)) or isinstance(value, bool)
+
+
+def _worker_bound_summary(use: ResourceUse) -> tuple[object | None, object | None]:
+    if use.resource != "cpu.compute":
+        return None, None
+    return use.demand.get("min"), use.demand.get("max")
+
+
+def _cpu_compute_oversubscribed(pairs: list[tuple[ResourceUse, ResourceUse]]) -> bool:
+    for left_use, right_use in pairs:
+        if left_use.resource != "cpu.compute" or right_use.resource != "cpu.compute":
             continue
-        shared.append(
-            SharedResourceItem(
-                resource=resource,
-                phase=phase,
-                libraries=libraries,
-                use_refs=sorted(_use_ref(contract, use_id) for contract, use_id, _ in entries),
-                source_refs=sorted(
-                    {source_ref for _, _, source_refs in entries for source_ref in source_refs}
-                ),
-            )
-        )
-    return shared
+        if not _scope_overlaps(left_use.scope, right_use.scope):
+            continue
+        left_min, left_max = _worker_bound_summary(left_use)
+        right_min, right_max = _worker_bound_summary(right_use)
+        if _is_unknown_bound(left_max) or _is_unknown_bound(right_max):
+            return True
+        if isinstance(left_max, (int, float)) and isinstance(right_max, (int, float)):
+            if left_max + right_max > 1:
+                return True
+        if left_min == right_min == 1 and left_max == right_max == 1:
+            continue
+    return False
 
 
-def _violated_assumptions(
+def _assumption_violations(
     left: LibraryContract,
     right: LibraryContract,
-    resource: ResourceType,
-    phase: PhaseName,
-) -> list[str]:
-    violated: list[str] = []
+    resource: str,
+    overlap_pairs: list[tuple[ResourceUse, ResourceUse]],
+) -> list[AssumptionViolation]:
+    violations: list[AssumptionViolation] = []
+    overlap_use_refs = sorted(
+        {_use_ref(left, left_use.id) for left_use, _ in overlap_pairs}
+        | {_use_ref(right, right_use.id) for _, right_use in overlap_pairs}
+    )
     for contract, other in ((left, right), (right, left)):
-        other_has_overlap = any(
-            use.resource == resource and _phase_overlaps(use.phase, phase) for use in other.uses
-        )
+        other_has_overlap = any(use.resource == resource for use in other.uses)
         if not other_has_overlap:
             continue
         for assumption in contract.assumptions:
-            predicate = assumption.predicate
-            if predicate.resource != resource or not _phase_overlaps(predicate.phase, phase):
+            if assumption.resource != resource:
                 continue
-            if predicate.kind == "max_competitors" and getattr(predicate, "value", 0) <= 1:
-                violated.append(_assumption_ref(contract, assumption.id))
-            elif predicate.kind == "dedicated_partition":
-                violated.append(_assumption_ref(contract, assumption.id))
-            elif predicate.kind == "budget_at_most":
-                violated.append(_assumption_ref(contract, assumption.id))
-            elif predicate.kind == "affinity_compatible" and resource == "cpu.affinity":
-                violated.append(_assumption_ref(contract, assumption.id))
-    return sorted(set(violated))
+            predicate_kind = str(assumption.predicate.get("kind", "")).strip()
+            should_record = False
+            if predicate_kind == "not_nested" and resource in {"cpu.compute", "gpu.compute"}:
+                should_record = True
+            elif predicate_kind == "exclusive":
+                should_record = True
+            elif predicate_kind == "competitors_at_most" and assumption.predicate.get("value") == 1:
+                should_record = True
+            elif predicate_kind in {"total_at_most", "placement_compatible", "competitors_at_most"}:
+                should_record = True
+            if should_record:
+                violations.append(
+                    AssumptionViolation(
+                        assumption=_assumption_ref(contract, assumption.id),
+                        conflicting_uses=overlap_use_refs,
+                    )
+                )
+    return sorted(violations, key=lambda item: item.assumption)
 
 
-def _candidate_recipe_refs(
-    left: LibraryContract,
-    right: LibraryContract,
-    resource: ResourceType,
-    controls: list[Control],
-) -> list[str]:
-    recipe_refs: list[str] = []
-    for contract in (left, right):
-        relevant_signal_ids = {
-            signal.id for signal in contract.signals if signal.resource == resource
-        }
-        relevant_control_ids = {
-            control.id for control in contract.controls if control.effect.resource == resource
-        }
-        for recipe in contract.recipes:
-            if (
-                relevant_signal_ids.intersection(recipe.collect)
-                or relevant_control_ids.intersection(recipe.control_refs)
-                or recipe.hypothesis_kind == "shared_resource_conflict"
-            ):
-                recipe_refs.append(_recipe_ref(contract, recipe.id))
-
-    if not recipe_refs and controls:
-        for contract in (left, right):
-            for recipe in contract.recipes:
-                if recipe.hypothesis_kind in {"validation", "starting_point", "parameter_sweep"}:
-                    recipe_refs.append(_recipe_ref(contract, recipe.id))
-    return sorted(dict.fromkeys(recipe_refs))
-
-
-def _validation_signal_refs(
-    left: LibraryContract,
-    right: LibraryContract,
-    resource: ResourceType,
-) -> list[str]:
-    signal_refs = [
-        _signal_ref(contract, signal.id)
-        for contract in (left, right)
-        for signal in contract.signals
-        if signal.resource == resource
+def _controls_for_resource(contract: LibraryContract, resource: str) -> list[Control]:
+    return [
+        control
+        for control in contract.controls
+        if resource in _resources_for_target(contract, control.target)
     ]
-    return sorted(dict.fromkeys(signal_refs))
 
 
-def _recipe_validation_signal_refs(
+def _control_collisions(
+    left: LibraryContract, right: LibraryContract, resource: str
+) -> list[ControlCollision]:
+    left_controls = _controls_for_resource(left, resource)
+    right_controls = _controls_for_resource(right, resource)
+    collisions: dict[tuple[str, str], set[str]] = defaultdict(set)
+    for left_control in left_controls:
+        left_dimension = _target_dimension(left_control.target, resource)
+        for right_control in right_controls:
+            right_dimension = _target_dimension(right_control.target, resource)
+            if left_dimension != right_dimension:
+                continue
+            key = (resource, left_dimension)
+            collisions[key].add(_control_ref(left, left_control.id))
+            collisions[key].add(_control_ref(right, right_control.id))
+    return [
+        ControlCollision(resource=resource, dimension=dimension, controls=sorted(refs))
+        for (resource, dimension), refs in sorted(collisions.items())
+    ]
+
+
+def _signal_relevant(
+    contract: LibraryContract,
+    resource: str,
+    component_ids: set[str],
+    use_ids: set[str],
+    signal_target: str,
+) -> bool:
+    if signal_target == resource or resource in _resources_for_target(contract, signal_target):
+        return True
+    head = signal_target.split(".", 1)[0]
+    return head in component_ids or head in use_ids
+
+
+def _signal_refs(
     left: LibraryContract,
     right: LibraryContract,
-    recipe_refs: list[str],
+    resource: str,
+    component_refs: list[str],
+    use_refs: list[str],
 ) -> list[str]:
-    selected_recipe_refs = set(recipe_refs)
-    signal_refs: list[str] = []
+    relevant: list[str] = []
+    component_ids_by_contract = {
+        left.contract: {
+            ref.split(".", 1)[1] for ref in component_refs if ref.startswith(f"{left.contract}.")
+        },
+        right.contract: {
+            ref.split(".", 1)[1] for ref in component_refs if ref.startswith(f"{right.contract}.")
+        },
+    }
+    use_ids_by_contract = {
+        left.contract: {
+            ref.split(".", 1)[1] for ref in use_refs if ref.startswith(f"{left.contract}.")
+        },
+        right.contract: {
+            ref.split(".", 1)[1] for ref in use_refs if ref.startswith(f"{right.contract}.")
+        },
+    }
     for contract in (left, right):
-        known_signal_ids = {signal.id for signal in contract.signals}
-        for recipe in contract.recipes:
-            if _recipe_ref(contract, recipe.id) not in selected_recipe_refs:
-                continue
-            for signal_id in recipe.collect:
-                if signal_id in known_signal_ids:
-                    signal_refs.append(_signal_ref(contract, signal_id))
-    return sorted(dict.fromkeys(signal_refs))
+        for signal in contract.signals:
+            if _signal_relevant(
+                contract,
+                resource,
+                component_ids_by_contract[contract.contract],
+                use_ids_by_contract[contract.contract],
+                signal.target,
+            ):
+                relevant.append(_signal_ref(contract, signal.id))
+    return sorted(dict.fromkeys(relevant))
+
+
+def _recipe_refs(left: LibraryContract, right: LibraryContract, hypothesis_kind: str) -> list[str]:
+    refs = [
+        _recipe_ref(contract, recipe.id)
+        for contract in (left, right)
+        for recipe in contract.recipes
+        if recipe.hypothesis_kind == hypothesis_kind
+    ]
+    return sorted(dict.fromkeys(refs))
+
+
+def _evidence_refs(
+    left_use: ResourceUse,
+    right_use: ResourceUse,
+    assumptions: list[AssumptionViolation],
+    controls: list[str],
+    signal_refs: list[str],
+    recipe_refs: list[str],
+    left: LibraryContract,
+    right: LibraryContract,
+) -> list[str]:
+    evidence = set(left_use.evidence) | set(right_use.evidence)
+    assumption_lookup = {
+        _assumption_ref(contract, item.id): item
+        for contract in (left, right)
+        for item in contract.assumptions
+    }
+    control_lookup = {
+        _control_ref(contract, item.id): item
+        for contract in (left, right)
+        for item in contract.controls
+    }
+    signal_lookup = {
+        _signal_ref(contract, item.id): item
+        for contract in (left, right)
+        for item in contract.signals
+    }
+    recipe_lookup = {
+        _recipe_ref(contract, item.id): item
+        for contract in (left, right)
+        for item in contract.recipes
+    }
+    for violation in assumptions:
+        evidence.update(assumption_lookup[violation.assumption].evidence)
+    for ref in controls:
+        evidence.update(control_lookup[ref].evidence)
+    for ref in signal_refs:
+        evidence.update(signal_lookup[ref].evidence)
+    for ref in recipe_refs:
+        evidence.update(recipe_lookup[ref].evidence)
+    return sorted(evidence)
+
+
+def derive_shared_resources(contracts: list[LibraryContract]) -> list[SharedResourceItem]:
+    grouped: dict[tuple[str, str], list[tuple[LibraryContract, ResourceUse]]] = defaultdict(list)
+    for contract in contracts:
+        for use in contract.uses:
+            grouped[(use.resource, use.phase)].append((contract, use))
+
+    shared_resources: list[SharedResourceItem] = []
+    for (resource, phase), entries in sorted(grouped.items(), key=lambda item: item[0]):
+        contracts_in_group = sorted({contract.contract for contract, _ in entries})
+        if len(contracts_in_group) < 2:
+            continue
+        shared_resources.append(
+            SharedResourceItem(
+                resource=resource,
+                phase=phase,
+                contracts=contracts_in_group,
+                components=sorted({_component_ref(contract, use.by) for contract, use in entries}),
+                uses=sorted({_use_ref(contract, use.id) for contract, use in entries}),
+                evidence=sorted({evidence for _, use in entries for evidence in use.evidence}),
+            )
+        )
+    return shared_resources
 
 
 def derive_conflict_hypotheses(contracts: list[LibraryContract]) -> list[ConflictHypothesis]:
     hypotheses: list[ConflictHypothesis] = []
-    seen: set[tuple[str, str, str]] = set()
 
     for left, right in combinations(sorted(contracts, key=lambda item: item.contract.lower()), 2):
-        left_controls = _collect_controls_by_resource(left)
-        right_controls = _collect_controls_by_resource(right)
+        grouped_pairs: dict[tuple[str, str], list[tuple[ResourceUse, ResourceUse]]] = defaultdict(
+            list
+        )
         for left_use in left.uses:
             for right_use in right.uses:
                 if left_use.resource != right_use.resource:
                     continue
                 if not _phase_overlaps(left_use.phase, right_use.phase):
                     continue
-                phase = left_use.phase if left_use.phase != "unknown" else right_use.phase
-                key = (left.contract, right.contract, f"{left_use.resource}:{phase}")
-                if key in seen:
-                    continue
+                grouped_pairs[
+                    (left_use.resource, _merged_phase(left_use.phase, right_use.phase))
+                ].append((left_use, right_use))
 
-                controls = sorted(
-                    left_controls.get(left_use.resource, [])
-                    + right_controls.get(right_use.resource, []),
-                    key=lambda item: (item.name.lower(), item.id.lower()),
+        for (resource, phase), overlap_pairs in sorted(
+            grouped_pairs.items(), key=lambda item: item[0]
+        ):
+            hypothesis_kind = RESOURCE_TO_HYPOTHESIS_KIND[resource]
+            overlaps = [
+                HypothesisOverlap(
+                    uses=sorted([_use_ref(left, left_use.id), _use_ref(right, right_use.id)]),
+                    components=sorted(
+                        [
+                            _component_ref_for_use(left, left_use),
+                            _component_ref_for_use(right, right_use),
+                        ]
+                    ),
+                    contracts=sorted([left.contract, right.contract]),
                 )
-                colliding_controls = [
+                for left_use, right_use in overlap_pairs
+            ]
+            use_refs = sorted({ref for overlap in overlaps for ref in overlap.uses})
+            component_refs = sorted({ref for overlap in overlaps for ref in overlap.components})
+            controls = sorted(
+                {
                     _control_ref(contract, control.id)
                     for contract in (left, right)
-                    for control in contract.controls
-                    if control.effect.resource == left_use.resource
-                    and control.scope in {"process", "library", "system", "device"}
+                    for control in _controls_for_resource(contract, resource)
+                }
+            )
+            control_collisions = _control_collisions(left, right, resource)
+            assumption_violations = _assumption_violations(left, right, resource, overlap_pairs)
+            signals = _signal_refs(left, right, resource, component_refs, use_refs)
+            recipes = _recipe_refs(left, right, hypothesis_kind)
+
+            shared_overlap = any(
+                _use_share_allows_overlap(left_use) and _use_share_allows_overlap(right_use)
+                for left_use, right_use in overlap_pairs
+            )
+            oversubscribed = resource == "cpu.compute" and _cpu_compute_oversubscribed(
+                overlap_pairs
+            )
+            placement_conflict = (
+                resource == "cpu.placement"
+                and any(
+                    left_use.share in {"exclusive", "partitioned"}
+                    or right_use.share in {"exclusive", "partitioned"}
+                    for left_use, right_use in overlap_pairs
+                )
+            ) or (
+                resource == "cpu.placement"
+                and any(
+                    item.resource == "cpu.placement"
+                    and str(item.predicate.get("kind", "")).strip() == "placement_compatible"
+                    for item in left.assumptions + right.assumptions
+                )
+            )
+
+            if not any(
+                [
+                    shared_overlap,
+                    oversubscribed,
+                    assumption_violations,
+                    control_collisions,
+                    placement_conflict,
                 ]
-                violated_assumptions = _violated_assumptions(left, right, left_use.resource, phase)
-                sharing_trigger = any(
-                    item.sharing in {"partitionable", "exclusive", "global"}
-                    for item in (left_use, right_use)
-                )
-                role_trigger = {left_use.role, right_use.role} & {"consume", "reserve", "pin"}
+            ):
+                continue
 
-                if (
-                    not colliding_controls
-                    and not violated_assumptions
-                    and not sharing_trigger
-                    and len(role_trigger) < 2
-                ):
-                    continue
+            if not signals:
+                recipe_signal_refs = {
+                    _signal_ref(contract, signal_id)
+                    for contract in (left, right)
+                    for recipe in contract.recipes
+                    if _recipe_ref(contract, recipe.id) in recipes
+                    for signal_id in recipe.collect
+                    if signal_id in {item.id for item in contract.signals}
+                }
+                signals = sorted(recipe_signal_refs)
+            if not signals:
+                continue
 
-                seen.add(key)
-                source_refs = sorted(
-                    set(left_use.source_refs)
-                    | set(right_use.source_refs)
-                    | {
-                        source_ref
-                        for item in left.assumptions + right.assumptions
-                        for source_ref in item.source_refs
-                        if _phase_overlaps(item.predicate.phase, phase)
-                        and item.predicate.resource == left_use.resource
-                    }
-                    | {source_ref for control in controls for source_ref in control.source_refs}
-                    | {
-                        source_ref
-                        for contract in (left, right)
-                        for signal in contract.signals
-                        for source_ref in signal.source_refs
-                        if signal.resource == left_use.resource
-                    }
-                )
-                candidate_recipe_refs = _candidate_recipe_refs(
-                    left,
-                    right,
-                    left_use.resource,
-                    controls,
-                )
-                validation_refs = _validation_signal_refs(left, right, left_use.resource)
-                if not validation_refs:
-                    validation_refs = _recipe_validation_signal_refs(
-                        left, right, candidate_recipe_refs
-                    )
-                if not validation_refs:
-                    continue
+            evidence = _evidence_refs(
+                overlap_pairs[0][0],
+                overlap_pairs[0][1],
+                assumption_violations,
+                controls,
+                signals,
+                recipes,
+                left,
+                right,
+            )
 
-                hypotheses.append(
-                    ConflictHypothesis(
-                        id=f"h_{_slugify(left_use.resource)}_{_slugify(left.contract)}_{_slugify(right.contract)}_{_slugify(phase)}",
-                        kind="shared_resource_conflict",
-                        resource=left_use.resource,
-                        phase=phase,
-                        libraries=sorted([left.contract, right.contract]),
-                        basis=HypothesisBasis(
-                            overlaps=[
-                                HypothesisOverlap(
-                                    uses=sorted(
-                                        [_use_ref(left, left_use.id), _use_ref(right, right_use.id)]
-                                    )
-                                )
-                            ],
-                            violated_assumptions=violated_assumptions,
-                            colliding_controls=sorted(set(colliding_controls)),
-                        ),
-                        validate=HypothesisValidation(collect=validation_refs),
-                        candidate_control_refs=sorted(set(colliding_controls)),
-                        candidate_recipe_refs=candidate_recipe_refs,
-                        source_refs=source_refs,
-                    )
+            hypotheses.append(
+                ConflictHypothesis(
+                    id=f"h_{_slugify(hypothesis_kind)}_{_slugify(left.contract)}_{_slugify(right.contract)}_{_slugify(phase)}",
+                    kind=hypothesis_kind,
+                    resource=resource,
+                    phase=phase,
+                    contracts=sorted([left.contract, right.contract]),
+                    components=component_refs,
+                    uses=use_refs,
+                    basis=HypothesisBasis(
+                        overlaps=overlaps,
+                        assumption_violations=assumption_violations,
+                        control_collisions=control_collisions,
+                    ),
+                    validate=HypothesisValidation(collect=signals),
+                    candidate_actions=controls,
+                    recipes=recipes,
+                    evidence=evidence,
                 )
+            )
     return sorted(hypotheses, key=lambda item: (item.resource, item.phase, item.id))
 
 
@@ -310,8 +505,8 @@ def compose_contracts(
     selected_contracts = [instance.instance_id for instance in instances]
     composed = ComposedContract(
         contract=contract_name,
-        contract_type="composed",
-        version="lpcl/v0",
+        type="composed",
+        version="lpcl/v1",
         selected_contracts=selected_contracts,
         contract_instances=instances,
         shared_resources=derive_shared_resources(instantiated_contracts),

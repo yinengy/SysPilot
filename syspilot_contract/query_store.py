@@ -3,19 +3,20 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping, cast
 
 from syspilot_contract.checker import load_contract
-from syspilot_contract.compose_contracts import compose_contracts
+from syspilot_contract.compose_contracts import compose_contracts as compose_contract_models
 from syspilot_contract.schemas import (
     Assumption,
+    Component,
     ComposedContract,
     Control,
-    ContractInstance,
     LibraryContract,
     Recipe,
     ResourceUse,
     Signal,
+    RESOURCE_TO_HYPOTHESIS_KIND,
 )
 
 
@@ -29,6 +30,40 @@ def _tokenize(value: str) -> list[str]:
 def _score(text: str, terms: list[str]) -> int:
     haystack = set(_tokenize(text))
     return sum(1 for term in terms if term in haystack)
+
+
+def _resource_root(target: str) -> str | None:
+    parts = target.split(".")
+    if len(parts) < 2:
+        return None
+    root = ".".join(parts[:2])
+    return root if root in RESOURCE_TO_HYPOTHESIS_KIND else None
+
+
+def _resources_for_target(contract: LibraryContract, target: str) -> list[str]:
+    if target in RESOURCE_TO_HYPOTHESIS_KIND:
+        return [target]
+    root = _resource_root(target)
+    if root is not None:
+        return [root]
+    use_by_id = {item.id: item for item in contract.uses}
+    if target in use_by_id:
+        return [use_by_id[target].resource]
+    head = target.split(".", 1)[0]
+    if head in use_by_id:
+        return [use_by_id[head].resource]
+    resources = sorted({item.resource for item in contract.uses if item.by == head})
+    return resources
+
+
+def _control_activation_value(control: Control) -> Any | None:
+    if control.effect.kind == "enable":
+        return True
+    if control.effect.kind == "disable":
+        return False
+    if control.effect.kind == "set" and control.effect.value != "input":
+        return control.effect.value
+    return None
 
 
 class ContractStore:
@@ -71,12 +106,7 @@ class ContractStore:
     def list_contracts(self) -> list[str]:
         return sorted(self._contracts)
 
-    def _instance_contracts_for_composed(
-        self,
-        composed: ComposedContract | None,
-    ) -> list[LibraryContract]:
-        if composed is None:
-            return []
+    def _instance_contracts_for_composed(self, composed: ComposedContract) -> list[LibraryContract]:
         libraries: list[LibraryContract] = []
         for instance in composed.contract_instances:
             try:
@@ -85,13 +115,129 @@ class ContractStore:
                 raise KeyError(
                     f"Composed contract '{composed.contract}' references missing contract '{instance.contract_id}' for instance '{instance.instance_id}'"
                 ) from exc
-            if isinstance(contract, LibraryContract):
-                libraries.append(contract.model_copy(update={"contract": instance.instance_id}))
-            else:
+            if not isinstance(contract, LibraryContract):
                 raise TypeError(
                     f"Composed contract '{composed.contract}' instance '{instance.instance_id}' target '{instance.contract_id}' is not a library contract"
                 )
+            libraries.append(contract.model_copy(update={"contract": instance.instance_id}))
         return libraries
+
+    def _libraries_for_contract_id(self, contract_id: str) -> list[LibraryContract]:
+        contract = self.get_contract(contract_id)
+        if isinstance(contract, LibraryContract):
+            return [contract]
+        return self._instance_contracts_for_composed(contract)
+
+    def compose_contracts(
+        self, contract_ids: list[str], app_name: str | None = None
+    ) -> ComposedContract:
+        libraries, composed = self._resolve_context_inputs(contract_ids)
+        if composed is not None and app_name is None:
+            return composed
+        return compose_contract_models(app_name or "context_composed", libraries)
+
+    def list_components(self, contract_id: str) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        for contract in self._libraries_for_contract_id(contract_id):
+            for item in contract.components:
+                rows.append({"contract": contract.contract, **item.model_dump(mode="json")})
+        return rows
+
+    def list_uses(
+        self,
+        contract_id: str,
+        resource: str | None = None,
+        component: str | None = None,
+    ) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        for contract in self._libraries_for_contract_id(contract_id):
+            for item in contract.uses:
+                if resource is not None and item.resource != resource:
+                    continue
+                if component is not None and item.by != component:
+                    continue
+                rows.append({"contract": contract.contract, **item.model_dump(mode="json")})
+        return rows
+
+    def list_controls(
+        self,
+        contract_id: str,
+        target: str | None = None,
+        resource: str | None = None,
+    ) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        for contract in self._libraries_for_contract_id(contract_id):
+            for item in contract.controls:
+                if target is not None and item.target != target:
+                    continue
+                if resource is not None and resource not in _resources_for_target(
+                    contract, item.target
+                ):
+                    continue
+                payload = item.model_dump(mode="json")
+                payload["activation_value"] = _control_activation_value(item)
+                rows.append({"contract": contract.contract, **payload})
+        return rows
+
+    def list_signals(
+        self,
+        contract_id: str,
+        target: str | None = None,
+        resource: str | None = None,
+    ) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        for contract in self._libraries_for_contract_id(contract_id):
+            for item in contract.signals:
+                if target is not None and item.target != target:
+                    continue
+                if resource is not None and resource not in _resources_for_target(
+                    contract, item.target
+                ):
+                    continue
+                rows.append({"contract": contract.contract, **item.model_dump(mode="json")})
+        return rows
+
+    def list_assumptions(
+        self, contract_id: str, resource: str | None = None
+    ) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        for contract in self._libraries_for_contract_id(contract_id):
+            for item in contract.assumptions:
+                if resource is not None and item.resource != resource:
+                    continue
+                rows.append({"contract": contract.contract, **item.model_dump(mode="json")})
+        return rows
+
+    def list_recipes(
+        self,
+        contract_id: str,
+        hypothesis_kind: str | None = None,
+    ) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        for contract in self._libraries_for_contract_id(contract_id):
+            for item in contract.recipes:
+                if hypothesis_kind is not None and item.hypothesis_kind != hypothesis_kind:
+                    continue
+                rows.append(
+                    {"contract": contract.contract, **item.model_dump(mode="json", by_alias=True)}
+                )
+        return rows
+
+    def list_hypotheses(
+        self,
+        composed_contract_id: str,
+        resource: str | None = None,
+        kind: str | None = None,
+    ) -> list[dict[str, object]]:
+        composed = self.compose_contracts([composed_contract_id])
+        rows: list[dict[str, object]] = []
+        for item in composed.hypotheses:
+            if resource is not None and item.resource != resource:
+                continue
+            if kind is not None and item.kind != kind:
+                continue
+            rows.append(item.model_dump(mode="json", by_alias=True))
+        return rows
 
     def _resolve_context_inputs(
         self,
@@ -105,8 +251,10 @@ class ContractStore:
                 library_contracts.append(contract)
             else:
                 composed_contracts.append(contract)
+
         if len(composed_contracts) > 1:
             raise ValueError("Only one composed contract can be queried at a time")
+
         composed = composed_contracts[0] if composed_contracts else None
         if composed is not None:
             libraries = self._instance_contracts_for_composed(composed)
@@ -114,12 +262,23 @@ class ContractStore:
             for contract in explicit_library_map.values():
                 if contract.contract not in {item.contract for item in libraries}:
                     libraries.append(contract)
-        else:
-            libraries = library_contracts
-        if composed is None and len(libraries) >= 2:
-            composed = compose_contracts("context_composed", libraries)
+            recomposed = compose_contract_models(composed.contract, libraries)
+            return libraries, recomposed
+
+        libraries = library_contracts
+        if len(libraries) >= 2:
+            composed = compose_contract_models("context_composed", libraries)
             libraries = self._instance_contracts_for_composed(composed)
         return libraries, composed
+
+    @staticmethod
+    def _require_component_ref(
+        ref: str,
+        ref_map: Mapping[str, tuple[LibraryContract, Component]],
+    ) -> tuple[LibraryContract, Component]:
+        if ref not in ref_map:
+            raise KeyError(f"Unresolved component ref: {ref}")
+        return ref_map[ref]
 
     @staticmethod
     def _require_use_ref(
@@ -176,343 +335,367 @@ class ContractStore:
         libraries, composed = self._resolve_context_inputs(contract_ids)
         terms = _tokenize(" ".join(value for value in (goal, symptom) if value))
 
-        use_ref_map = {
-            f"{contract.contract}.{use.id}": (contract, use)
+        component_ref_map = {
+            f"{contract.contract}.{item.id}": (contract, item)
             for contract in libraries
-            for use in contract.uses
+            for item in contract.components
+        }
+        use_ref_map = {
+            f"{contract.contract}.{item.id}": (contract, item)
+            for contract in libraries
+            for item in contract.uses
         }
         assumption_ref_map = {
-            f"{contract.contract}.{assumption.id}": (contract, assumption)
+            f"{contract.contract}.{item.id}": (contract, item)
             for contract in libraries
-            for assumption in contract.assumptions
+            for item in contract.assumptions
         }
-
         control_ref_map = {
-            f"{contract.contract}.{control.id}": (contract, control)
+            f"{contract.contract}.{item.id}": (contract, item)
             for contract in libraries
-            for control in contract.controls
+            for item in contract.controls
         }
         signal_ref_map = {
-            f"{contract.contract}.{signal.id}": (contract, signal)
+            f"{contract.contract}.{item.id}": (contract, item)
             for contract in libraries
-            for signal in contract.signals
+            for item in contract.signals
         }
         recipe_ref_map = {
-            f"{contract.contract}.{recipe.id}": (contract, recipe)
+            f"{contract.contract}.{item.id}": (contract, item)
             for contract in libraries
-            for recipe in contract.recipes
+            for item in contract.recipes
         }
 
+        relevant_components = [
+            {
+                "contract": contract.contract,
+                **item.model_dump(mode="json"),
+            }
+            for contract in libraries
+            for item in contract.components
+        ]
+
         shared_resources: list[dict[str, object]] = []
+        likely_hypotheses: list[dict[str, object]] = []
+        hypothesis_profiles: list[dict[str, object]] = []
+        conflicts: list[dict[str, object]] = []
+
         if composed is not None:
             for item in composed.shared_resources:
-                resolved_uses = []
-                for ref in item.use_refs:
-                    contract, use = self._require_use_ref(ref, use_ref_map)
-                    resolved_uses.append(
-                        {
-                            "ref": ref,
-                            "library": contract.contract,
-                            "use": use.model_dump(mode="json"),
-                        }
-                    )
+                resolved_components = [
+                    {
+                        "ref": ref,
+                        "contract": self._require_component_ref(ref, component_ref_map)[0].contract,
+                        "component": self._require_component_ref(ref, component_ref_map)[
+                            1
+                        ].model_dump(mode="json"),
+                    }
+                    for ref in item.components
+                ]
+                resolved_uses = [
+                    {
+                        "ref": ref,
+                        "contract": self._require_use_ref(ref, use_ref_map)[0].contract,
+                        "use": self._require_use_ref(ref, use_ref_map)[1].model_dump(mode="json"),
+                    }
+                    for ref in item.uses
+                ]
                 shared_resources.append(
                     {
                         "resource": item.resource,
                         "phase": item.phase,
-                        "libraries": item.libraries,
-                        "use_refs": item.use_refs,
+                        "contracts": item.contracts,
+                        "components": resolved_components,
                         "uses": resolved_uses,
-                        "source_refs": item.source_refs,
+                        "evidence": item.evidence,
                     }
                 )
 
-        observability: list[dict[str, object]] = []
-        for contract in libraries:
-            for signal in contract.signals:
-                text = (
-                    f"{signal.metric} {signal.indicates} {signal.resource} "
-                    f"{signal.probe.kind} {signal.probe.target}"
-                )
-                observability.append(
-                    {
-                        "section": "signals",
-                        "item_id": signal.id,
-                        "title": signal.metric,
-                        "text": text,
-                        "keywords": [
-                            signal.metric,
-                            signal.indicates,
-                            signal.resource,
-                            signal.probe.kind,
-                            signal.probe.target,
-                        ],
-                        "resource_domains": [signal.resource],
-                        "source_refs": signal.source_refs,
-                        "library": contract.contract,
-                        "signal_ref": f"{contract.contract}.{signal.id}",
-                        "signal": signal.model_dump(mode="json"),
-                        "score": _score(text, terms),
-                    }
-                )
-
-        candidate_actions: list[dict[str, object]] = []
-        for contract in libraries:
-            for control in contract.controls:
-                related_recipe_actions = [
-                    action
-                    for recipe in contract.recipes
-                    if control.id in recipe.control_refs
-                    for action in recipe.actions
-                ]
-                activation = (
-                    f" activation={control.activation_value}"
-                    if control.activation_value is not None
-                    else ""
-                )
-                text = (
-                    f"{control.name} type={control.type}{activation} {control.effect.op} {control.effect.resource} "
-                    f"scope {control.scope} {' '.join(related_recipe_actions)}"
-                )
-                candidate_actions.append(
-                    {
-                        "section": "controls",
-                        "item_id": control.id,
-                        "title": control.name,
-                        "text": text,
-                        "keywords": [
-                            control.name,
-                            control.type,
-                            control.effect.resource,
-                            control.effect.op,
-                        ]
-                        + control.allowed_values,
-                        "resource_domains": [control.effect.resource],
-                        "source_refs": control.source_refs,
-                        "library": contract.contract,
-                        "control_ref": f"{contract.contract}.{control.id}",
-                        "control": control.model_dump(mode="json"),
-                        "score": _score(text, terms),
-                    }
-                )
-
-        conflicts: list[dict[str, object]] = []
-        hypothesis_profiles: list[dict[str, object]] = []
-        if composed is not None:
             for item in composed.hypotheses:
+                resolved_components = [
+                    {
+                        "ref": ref,
+                        "contract": self._require_component_ref(ref, component_ref_map)[0].contract,
+                        "component": self._require_component_ref(ref, component_ref_map)[
+                            1
+                        ].model_dump(mode="json"),
+                    }
+                    for ref in item.components
+                ]
+                resolved_uses = [
+                    {
+                        "ref": ref,
+                        "contract": self._require_use_ref(ref, use_ref_map)[0].contract,
+                        "use": self._require_use_ref(ref, use_ref_map)[1].model_dump(mode="json"),
+                    }
+                    for ref in item.uses
+                ]
                 resolved_overlaps = []
                 for overlap in item.basis.overlaps:
-                    resolved_overlap_uses = []
-                    for ref in overlap.uses:
-                        contract, use = self._require_use_ref(ref, use_ref_map)
-                        resolved_overlap_uses.append(
-                            {
-                                "ref": ref,
-                                "library": contract.contract,
-                                "use": use.model_dump(mode="json"),
-                            }
-                        )
+                    overlap_uses = [
+                        {
+                            "ref": ref,
+                            "contract": self._require_use_ref(ref, use_ref_map)[0].contract,
+                            "use": self._require_use_ref(ref, use_ref_map)[1].model_dump(
+                                mode="json"
+                            ),
+                        }
+                        for ref in overlap.uses
+                    ]
                     resolved_overlaps.append(
                         {
-                            "use_refs": overlap.uses,
-                            "uses": resolved_overlap_uses,
+                            "contracts": overlap.contracts,
+                            "components": overlap.components,
+                            "uses": overlap_uses,
                         }
                     )
-                resolved_assumptions = []
-                for ref in item.basis.violated_assumptions:
-                    contract, assumption = self._require_assumption_ref(ref, assumption_ref_map)
-                    resolved_assumptions.append(
+                resolved_assumption_violations = []
+                for violation in item.basis.assumption_violations:
+                    contract, assumption = self._require_assumption_ref(
+                        violation.assumption, assumption_ref_map
+                    )
+                    resolved_assumption_violations.append(
                         {
-                            "ref": ref,
-                            "library": contract.contract,
+                            "ref": violation.assumption,
+                            "contract": contract.contract,
                             "assumption": assumption.model_dump(mode="json"),
+                            "conflicting_uses": violation.conflicting_uses,
                         }
                     )
-                resolved_colliding_controls = []
-                for ref in item.basis.colliding_controls:
-                    contract, control = self._require_control_ref(ref, control_ref_map)
-                    resolved_colliding_controls.append(
+                resolved_control_collisions = []
+                for collision in item.basis.control_collisions:
+                    controls = []
+                    for ref in collision.controls:
+                        contract, control = self._require_control_ref(ref, control_ref_map)
+                        control_payload = control.model_dump(mode="json")
+                        control_payload["activation_value"] = _control_activation_value(control)
+                        controls.append(
+                            {
+                                "ref": ref,
+                                "contract": contract.contract,
+                                "control": control_payload,
+                            }
+                        )
+                    resolved_control_collisions.append(
                         {
-                            "ref": ref,
-                            "library": contract.contract,
-                            "control": control.model_dump(mode="json"),
+                            "resource": collision.resource,
+                            "dimension": collision.dimension,
+                            "controls": controls,
                         }
                     )
-                control_names: list[str] = []
-                for ref in item.basis.colliding_controls:
-                    _, control = self._require_control_ref(ref, control_ref_map)
-                    control_names.append(control.name)
-                signal_titles: list[str] = []
-                for ref in item.validation.collect:
-                    _, signal = self._require_signal_ref(ref, signal_ref_map)
-                    signal_titles.append(signal.metric)
-                recipe_titles: list[str] = []
-                for ref in item.candidate_recipe_refs:
-                    _, recipe = self._require_recipe_ref(ref, recipe_ref_map)
-                    recipe_titles.append(recipe.id)
                 resolved_validation_signals = []
                 for ref in item.validation.collect:
                     contract, signal = self._require_signal_ref(ref, signal_ref_map)
                     resolved_validation_signals.append(
                         {
                             "ref": ref,
-                            "library": contract.contract,
+                            "contract": contract.contract,
                             "signal": signal.model_dump(mode="json"),
                         }
                     )
                 resolved_candidate_controls = []
-                for ref in item.candidate_control_refs:
+                for ref in item.candidate_actions:
+                    if ref not in control_ref_map:
+                        continue
                     contract, control = self._require_control_ref(ref, control_ref_map)
+                    control_payload = control.model_dump(mode="json")
+                    control_payload["activation_value"] = _control_activation_value(control)
                     resolved_candidate_controls.append(
                         {
                             "ref": ref,
-                            "library": contract.contract,
-                            "control": control.model_dump(mode="json"),
+                            "contract": contract.contract,
+                            "control": control_payload,
                         }
                     )
                 resolved_candidate_recipes = []
-                for ref in item.candidate_recipe_refs:
+                for ref in item.recipes:
                     contract, recipe = self._require_recipe_ref(ref, recipe_ref_map)
                     resolved_candidate_recipes.append(
                         {
                             "ref": ref,
-                            "library": contract.contract,
-                            "recipe": recipe.model_dump(mode="json"),
+                            "contract": contract.contract,
+                            "recipe": recipe.model_dump(mode="json", by_alias=True),
                         }
                     )
-                text = (
-                    f"{item.kind} {item.resource} {item.phase} controls {' '.join(control_names)} "
-                    f"signals {' '.join(signal_titles)} recipes {' '.join(recipe_titles)}"
-                )
+
+                validation_probe_names = {
+                    str(entry[1].probe.name)
+                    for entry in [
+                        self._require_signal_ref(ref, signal_ref_map)
+                        for ref in item.validation.collect
+                    ]
+                }
                 report_controls = [
-                    candidate
-                    for candidate in resolved_candidate_controls
-                    if isinstance(candidate.get("control"), dict)
-                    and candidate["control"].get("kind") == "env"
-                    and isinstance(candidate["control"].get("effect"), dict)
-                    and candidate["control"]["effect"].get("op") == "report"
-                    and candidate["control"].get("activation_value") is not None
+                    control_entry
+                    for control_entry in resolved_candidate_controls
+                    if isinstance(control_entry.get("control"), dict)
+                    and control_entry["control"].get("kind") == "env"
+                    and control_entry["control"].get("name") in validation_probe_names
+                    and control_entry["control"].get("activation_value") is not None
                 ]
-                hypothesis_profiles.append(
-                    {
-                        "hypothesis_id": item.id,
-                        "resource": item.resource,
-                        "phase": item.phase,
-                        "libraries": item.libraries,
-                        "validation_signals": resolved_validation_signals,
-                        "report_controls": report_controls,
-                        "candidate_controls": resolved_candidate_controls,
-                        "candidate_recipes": resolved_candidate_recipes,
-                        "source_refs": item.source_refs,
-                    }
+
+                signal_titles = [
+                    entry["signal"]["metric"]
+                    for entry in resolved_validation_signals
+                    if isinstance(entry.get("signal"), dict)
+                ]
+                control_titles = [
+                    entry["control"]["name"]
+                    for entry in resolved_candidate_controls
+                    if isinstance(entry.get("control"), dict)
+                ]
+                recipe_titles = [
+                    entry["recipe"]["id"]
+                    for entry in resolved_candidate_recipes
+                    if isinstance(entry.get("recipe"), dict)
+                ]
+                text = (
+                    f"{item.kind} {item.resource} {item.phase} components {' '.join(item.components)} "
+                    f"signals {' '.join(signal_titles)} controls {' '.join(control_titles)} recipes {' '.join(recipe_titles)}"
                 )
+                payload: dict[str, object] = {
+                    "hypothesis_id": item.id,
+                    "kind": item.kind,
+                    "resource": item.resource,
+                    "phase": item.phase,
+                    "contracts": item.contracts,
+                    "components": resolved_components,
+                    "uses": resolved_uses,
+                    "basis": {
+                        "overlaps": resolved_overlaps,
+                        "assumption_violations": resolved_assumption_violations,
+                        "control_collisions": resolved_control_collisions,
+                    },
+                    "validation_signals": resolved_validation_signals,
+                    "report_controls": report_controls,
+                    "candidate_controls": resolved_candidate_controls,
+                    "candidate_recipes": resolved_candidate_recipes,
+                    "evidence": item.evidence,
+                }
+                hypothesis_profiles.append(payload)
+                likely_hypotheses.append(payload)
                 conflicts.append(
                     {
                         "section": "hypotheses",
                         "item_id": item.id,
-                        "title": f"{item.resource} / {item.phase}",
+                        "title": f"{item.kind} / {item.resource}",
                         "text": text,
-                        "keywords": control_names + signal_titles + recipe_titles,
+                        "keywords": control_titles + signal_titles + recipe_titles,
                         "resource_domains": [item.resource],
-                        "source_refs": item.source_refs,
-                        "libraries": item.libraries,
-                        "resolved_overlaps": resolved_overlaps,
-                        "violated_assumptions": resolved_assumptions,
-                        "colliding_controls": resolved_colliding_controls,
+                        "contracts": item.contracts,
+                        "components": resolved_components,
+                        "uses": resolved_uses,
                         "validation_signals": resolved_validation_signals,
                         "candidate_controls": resolved_candidate_controls,
                         "candidate_recipes": resolved_candidate_recipes,
+                        "evidence": item.evidence,
                         "score": _score(text, terms),
                     }
                 )
-                for ref in item.candidate_control_refs:
-                    contract, control = self._require_control_ref(ref, control_ref_map)
-                    candidate_actions.append(
-                        {
-                            "section": "hypothesis_controls",
-                            "item_id": item.id,
-                            "title": control.name,
-                            "text": (
-                                f"{control.name} type={control.type} {control.effect.op} "
-                                f"{control.effect.resource} scope {control.scope}"
-                            ),
-                            "keywords": [control.name, control.type, control.effect.resource],
-                            "resource_domains": [item.resource],
-                            "source_refs": control.source_refs,
-                            "library": contract.contract,
-                            "control_ref": ref,
-                            "control": control.model_dump(mode="json"),
-                            "score": _score(control.name, terms),
-                        }
-                    )
-                for ref in item.candidate_recipe_refs:
-                    contract, recipe = self._require_recipe_ref(ref, recipe_ref_map)
-                    text = (
-                        f"{recipe.hypothesis_kind} {' '.join(recipe.actions)} "
-                        f"{' '.join(recipe.collect)} {' '.join(recipe.control_refs)}"
-                    )
-                    candidate_actions.append(
-                        {
-                            "section": "hypothesis_recipes",
-                            "item_id": item.id,
-                            "title": recipe.id,
-                            "text": text,
-                            "keywords": recipe.collect + recipe.control_refs,
-                            "resource_domains": [item.resource],
-                            "source_refs": recipe.source_refs,
-                            "library": contract.contract,
-                            "recipe_ref": ref,
-                            "recipe": recipe.model_dump(mode="json"),
-                            "score": _score(text, terms),
-                        }
-                    )
 
+        profile_first: list[dict[str, object]] = []
+        signals_to_collect: list[dict[str, object]] = []
+        for contract in libraries:
+            for signal in contract.signals:
+                resources = _resources_for_target(contract, signal.target)
+                text = f"{signal.metric} {signal.indicates} {signal.target} {signal.probe.kind} {signal.probe.name} {' '.join(resources)}"
+                payload: dict[str, object] = {
+                    "section": "signals",
+                    "item_id": signal.id,
+                    "title": signal.metric,
+                    "text": text,
+                    "keywords": [signal.metric, signal.indicates, signal.target, signal.probe.name],
+                    "resource_domains": resources,
+                    "evidence": signal.evidence,
+                    "library": contract.contract,
+                    "signal_ref": f"{contract.contract}.{signal.id}",
+                    "signal": signal.model_dump(mode="json"),
+                    "score": _score(text, terms),
+                }
+                profile_first.append(payload)
+                signals_to_collect.append(payload)
+
+        candidate_actions: list[dict[str, object]] = []
+        candidate_controls: list[dict[str, object]] = []
+        for contract in libraries:
+            for control in contract.controls:
+                resources = _resources_for_target(contract, control.target)
+                control_payload = control.model_dump(mode="json")
+                control_payload["activation_value"] = _control_activation_value(control)
+                text = f"{control.name} {control.kind} {control.type} target={control.target} effect={control.effect.kind} {' '.join(resources)}"
+                payload: dict[str, object] = {
+                    "section": "controls",
+                    "item_id": control.id,
+                    "title": control.name,
+                    "text": text,
+                    "keywords": [
+                        control.name,
+                        control.kind,
+                        control.type,
+                        control.target,
+                        control.effect.kind,
+                    ],
+                    "resource_domains": resources,
+                    "evidence": control.evidence,
+                    "library": contract.contract,
+                    "control_ref": f"{contract.contract}.{control.id}",
+                    "control": control_payload,
+                    "score": _score(text, terms),
+                }
+                candidate_actions.append(payload)
+                candidate_controls.append(payload)
+
+        recipes: list[dict[str, object]] = []
         validation: list[dict[str, object]] = []
         for contract in libraries:
             for recipe in contract.recipes:
-                text = f"{recipe.accept_if} {recipe.rollback_if} {' '.join(recipe.collect)} {' '.join(recipe.actions)}"
-                validation.append(
+                text = f"{recipe.hypothesis_kind} {' '.join(recipe.collect)} {' '.join(recipe.actions)}"
+                payload: dict[str, object] = {
+                    "section": "recipes",
+                    "item_id": recipe.id,
+                    "title": recipe.hypothesis_kind,
+                    "text": text,
+                    "keywords": recipe.collect + recipe.actions,
+                    "evidence": recipe.evidence,
+                    "library": contract.contract,
+                    "recipe_ref": f"{contract.contract}.{recipe.id}",
+                    "recipe": recipe.model_dump(mode="json", by_alias=True),
+                    "score": _score(text, terms),
+                }
+                recipes.append(payload)
+                validation.append(payload)
+                candidate_actions.append(
                     {
-                        "section": "recipes",
-                        "item_id": recipe.id,
-                        "title": recipe.hypothesis_kind,
-                        "text": text,
-                        "keywords": recipe.collect,
-                        "source_refs": recipe.source_refs,
-                        "library": contract.contract,
-                        "recipe_ref": f"{contract.contract}.{recipe.id}",
-                        "recipe": recipe.model_dump(mode="json"),
-                        "score": _score(text, terms),
+                        **payload,
+                        "section": "recipe_actions",
+                        "title": recipe.id,
                     }
                 )
+
         if composed is not None:
             for item in composed.hypotheses:
-                signal_titles: list[str] = []
-                for ref in item.validation.collect:
-                    _, signal = self._require_signal_ref(ref, signal_ref_map)
-                    signal_titles.append(signal.metric)
-                text = f"collect {' '.join(signal_titles)} for {item.id}"
-                resolved_signals = []
-                for ref in item.validation.collect:
-                    contract, signal = self._require_signal_ref(ref, signal_ref_map)
-                    resolved_signals.append(
-                        {
-                            "ref": ref,
-                            "library": contract.contract,
-                            "signal": signal.model_dump(mode="json"),
-                        }
-                    )
                 validation.append(
                     {
                         "section": "hypothesis_validation",
                         "item_id": item.id,
                         "title": item.id,
-                        "text": text,
-                        "keywords": signal_titles,
-                        "source_refs": item.source_refs,
-                        "library": ", ".join(item.libraries),
-                        "signals": resolved_signals,
-                        "score": _score(text, terms),
+                        "text": f"collect {' '.join(item.validation.collect)}",
+                        "keywords": item.validation.collect,
+                        "evidence": item.evidence,
+                        "library": ", ".join(item.contracts),
+                        "signals": [
+                            {
+                                "ref": ref,
+                                "contract": self._require_signal_ref(ref, signal_ref_map)[
+                                    0
+                                ].contract,
+                                "signal": self._require_signal_ref(ref, signal_ref_map)[
+                                    1
+                                ].model_dump(mode="json"),
+                            }
+                            for ref in item.validation.collect
+                        ],
+                        "score": _score(" ".join(item.validation.collect), terms),
                     }
                 )
 
@@ -536,17 +719,24 @@ class ContractStore:
             ]
 
         labels = [contract.contract for contract in libraries]
-        if composed is not None and not labels:
-            labels = [instance.instance_id for instance in composed.contract_instances]
         summary = (
-            f"Structured contract context for {', '.join(sorted(labels))}. "
+            f"Structured LPCL v1 context for {', '.join(sorted(labels))}. "
             f"Goal={goal or 'unspecified'}. Symptom={symptom or 'unspecified'}."
+        )
+        relevant_resources = sorted(
+            {item.resource for contract in libraries for item in contract.uses}
         )
         return {
             "summary": summary,
+            "relevant_components": relevant_components,
+            "relevant_resources": relevant_resources,
+            "likely_hypotheses": likely_hypotheses,
+            "signals_to_collect": signals_to_collect,
+            "candidate_controls": candidate_controls,
+            "recipes": recipes,
             "shared_resources": shared_resources,
             "hypothesis_profiles": hypothesis_profiles,
-            "profile_first": _rank(observability),
+            "profile_first": _rank(profile_first),
             "candidate_actions": _rank(candidate_actions),
             "conflicts": _rank(conflicts),
             "validation": _rank(validation),

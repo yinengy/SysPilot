@@ -834,6 +834,12 @@ def synthesize_manual_cmd(
     type=click.Path(path_type=Path),
     help="Runtime contract root",
 )
+@click.option(
+    "--include-evidence/--no-include-evidence",
+    default=False,
+    show_default=True,
+    help="Include evidence blocks in generated LPCL output",
+)
 @click.pass_context
 def synthesize_contract_cmd(
     ctx: click.Context,
@@ -841,6 +847,7 @@ def synthesize_contract_cmd(
     contract_id: str | None,
     artifact_root: Path,
     contract_root: Path | None,
+    include_evidence: bool,
 ) -> None:
     from syspilot_contract.integration import synthesize_library_contract_bundle
     from syspilot_manual.llm_client import ManualLLMClient
@@ -858,6 +865,7 @@ def synthesize_contract_cmd(
             artifact_root=artifact_root,
             llm_client=llm_client,
             contract_root=resolved_contract_root,
+            include_evidence=include_evidence,
             progress_callback=_contract_synthesis_progress_callback,
         )
     )
@@ -871,6 +879,36 @@ def synthesize_contract_cmd(
                 "contract_yaml": str(
                     resolved_contract_root / resolved_contract_id / "contract.yaml"
                 ),
+                "contract_lpcl": str(
+                    resolved_contract_root / resolved_contract_id / "contract.lpcl"
+                ),
+            },
+            indent=2,
+        )
+    )
+
+
+@cli.command("compile-lpcl")
+@click.option("--input", "input_path", required=True, type=click.Path(path_type=Path))
+@click.option("--output", "output_path", required=True, type=click.Path(path_type=Path))
+@click.option(
+    "--include-evidence/--no-include-evidence",
+    default=False,
+    show_default=True,
+    help="Include evidence blocks in compiled LPCL output",
+)
+def compile_lpcl_cmd(input_path: Path, output_path: Path, include_evidence: bool) -> None:
+    from syspilot_contract.compiler import compile_lpcl_file
+
+    try:
+        compile_lpcl_file(input_path, output_path, include_evidence=include_evidence)
+    except Exception as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(
+        json.dumps(
+            {
+                "input": str(input_path),
+                "output": str(output_path),
             },
             indent=2,
         )
@@ -884,13 +922,23 @@ def synthesize_contract_cmd(
     type=click.Path(path_type=Path),
     help="Optional runtime contract root for ID lookup",
 )
-def check_contract_cmd(contract_ref: str, contract_root: Path | None) -> None:
+@click.option(
+    "--allow-migration/--no-allow-migration",
+    default=False,
+    show_default=True,
+    help="Allow legacy LPCL payload migration before validation",
+)
+def check_contract_cmd(
+    contract_ref: str,
+    contract_root: Path | None,
+    allow_migration: bool,
+) -> None:
     from syspilot_contract.checker import validate_contract_file
 
     contract_path = _resolve_contract_path(contract_ref, contract_root)
     if not contract_path.exists():
         raise click.ClickException(f"Contract not found: {contract_path}")
-    contract, result = validate_contract_file(contract_path)
+    contract, result = validate_contract_file(contract_path, allow_migration=allow_migration)
     click.echo(
         json.dumps(
             {
@@ -1034,12 +1082,26 @@ def compose_manuals_cmd(
     "--contract-root",
     type=click.Path(path_type=Path),
 )
+@click.option(
+    "--allow-migration/--no-allow-migration",
+    default=False,
+    show_default=True,
+    help="Allow legacy LPCL payload migration before composition",
+)
+@click.option(
+    "--include-evidence/--no-include-evidence",
+    default=False,
+    show_default=True,
+    help="Include evidence blocks in generated LPCL output",
+)
 def compose_contracts_cmd(
     app: str,
     contracts: tuple[str, ...],
     contract_id: str | None,
     artifact_root: Path,
     contract_root: Path | None,
+    allow_migration: bool,
+    include_evidence: bool,
 ) -> None:
     from syspilot_contract.integration import compose_and_write_contract
 
@@ -1051,6 +1113,8 @@ def compose_contracts_cmd(
         contract_refs=list(contracts),
         artifact_root=artifact_root,
         contract_root=resolved_contract_root,
+        allow_migration=allow_migration,
+        include_evidence=include_evidence,
         progress_callback=_contract_composition_progress_callback,
     )
     click.echo(
@@ -1062,6 +1126,9 @@ def compose_contracts_cmd(
                 "bundle_dir": str(resolved_contract_root / resolved_contract_id),
                 "contract_yaml": str(
                     resolved_contract_root / resolved_contract_id / "contract.yaml"
+                ),
+                "contract_lpcl": str(
+                    resolved_contract_root / resolved_contract_id / "contract.lpcl"
                 ),
             },
             indent=2,
@@ -1805,6 +1872,18 @@ def _collect_contract_report_env(hypothesis_profiles: list[dict[str, Any]]) -> d
                 continue
             name = str(control.get("name", "")).strip()
             activation_value = control.get("activation_value")
+            if activation_value is None:
+                effect = control.get("effect")
+                if isinstance(effect, dict):
+                    effect_kind = str(effect.get("kind", "")).strip()
+                    if effect_kind == "enable":
+                        activation_value = True
+                    elif effect_kind == "disable":
+                        activation_value = False
+                    elif effect_kind == "set":
+                        effect_value = effect.get("value")
+                        if effect_value != "input":
+                            activation_value = effect_value
             if not name or activation_value is None:
                 continue
             report_env.setdefault(name, _stringify_env_value(activation_value))
@@ -1862,7 +1941,7 @@ def _build_contract_hypothesis_validation_script(
         "def _signal_result(signal_entry):\n"
         "    signal = signal_entry.get('signal', {}) if isinstance(signal_entry, dict) else {}\n"
         "    probe = signal.get('probe', {}) if isinstance(signal, dict) else {}\n"
-        "    target = str(probe.get('target', '')).strip()\n"
+        "    target = str(probe.get('name', probe.get('target', ''))).strip()\n"
         "    kind = str(probe.get('kind', '')).strip()\n"
         "    result = {\n"
         "        'ref': signal_entry.get('ref'),\n"
@@ -1874,20 +1953,20 @@ def _build_contract_hypothesis_validation_script(
         "        'excerpt': [],\n"
         "    }\n"
         "    lines = combined_output.splitlines()\n"
-        "    if kind == 'runtime_env':\n"
+        "    if kind in ('log', 'manual'):\n"
         "        matches = [line.strip() for line in lines if target.lower() in line.lower()]\n"
         "        result['observed'] = bool(matches)\n"
         "        result['source'] = 'runtime_output' if matches else 'runtime_output_missing'\n"
         "        result['value'] = matches[:8] if matches else None\n"
         "        result['excerpt'] = matches[:8]\n"
         "        return result\n"
-        "    if kind == 'procfs':\n"
+        "    if kind == 'os':\n"
         "        value = refined_runtime_maps.get(target)\n"
         "        result['observed'] = value is not None\n"
-        "        result['source'] = 'refined_runtime_maps' if value is not None else 'procfs_missing'\n"
+        "        result['source'] = 'refined_runtime_maps' if value is not None else 'os_missing'\n"
         "        result['value'] = value\n"
         "        return result\n"
-        "    if kind == 'command':\n"
+        "    if kind == 'api':\n"
         "        if target == 'openblas_get_num_threads':\n"
         "            value = runtime_output.get('threads_counted')\n"
         "            if value is None:\n"
@@ -1933,6 +2012,13 @@ def _build_contract_hypothesis_validation_script(
         "            result['value'] = matches[:8] if matches else None\n"
         "            result['excerpt'] = matches[:8]\n"
         "            return result\n"
+        "        matches = [line.strip() for line in lines if target.lower() in line.lower()]\n"
+        "        result['observed'] = bool(matches)\n"
+        "        result['source'] = 'runtime_output' if matches else 'unsupported'\n"
+        "        result['value'] = matches[:8] if matches else None\n"
+        "        result['excerpt'] = matches[:8]\n"
+        "        return result\n"
+        "    if kind in ('perf', 'profiler', 'benchmark'):\n"
         "        matches = [line.strip() for line in lines if target.lower() in line.lower()]\n"
         "        result['observed'] = bool(matches)\n"
         "        result['source'] = 'runtime_output' if matches else 'unsupported'\n"

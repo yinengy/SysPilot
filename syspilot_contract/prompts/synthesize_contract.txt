@@ -1,56 +1,105 @@
-You are synthesizing a typed LPCL library performance contract from extracted evidence.
+You are synthesizing an LPCL v1 library performance contract from extracted evidence.
 
-Return JSON only and match the provided schema exactly.
+Return YAML or JSON only. Do not return prose.
 
-Rules:
-- contract_type must be "library"
-- version must be "lpcl/v0"
-- use only supported evidence from the input
-- do not invent unsupported knobs, signals, assumptions, or recipes
-- every generated item must include source_refs
-- controls.affects must reference existing use ids
-- recipes.collect must reference existing signal ids
-- recipes.control_refs should reference existing control ids when a recipe changes or validates a control
-- omit any control that does not have at least one affected use and source_refs
-- omit any recipe that does not have at least one collected signal, one action, and source_refs
-- map evidence into LPCL sections: uses, assumptions, controls, signals, recipes
-- map old evidence hints into LPCL resource vocabulary where appropriate
-- if something is unclear, omit it instead of guessing
-- use canonical host symbols for bounds when applicable: host.physical_cores, host.visible_cpus, host.numa_nodes
-- control.name must be the canonical knob token only; never inline values like KMP_AFFINITY=verbose into the name field
-- control.type must be one of: int, bool, enum, string, cpu_set, numa_node_set
-- if a control needs a specific enabling value, put it in activation_value
-- if control.type is enum and the allowed values are known from docs, include allowed_values
-- signals must use probe.kind + probe.target instead of a free-form tool string
-- probe.kind must be one of: command, procfs, runtime_env
-- recipe.hypothesis_kind must be one of: baseline_validation, parameter_sweep, validation, starting_point, shared_resource_conflict
+Hard requirements:
+- version must be "lpcl/v1"
+- type must be "library"
+- include top-level fields: version, contract, type, components, uses, assumptions, controls, signals, recipes
+- every component, use, assumption, control, signal, and recipe must include evidence
+- if evidence is weak or unrelated to resource contention, omit the claim
+- prefer fewer, higher-quality declarations over weak coverage
 
-Preferred LPCL resource vocabulary:
-- cpu.core
-- cpu.thread
-- cpu.affinity
-- gpu.device
-- gpu.stream
+Do not create new resource names.
+
+The only valid resources are:
+- cpu.compute
+- cpu.placement
+- gpu.compute
+- gpu.memory
 - mem.capacity
 - mem.bandwidth
-- mem.allocator
 - io.bandwidth
 - io.queue
-- net.bandwidth
-- worker.pool
-- cache.capacity
 
-Preferred assumptions:
-- max_competitors
-- budget_at_most
-- dedicated_partition
-- affinity_compatible
-- not_nested
+Model implementation mechanisms as components, not resources.
 
-Preferred demand kinds:
-- fixed
-- range
-- scaled_by
-- proportional_to
-- burst
-- unknown
+If the source mentions threads, workers, thread pools, task pools, OpenMP teams, TBB arenas, queues, streams, backends, allocators, scratchpads, or caches, model them as components unless they directly refer to one of the valid shared resources.
+
+Component rules:
+- component.kind must be one of: executor, queue, allocator, backend, cache
+- component.attrs is descriptive only
+- thread and worker counts belong on executor attrs/workers and cpu.compute demand.dimension=workers
+
+Mapping rules:
+1. Model worker/thread count as:
+   - component kind: executor
+   - attribute: workers
+   - use resource: cpu.compute
+   - demand dimension: workers
+2. Model CPU affinity/pinning as:
+   - use resource: cpu.placement
+   - demand dimension: core_set
+3. Model GPU device use as:
+   - use resource: gpu.compute
+4. Model GPU memory/workspace/scratchpad as:
+   - use resource: gpu.memory
+5. Model host memory footprint/cache/buffer capacity as:
+   - use resource: mem.capacity
+6. Model memory traffic/bandwidth pressure as:
+   - use resource: mem.bandwidth
+7. Model I/O throughput as:
+   - use resource: io.bandwidth
+8. Model I/O queue depth/concurrency as:
+   - use resource: io.queue
+
+Use schema:
+- use.resource must be one of the valid resources
+- use.by must reference an existing component id
+- use.phase must be one of: init, compute, communication, flush, background, teardown, unknown
+- use.scope must be one of: thread, process, library, device, system
+- use.share must be one of: shared, exclusive, partitioned, process_global
+
+Demand schemas:
+- cpu.compute -> {dimension: workers, min: <number_or_symbol>, max: <number_or_symbol>}
+- cpu.placement -> {dimension: core_set, source: <string_or_symbol>}
+- gpu.compute -> {dimension: devices, min, max} OR {dimension: partition, source}
+- gpu.memory -> {dimension: bytes, min, max}
+- mem.capacity -> {dimension: bytes, min, max}
+- mem.bandwidth -> {dimension: intensity, value: <number_or_symbol_or_unknown>}
+- io.bandwidth -> {dimension: bandwidth, min, max}
+- io.queue -> {dimension: depth, min, max}
+
+Assumption rules:
+- predicate.kind must be one of: total_at_most, competitors_at_most, exclusive, not_nested, placement_compatible
+- not_nested is valid only for cpu.compute and gpu.compute
+- placement_compatible is valid only for cpu.placement
+
+Control rules:
+- control.kind must be one of: env, api, config, cli, vlc
+- control.type must be one of: int, float, bool, string, enum, set
+- control.target must point to a component id, component attribute path, use id, use demand path, or a valid resource
+- control.effect.kind must be one of: set, increase, decrease, partition, disable, enable
+- OPENBLAS_NUM_THREADS, OMP_NUM_THREADS, MKL_NUM_THREADS, and similar knobs should target executor.workers, not a fake resource
+- affinity controls should target a cpu.placement use or component placement attribute
+- backend controls should target a backend component attribute
+- thread timeout controls should target executor.idle_timeout
+
+Signal rules:
+- signal.probe.kind must be one of: api, perf, os, log, profiler, benchmark, manual
+- signal.probe.name must be the canonical probe name
+
+Recipe rules:
+- recipe.for must be one of:
+  - shared_cpu_compute_conflict
+  - cpu_placement_conflict
+  - shared_gpu_compute_conflict
+  - gpu_memory_pressure
+  - host_memory_capacity_pressure
+  - memory_bandwidth_contention
+  - io_bandwidth_contention
+  - io_queue_contention
+- recipe.collect must reference existing signal ids
+
+Do not emit unsupported claims.
+When uncertain, omit the claim.

@@ -4,149 +4,175 @@ from typing import cast
 from syspilot_contract.checker import dump_contract_yaml
 from syspilot_contract.compose_contracts import compose_contracts, derive_conflict_hypotheses
 from syspilot_contract.integration import build_agent_context_bundle, write_contract_bundle
+from syspilot_contract.query_store import ContractStore
 from syspilot_contract.schemas import LibraryContract
 
 
-def _contract(name: str, control_name: str, role: str = "consume") -> LibraryContract:
+def _compute_contract(
+    name: str, control_name: str, signal_prefix: str | None = None
+) -> LibraryContract:
+    signal_prefix = signal_prefix or name.lower()
     return LibraryContract.model_validate(
         {
+            "version": "lpcl/v1",
             "contract": name,
-            "version": "lpcl/v0",
-            "contract_type": "library",
-            "source_artifacts": [
-                {"source_id": f"{name}_doc", "path": f"docs/{name}.md", "kind": "doc"}
+            "type": "library",
+            "components": [
+                {
+                    "id": f"{signal_prefix}_threads",
+                    "kind": "executor",
+                    "attrs": {
+                        "executor_kind": "thread_pool",
+                        "workers": {"min": 1, "max": "host.cpu_slots"},
+                    },
+                    "evidence": [f"{signal_prefix}_doc:chunk_001"],
+                }
             ],
             "uses": [
                 {
-                    "id": "threads",
-                    "resource": "cpu.thread",
+                    "id": f"{signal_prefix}_cpu_compute",
+                    "resource": "cpu.compute",
+                    "by": f"{signal_prefix}_threads",
                     "phase": "compute",
                     "scope": "process",
-                    "role": role,
-                    "sharing": "partitionable",
                     "demand": {
-                        "kind": "scaled_by",
-                        "knob": control_name,
-                        "lower": 1,
-                        "upper": "host.physical_cores",
+                        "dimension": "workers",
+                        "min": 1,
+                        "max": "host.cpu_slots",
                     },
-                    "source_refs": [f"{name}_doc:chunk_001"],
+                    "share": "shared",
+                    "evidence": [f"{signal_prefix}_doc:chunk_001"],
                 }
             ],
             "assumptions": [
                 {
-                    "id": "solo_compute_pool",
-                    "predicate": {
-                        "kind": "max_competitors",
-                        "resource": "cpu.thread",
-                        "phase": "compute",
-                        "value": 1,
-                    },
-                    "source_refs": [f"{name}_doc:chunk_001"],
+                    "id": f"{signal_prefix}_not_nested",
+                    "resource": "cpu.compute",
+                    "predicate": {"kind": "not_nested"},
+                    "evidence": [f"{signal_prefix}_doc:chunk_001"],
                 }
             ],
             "controls": [
                 {
-                    "id": f"{name}_control",
+                    "id": f"{signal_prefix}_threads_control",
                     "name": control_name,
                     "kind": "env",
                     "type": "int",
-                    "affects": ["threads"],
-                    "effect": {"op": "increase", "resource": "cpu.thread", "strength": "strong"},
-                    "scope": "process",
-                    "source_refs": [f"{name}_doc:chunk_001"],
+                    "target": f"{signal_prefix}_threads.workers",
+                    "effect": {"kind": "set", "value": "input"},
+                    "evidence": [f"{signal_prefix}_doc:chunk_001"],
                 }
             ],
             "signals": [
                 {
-                    "id": f"{name}_signal",
-                    "metric": f"{name}.runqueue_length",
-                    "resource": "cpu.thread",
-                    "indicates": "thread contention",
-                    "probe": {"kind": "command", "target": "perf"},
-                    "source_refs": [f"{name}_doc:chunk_001"],
-                }
+                    "id": f"{signal_prefix}_thread_count",
+                    "target": f"{signal_prefix}_threads.workers",
+                    "metric": "active_thread_count",
+                    "indicates": "effective_worker_count",
+                    "probe": {"kind": "api", "name": control_name.lower().replace("-", "_")},
+                    "evidence": [f"{signal_prefix}_doc:chunk_001"],
+                },
+                {
+                    "id": f"{signal_prefix}_ctx_switch_rate",
+                    "target": "cpu.compute",
+                    "metric": "os.context_switch_rate",
+                    "indicates": "oversubscription",
+                    "probe": {"kind": "perf", "name": "perf_stat"},
+                    "evidence": [f"{signal_prefix}_doc:chunk_001"],
+                },
             ],
             "recipes": [
                 {
-                    "id": f"{name}_recipe",
-                    "hypothesis_kind": "shared_resource_conflict",
-                    "collect": [f"{name}_signal"],
-                    "control_refs": [f"{name}_control"],
-                    "actions": [f"decrease {control_name}"],
-                    "accept_if": "throughput improves",
-                    "rollback_if": "throughput regresses",
-                    "source_refs": [f"{name}_doc:chunk_001"],
+                    "id": f"{signal_prefix}_reduce_oversubscription",
+                    "for": "shared_cpu_compute_conflict",
+                    "collect": [
+                        f"{signal_prefix}_thread_count",
+                        f"{signal_prefix}_ctx_switch_rate",
+                    ],
+                    "actions": [f"set {control_name} to 1"],
+                    "accept": "effective_worker_count == 1 and throughput_not_worse",
+                    "rollback": "throughput_worse",
+                    "evidence": [f"{signal_prefix}_doc:chunk_001"],
                 }
             ],
         }
     )
 
 
-def _affinity_contract(name: str, control_name: str) -> LibraryContract:
+def _placement_contract(name: str, bind_name: str, places_name: str) -> LibraryContract:
+    prefix = name.lower()
     return LibraryContract.model_validate(
         {
+            "version": "lpcl/v1",
             "contract": name,
-            "version": "lpcl/v0",
-            "contract_type": "library",
-            "source_artifacts": [
-                {"source_id": f"{name}_doc", "path": f"docs/{name}.md", "kind": "doc"}
+            "type": "library",
+            "components": [
+                {
+                    "id": f"{prefix}_threads",
+                    "kind": "executor",
+                    "attrs": {"executor_kind": "thread_pool"},
+                    "evidence": [f"{prefix}_doc:chunk_001"],
+                }
             ],
             "uses": [
                 {
-                    "id": "affinity",
-                    "resource": "cpu.affinity",
+                    "id": f"{prefix}_cpu_placement",
+                    "resource": "cpu.placement",
+                    "by": f"{prefix}_threads",
                     "phase": "compute",
                     "scope": "process",
-                    "role": "pin",
-                    "sharing": "partitionable",
-                    "demand": {"kind": "unknown"},
-                    "source_refs": [f"{name}_doc:chunk_001"],
+                    "demand": {"dimension": "core_set", "source": "runtime_affinity_mask"},
+                    "share": "partitioned",
+                    "evidence": [f"{prefix}_doc:chunk_001"],
                 }
             ],
             "assumptions": [
                 {
-                    "id": "affinity_ok",
-                    "predicate": {
-                        "kind": "affinity_compatible",
-                        "resource": "cpu.affinity",
-                        "phase": "compute",
-                    },
-                    "source_refs": [f"{name}_doc:chunk_001"],
+                    "id": f"{prefix}_placement_compatible",
+                    "resource": "cpu.placement",
+                    "predicate": {"kind": "placement_compatible"},
+                    "evidence": [f"{prefix}_doc:chunk_001"],
                 }
             ],
             "controls": [
                 {
-                    "id": f"{name}_affinity_control",
-                    "name": control_name,
+                    "id": f"{prefix}_proc_bind",
+                    "name": bind_name,
+                    "kind": "env",
+                    "type": "enum",
+                    "target": f"{prefix}_cpu_placement",
+                    "effect": {"kind": "set", "value": "input"},
+                    "evidence": [f"{prefix}_doc:chunk_001"],
+                },
+                {
+                    "id": f"{prefix}_places",
+                    "name": places_name,
                     "kind": "env",
                     "type": "string",
-                    "affects": ["affinity"],
-                    "effect": {"op": "select", "resource": "cpu.affinity", "strength": "strong"},
-                    "scope": "process",
-                    "source_refs": [f"{name}_doc:chunk_001"],
-                }
+                    "target": f"{prefix}_cpu_placement",
+                    "effect": {"kind": "set", "value": "input"},
+                    "evidence": [f"{prefix}_doc:chunk_001"],
+                },
             ],
             "signals": [
                 {
-                    "id": f"{name}_timing_signal",
-                    "metric": f"{name}.timing",
-                    "resource": "cpu.thread",
-                    "indicates": "runtime timing for placement comparison",
-                    "probe": {"kind": "command", "target": "log"},
-                    "source_refs": [f"{name}_doc:chunk_001"],
+                    "id": f"{prefix}_placement_signal",
+                    "target": "cpu.placement",
+                    "metric": "thread_placement",
+                    "indicates": "placement_state",
+                    "probe": {"kind": "log", "name": "OMP_DISPLAY_AFFINITY"},
+                    "evidence": [f"{prefix}_doc:chunk_001"],
                 }
             ],
             "recipes": [
                 {
-                    "id": f"{name}_affinity_recipe",
-                    "hypothesis_kind": "shared_resource_conflict",
-                    "collect": [f"{name}_timing_signal"],
-                    "control_refs": [f"{name}_affinity_control"],
-                    "actions": [f"compare placement with {control_name}"],
-                    "accept_if": "runtime improves",
-                    "rollback_if": "runtime regresses",
-                    "source_refs": [f"{name}_doc:chunk_001"],
+                    "id": f"{prefix}_placement_recipe",
+                    "for": "cpu_placement_conflict",
+                    "collect": [f"{prefix}_placement_signal"],
+                    "actions": [f"compare placement with {bind_name} and {places_name}"],
+                    "accept": "placement_matches_intent",
+                    "rollback": "placement_conflicts",
+                    "evidence": [f"{prefix}_doc:chunk_001"],
                 }
             ],
         }
@@ -154,8 +180,8 @@ def _affinity_contract(name: str, control_name: str) -> LibraryContract:
 
 
 def test_compose_order_independent() -> None:
-    openmp = _contract("OpenMP", "OMP_NUM_THREADS")
-    openblas = _contract("OpenBLAS", "OPENBLAS_NUM_THREADS")
+    openmp = _compute_contract("OpenMP", "OMP_NUM_THREADS", "omp")
+    openblas = _compute_contract("OpenBLAS", "OPENBLAS_NUM_THREADS", "blas")
 
     first = compose_contracts("openmp_openblas", [openmp, openblas])
     second = compose_contracts("openmp_openblas", [openblas, openmp])
@@ -163,25 +189,56 @@ def test_compose_order_independent() -> None:
     assert dump_contract_yaml(first) == dump_contract_yaml(second)
 
 
-def test_composer_derives_hypotheses_from_shared_resource() -> None:
-    openmp = _contract("OpenMP", "OMP_NUM_THREADS")
-    openblas = _contract("OpenBLAS", "OPENBLAS_NUM_THREADS", role="reserve")
+def test_compose_openblas_openmp_derives_shared_cpu_compute_conflict() -> None:
+    openmp = _compute_contract("OpenMP", "OMP_NUM_THREADS", "omp")
+    openblas = _compute_contract("OpenBLAS", "OPENBLAS_NUM_THREADS", "blas")
 
     hypotheses = derive_conflict_hypotheses([openmp, openblas])
 
     assert hypotheses
-    assert hypotheses[0].resource == "cpu.thread"
-    assert "OpenMP.OpenMP_control" in hypotheses[0].basis.colliding_controls
-    assert any("solo_compute_pool" in item for item in hypotheses[0].basis.violated_assumptions)
-    assert "OpenMP.OpenMP_signal" in hypotheses[0].validation.collect
-    assert "OpenMP.OpenMP_recipe" in hypotheses[0].candidate_recipe_refs
+    hypothesis = hypotheses[0]
+    assert hypothesis.kind == "shared_cpu_compute_conflict"
+    assert hypothesis.resource == "cpu.compute"
+    assert sorted(hypothesis.contracts) == ["OpenBLAS", "OpenMP"]
+    assert any(ref.endswith("omp_threads") for ref in hypothesis.components)
+    assert any(ref.endswith("blas_threads") for ref in hypothesis.components)
+    assert any(
+        violation.assumption.endswith("omp_not_nested")
+        for violation in hypothesis.basis.assumption_violations
+    )
+    assert any(action.endswith("omp_threads_control") for action in hypothesis.candidate_actions)
+    assert any(action.endswith("blas_threads_control") for action in hypothesis.candidate_actions)
+    assert any(ref.endswith("omp_ctx_switch_rate") for ref in hypothesis.validation.collect)
+    assert any(ref.endswith("blas_ctx_switch_rate") for ref in hypothesis.validation.collect)
 
 
-def test_contract_context_bundle_exposes_profile_actions_conflicts(tmp_path: Path) -> None:
+def test_no_fake_worker_pool_hypothesis_or_resource() -> None:
+    openmp = _compute_contract("OpenMP", "OMP_NUM_THREADS", "omp")
+    openblas = _compute_contract("OpenBLAS", "OPENBLAS_NUM_THREADS", "blas")
+
+    composed = compose_contracts("openmp_openblas", [openmp, openblas])
+
+    assert all(item.resource != "worker.pool" for item in composed.shared_resources)
+    assert all(item.resource != "worker.pool" for item in composed.hypotheses)
+    assert all(item.kind != "worker.pool" for item in composed.hypotheses)
+
+
+def test_cpu_placement_conflict() -> None:
+    gromacs = _placement_contract("GROMACS", "OMP_PROC_BIND", "OMP_PLACES")
+    cp2k = _placement_contract("CP2K", "KMP_AFFINITY", "KMP_HW_SUBSET")
+
+    hypotheses = derive_conflict_hypotheses([gromacs, cp2k])
+
+    assert hypotheses
+    assert hypotheses[0].kind == "cpu_placement_conflict"
+    assert hypotheses[0].resource == "cpu.placement"
+
+
+def test_contract_context_bundle_exposes_conflict_oriented_context(tmp_path: Path) -> None:
     artifact_root = tmp_path / "artifacts"
     contract_root = tmp_path / "contracts"
-    openmp = _contract("OpenMP", "OMP_NUM_THREADS")
-    openblas = _contract("OpenBLAS", "OPENBLAS_NUM_THREADS", role="reserve")
+    openmp = _compute_contract("OpenMP", "OMP_NUM_THREADS", "omp")
+    openblas = _compute_contract("OpenBLAS", "OPENBLAS_NUM_THREADS", "blas")
     write_contract_bundle("openmp", openmp, artifact_root, contract_root)
     write_contract_bundle("openblas", openblas, artifact_root, contract_root)
 
@@ -193,61 +250,21 @@ def test_contract_context_bundle_exposes_profile_actions_conflicts(tmp_path: Pat
         max_items_per_section=3,
     )
 
-    assert context["profile_first"]
+    assert context["relevant_components"]
+    assert context["relevant_resources"] == ["cpu.compute"]
+    assert context["likely_hypotheses"]
+    assert context["signals_to_collect"]
+    assert context["candidate_controls"]
+    assert context["recipes"]
     assert context["candidate_actions"]
     assert context["conflicts"]
     assert context["validation"]
-    assert context["hypothesis_profiles"]
-
-
-def test_composer_falls_back_to_recipe_signals_when_resource_specific_signals_absent() -> None:
-    gromacs = _affinity_contract("Gromacs", "GMX_PIN")
-    cp2k = _affinity_contract("CP2K", "OMP_PLACES")
-
-    hypotheses = derive_conflict_hypotheses([gromacs, cp2k])
-
-    assert hypotheses
-    assert hypotheses[0].resource == "cpu.affinity"
-    assert "Gromacs.Gromacs_timing_signal" in hypotheses[0].validation.collect
-    assert "CP2K.CP2K_timing_signal" in hypotheses[0].validation.collect
-
-
-def test_composed_contract_id_hydrates_library_refs_for_context(tmp_path: Path) -> None:
-    artifact_root = tmp_path / "artifacts"
-    contract_root = tmp_path / "contracts"
-    openmp = _contract("OpenMP", "OMP_NUM_THREADS")
-    openblas = _contract("OpenBLAS", "OPENBLAS_NUM_THREADS", role="reserve")
-    composed = compose_contracts("openmp_openblas", [openmp, openblas])
-
-    write_contract_bundle("openmp", openmp, artifact_root, contract_root)
-    write_contract_bundle("openblas", openblas, artifact_root, contract_root)
-    write_contract_bundle("openmp_openblas_composed", composed, artifact_root, contract_root)
-
-    context = build_agent_context_bundle(
-        ["openmp_openblas_composed"],
-        goal="improve throughput",
-        symptom="thread contention",
-        contract_root=contract_root,
-        max_items_per_section=3,
-    )
-
-    assert context["profile_first"]
-    assert context["candidate_actions"]
-    assert context["conflicts"]
-    assert context["validation"]
-    assert context["hypothesis_profiles"]
-    candidate_titles = {
-        item["title"]
-        for item in cast(list[dict[str, object]], context["candidate_actions"])
-        if "title" in item
-    }
-    assert "OMP_NUM_THREADS" in candidate_titles or "OPENBLAS_NUM_THREADS" in candidate_titles
 
 
 def test_duplicate_library_contracts_get_distinct_instances_and_context(tmp_path: Path) -> None:
     artifact_root = tmp_path / "artifacts"
     contract_root = tmp_path / "contracts"
-    openmp = _contract("OpenMP", "OMP_NUM_THREADS")
+    openmp = _compute_contract("OpenMP", "OMP_NUM_THREADS", "omp")
     composed = compose_contracts("openmp_openmp", [openmp, openmp.model_copy(deep=True)])
 
     write_contract_bundle("openmp", openmp, artifact_root, contract_root)
@@ -256,9 +273,9 @@ def test_duplicate_library_contracts_get_distinct_instances_and_context(tmp_path
     assert [item.instance_id for item in composed.contract_instances] == ["openmp_1", "openmp_2"]
     assert [item.contract_id for item in composed.contract_instances] == ["OpenMP", "OpenMP"]
     assert composed.hypotheses
-    assert sorted(composed.hypotheses[0].libraries) == ["openmp_1", "openmp_2"]
-    assert "openmp_1.threads" in composed.hypotheses[0].basis.overlaps[0].uses
-    assert "openmp_2.threads" in composed.hypotheses[0].basis.overlaps[0].uses
+    assert sorted(composed.hypotheses[0].contracts) == ["openmp_1", "openmp_2"]
+    assert "openmp_1.omp_cpu_compute" in composed.hypotheses[0].uses
+    assert "openmp_2.omp_cpu_compute" in composed.hypotheses[0].uses
 
     context = build_agent_context_bundle(
         ["openmp_openmp_composed"],
@@ -271,6 +288,29 @@ def test_duplicate_library_contracts_get_distinct_instances_and_context(tmp_path
     assert context["shared_resources"]
     conflicts = cast(list[dict[str, object]], context["conflicts"])
     assert conflicts
-    libraries = conflicts[0].get("libraries")
-    assert isinstance(libraries, list)
-    assert sorted(str(item) for item in libraries) == ["openmp_1", "openmp_2"]
+    contracts = conflicts[0].get("contracts")
+    assert isinstance(contracts, list)
+    assert sorted(str(item) for item in contracts) == ["openmp_1", "openmp_2"]
+
+
+def test_query_api_filters_uses_controls_signals_by_resource(tmp_path: Path) -> None:
+    artifact_root = tmp_path / "artifacts"
+    contract_root = tmp_path / "contracts"
+    openmp = _compute_contract("OpenMP", "OMP_NUM_THREADS", "omp")
+    placement = _placement_contract("PlacementLib", "OMP_PROC_BIND", "OMP_PLACES")
+    write_contract_bundle("openmp", openmp, artifact_root, contract_root)
+    write_contract_bundle("placementlib", placement, artifact_root, contract_root)
+
+    store = ContractStore(contract_root)
+
+    cpu_compute_uses = store.list_uses("openmp", resource="cpu.compute")
+    cpu_compute_controls = store.list_controls("openmp", resource="cpu.compute")
+    cpu_compute_signals = store.list_signals("openmp", resource="cpu.compute")
+    cpu_placement_uses = store.list_uses("placementlib", resource="cpu.placement")
+    cpu_placement_signals = store.list_signals("placementlib", resource="cpu.placement")
+
+    assert len(cpu_compute_uses) == 1
+    assert len(cpu_compute_controls) == 1
+    assert len(cpu_compute_signals) == 2
+    assert len(cpu_placement_uses) == 1
+    assert len(cpu_placement_signals) == 1
