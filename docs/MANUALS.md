@@ -76,6 +76,11 @@ Current source-pack examples:
 - `manual_sources/openblas/`
 - `manual_sources/numactl/`
 
+Current implementation-specific contract-source examples:
+
+- `contract_sources/onemkl/`
+- `contract_sources/openmpi/`
+
 ### Runtime behavior
 
 - The existing manual runtime still loads `manual/<name>.md` as raw markdown.
@@ -83,6 +88,7 @@ Current source-pack examples:
 - LPCL contracts now use the stricter `lpcl/v1` ontology: components model internal mechanisms, while shared-resource analysis is restricted to `cpu.compute`, `cpu.placement`, `gpu.compute`, `gpu.memory`, `mem.capacity`, `mem.bandwidth`, `io.bandwidth`, and `io.queue` so composition stays conflict-oriented instead of treating thread pools or worker pools as resources.
 - Generated `contract.lpcl` artifacts are now compiled statically from validated LPCL YAML/JSON, not LLM-rendered text, so the DSL output stays deterministic, brace/semicolon exact, and golden-testable across runs.
 - LPCL compilation hides `evidence = [...]` lines by default for human-readable review output, and callers must pass the explicit `--include-evidence` flag (or equivalent API option) to restore evidence blocks when needed for debugging or papers.
+- Contract bundles therefore consist of canonical `contract.yaml` plus compiled `contract.lpcl`; if you need to recompile manually, use `syspilot compile-lpcl --input contracts/<name>/contract.yaml --output contracts/<name>/contract.lpcl`, and add `--include-evidence` only when you explicitly want provenance blocks in the LPCL view.
 - A composed contract like `contracts/openmp_openblas_composed/contract.yaml` can now be passed directly as a runtime knowledge input; SysPilot resolves `selected_contracts` plus hypothesis refs back into concrete controls, signals, recipes, assumptions, and shared-resource facts before building the agent context bundle.
 - Composed contracts may now include multiple instances of the same library contract. SysPilot writes deterministic `contract_instances` metadata and uses instance-qualified refs like `openmp_1.*` and `openmp_2.*` so duplicate libraries remain distinguishable at both compose time and runtime query time.
 - Spawn-mode tuning now derives `hypothesis_profiles` from composed contract conflicts, enables report-style controls for those profiles, and runs contract-guided validation scripts during the profiling phase so each round can feed structured hypothesis evidence back into the next tuning decision.

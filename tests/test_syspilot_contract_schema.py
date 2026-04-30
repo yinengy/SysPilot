@@ -299,6 +299,79 @@ def test_validator_rejects_recipe_collecting_missing_signal() -> None:
     assert any("collects missing signals" in issue for issue in result.issues)
 
 
+def test_validator_allows_backend_control_targeting_component_attribute() -> None:
+    _, result = validate_contract_text(
+        dedent(
+            """
+            version: lpcl/v1
+            contract: OpenMPI
+            type: library
+            components:
+              - id: ompi_comm_backend
+                kind: backend
+                attrs:
+                  backend_name: ucx
+                  backend_type: transport
+                evidence: [doc_001:chunk_001]
+            uses: []
+            assumptions: []
+            controls:
+              - id: select_pml
+                name: pml
+                kind: cli
+                type: string
+                target: ompi_comm_backend.backend_name
+                effect:
+                  kind: set
+                  value: input
+                evidence: [doc_001:chunk_001]
+            signals: []
+            recipes: []
+            """
+        )
+    )
+
+    assert result.valid is True
+
+
+def test_validator_rejects_missing_component_attribute_target() -> None:
+    _, result = validate_contract_text(
+        dedent(
+            """
+            version: lpcl/v1
+            contract: OpenMPI
+            type: library
+            components:
+              - id: ompi_comm_backend
+                kind: backend
+                attrs:
+                  backend_name: ucx
+                  backend_type: transport
+                evidence: [doc_001:chunk_001]
+            uses: []
+            assumptions: []
+            controls:
+              - id: select_pml
+                name: pml
+                kind: cli
+                type: string
+                target: ompi_comm_backend.selectorz
+                effect:
+                  kind: set
+                  value: input
+                evidence: [doc_001:chunk_001]
+            signals: []
+            recipes: []
+            """
+        )
+    )
+
+    assert result.valid is False
+    assert any(
+        "targets nonexistent ompi_comm_backend.selectorz" in issue for issue in result.issues
+    )
+
+
 def test_old_schema_migration_maps_cpu_thread_to_cpu_compute_workers() -> None:
     migrated = migrate_contract_payload(
         {

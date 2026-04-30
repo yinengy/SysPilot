@@ -420,6 +420,29 @@ def test_compile_lpcl_cli_can_include_evidence(tmp_path: Path) -> None:
     assert "evidence = [" in output_path.read_text(encoding="utf-8")
 
 
+def test_compile_lpcl_cli_hides_evidence_by_default(tmp_path: Path) -> None:
+    runner = CliRunner()
+    input_path = tmp_path / "contract.yaml"
+    output_path = tmp_path / "contract.lpcl"
+    input_path.write_text(
+        _library_contract("OpenMP").model_dump_json(by_alias=True, indent=2), encoding="utf-8"
+    )
+
+    result = runner.invoke(
+        cli,
+        [
+            "compile-lpcl",
+            "--input",
+            str(input_path),
+            "--output",
+            str(output_path),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "evidence = [" not in output_path.read_text(encoding="utf-8")
+
+
 def test_synthesize_contract_cli_can_include_evidence(tmp_path: Path) -> None:
     runner = CliRunner()
     artifact_root = tmp_path / "artifacts"
@@ -470,6 +493,9 @@ def test_synthesize_contract_cli_can_include_evidence(tmp_path: Path) -> None:
     assert "evidence = [" in (contract_root / "openmp" / "contract.lpcl").read_text(
         encoding="utf-8"
     )
+    assert "evidence = [" in (artifact_root / "contracts" / "openmp" / "contract.lpcl").read_text(
+        encoding="utf-8"
+    )
 
 
 def test_compose_contracts_cli_can_include_evidence(tmp_path: Path) -> None:
@@ -501,3 +527,6 @@ def test_compose_contracts_cli_can_include_evidence(tmp_path: Path) -> None:
     assert "evidence = [" in (contract_root / "minife_composed" / "contract.lpcl").read_text(
         encoding="utf-8"
     )
+    assert "evidence = [" in (
+        artifact_root / "composed_contracts" / "minife_composed" / "contract.lpcl"
+    ).read_text(encoding="utf-8")

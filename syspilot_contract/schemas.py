@@ -296,17 +296,38 @@ def _resources_for_target(target: str, contract: "LibraryContract") -> list[str]
     return []
 
 
+def _nested_path_exists(value: object, path_parts: list[str]) -> bool:
+    if not path_parts:
+        return True
+    if not isinstance(value, dict):
+        return False
+    head, *tail = path_parts
+    if head not in value:
+        return False
+    return _nested_path_exists(value[head], tail)
+
+
 def _target_exists(target: str, contract: "LibraryContract") -> bool:
     if target in RESOURCE_TYPES:
         return True
     if _resource_root(target) is not None:
         return True
-    use_ids = {item.id for item in contract.uses}
-    component_ids = {item.id for item in contract.components}
-    if target in use_ids or target in component_ids:
+    use_by_id = {item.id: item for item in contract.uses}
+    component_by_id = {item.id: item for item in contract.components}
+    if target in use_by_id or target in component_by_id:
         return True
-    head = target.split(".", 1)[0]
-    return head in use_ids or head in component_ids
+    head, sep, remainder = target.partition(".")
+    if not sep:
+        return False
+    if head in component_by_id:
+        return _nested_path_exists(component_by_id[head].attrs, remainder.split("."))
+    if head in use_by_id:
+        if remainder == "demand":
+            return True
+        if not remainder.startswith("demand."):
+            return False
+        return _nested_path_exists(use_by_id[head].demand, remainder.split(".")[1:])
+    return False
 
 
 def _looks_like_worker_control(name: str) -> bool:
@@ -698,10 +719,6 @@ class LibraryContract(ContractBaseModel):
                     )
                 else:
                     issues.append(f"Control {control.id} targets nonexistent {control.target}.")
-            elif not _resources_for_target(control.target, self):
-                issues.append(
-                    f"Control {control.id} target {control.target} could not be mapped to a resource."
-                )
             elif _looks_like_worker_control(control.name) and not control.target.endswith(
                 ".workers"
             ):
