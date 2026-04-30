@@ -1315,16 +1315,22 @@ def tune(
     sink.print(f"[cyan]Saving LLM prompts to: {prompt_log_path}[/cyan]")
 
     contract_root = _discover_contract_root()
-    structured_contract_bundle = _build_contract_context_bundle(
+    manual_root = _discover_manual_root() if manual else None
+    structured_context_bundle = _build_structured_context_bundle(
         list(manual),
         goal="improve throughput",
         symptom=None,
         max_items_per_section=5,
+        manual_root=manual_root,
         contract_root=contract_root,
+    )
+    initial_hypothesis_profiles = _extract_hypothesis_profiles(
+        structured_context_bundle,
+        max_profiles=None,
     )
 
     if manual:
-        if _has_structured_context(structured_contract_bundle):
+        if _has_structured_context(structured_context_bundle):
             sink.print(f"[cyan]Using structured contract context: {', '.join(manual)}[/cyan]")
         else:
             sink.print(f"[cyan]Loading manuals: {', '.join(manual)}[/cyan]")
@@ -1334,6 +1340,11 @@ def tune(
                     sink.print(f"  [green]✓ Loaded: {manual_name}[/green]")
                 else:
                     sink.print(f"  [red]✗ Failed: {manual_name}[/red]")
+
+    if initial_hypothesis_profiles:
+        sink.print(
+            f"[cyan]Generated {len(initial_hypothesis_profiles)} contract hypothesis profile(s) at startup[/cyan]"
+        )
 
     manager = ProfilingManager()
     tuner = ApplicationTuner(config.tuning)
@@ -1371,9 +1382,10 @@ def tune(
                 workdir,
                 sink,
                 event_emitter,
-                structured_contract_bundle
-                if _has_structured_context(structured_contract_bundle)
+                structured_context_bundle
+                if _has_structured_context(structured_context_bundle)
                 else None,
+                initial_hypothesis_profiles,
             )
         else:
             assert pid is not None
@@ -1840,7 +1852,7 @@ def _extract_hypothesis_profiles(
     structured_context_bundle: dict[str, object] | None,
     selected_hypothesis_refs: list[str] | None = None,
     *,
-    max_profiles: int = 3,
+    max_profiles: int | None = 3,
 ) -> list[dict[str, Any]]:
     if not isinstance(structured_context_bundle, dict):
         return []
@@ -1854,8 +1866,8 @@ def _extract_hypothesis_profiles(
             item for item in profiles if str(item.get("hypothesis_id", "")).strip() in selected
         ]
         if prioritized:
-            return prioritized[:max_profiles]
-    return profiles[:max_profiles]
+            return prioritized if max_profiles is None else prioritized[:max_profiles]
+    return profiles if max_profiles is None else profiles[:max_profiles]
 
 
 def _collect_contract_report_env(hypothesis_profiles: list[dict[str, Any]]) -> dict[str, str]:
@@ -3211,6 +3223,7 @@ async def _run_spawn_tune_loop_async(
     sink: OutputSink | None = None,
     event_emitter: _TuneEmitter | None = None,
     structured_context_bundle: dict[str, object] | None = None,
+    initial_hypothesis_profiles: list[dict[str, Any]] | None = None,
 ) -> None:
     if sink is None:
         sink = make_output_sink(ui_mode=TuneUIMode.PLAIN, console=console)
@@ -3264,6 +3277,7 @@ async def _run_spawn_tune_loop_async(
             "timeout_s": timeout,
             "loaded_manuals": loaded_manual_names,
             "baseline_env_overrides": dict(inline_env_overrides),
+            "startup_hypothesis_profile_count": len(initial_hypothesis_profiles or []),
         },
     )
 
@@ -3394,6 +3408,9 @@ async def _run_spawn_tune_loop_async(
     convergence_patience = 2
     min_improvement_pct = 1.0
     active_hypothesis_refs: list[str] = []
+    startup_hypothesis_profiles = [
+        item for item in (initial_hypothesis_profiles or []) if isinstance(item, dict)
+    ]
 
     for iteration in range(1, max_iterations + 1):
         _emit_tune_event(
@@ -3424,10 +3441,13 @@ async def _run_spawn_tune_loop_async(
                 "iteration": iteration,
             },
         )
-        selected_hypothesis_profiles = _extract_hypothesis_profiles(
-            structured_context_bundle,
-            active_hypothesis_refs,
-        )
+        if active_hypothesis_refs:
+            selected_hypothesis_profiles = _extract_hypothesis_profiles(
+                structured_context_bundle,
+                active_hypothesis_refs,
+            )
+        else:
+            selected_hypothesis_profiles = startup_hypothesis_profiles
         profiling_artifacts = await _run_live_profiling_pipeline(
             agent,
             current_command_parts,
@@ -4130,6 +4150,7 @@ def _run_spawn_tune_loop(
     sink: OutputSink | None = None,
     event_emitter: _TuneEmitter | None = None,
     structured_context_bundle: dict[str, object] | None = None,
+    initial_hypothesis_profiles: list[dict[str, Any]] | None = None,
 ) -> None:
     workdir_str = str(workdir) if workdir else None
     asyncio.run(
@@ -4144,6 +4165,7 @@ def _run_spawn_tune_loop(
             sink=sink,
             event_emitter=event_emitter,
             structured_context_bundle=structured_context_bundle,
+            initial_hypothesis_profiles=initial_hypothesis_profiles,
         )
     )
 

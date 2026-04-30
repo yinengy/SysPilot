@@ -703,6 +703,96 @@ def test_spawn_mode_accepts_composed_contract_without_manual_files(tmp_path: Pat
     assert "RAW MANUAL SHOULD NOT APPEAR" not in prompt
 
 
+def test_spawn_mode_passes_contract_hypotheses_into_first_profiling_round(tmp_path: Path) -> None:
+    runner = CliRunner()
+    artifact_root = tmp_path / "artifacts"
+    contract_root = tmp_path / "contracts"
+    openmp = _library_contract("OpenMP", "OMP_NUM_THREADS")
+    openblas = _library_contract("OpenBLAS", "OPENBLAS_NUM_THREADS")
+    composed = compose_contracts("openmp_openblas", [openmp, openblas])
+    write_contract_bundle("openmp", openmp, artifact_root, contract_root)
+    write_contract_bundle("openblas", openblas, artifact_root, contract_root)
+    write_contract_bundle("openmp_openblas_composed", composed, artifact_root, contract_root)
+    _DummyAgent.instances.clear()
+
+    expected_bundle = build_agent_context_bundle(
+        ["openmp_openblas_composed"],
+        goal="improve throughput",
+        symptom=None,
+        contract_root=contract_root,
+    )
+    expected_profiles = _extract_hypothesis_profiles(
+        cast(dict[str, object], expected_bundle),
+        max_profiles=None,
+    )
+    expected_ids = {str(item["hypothesis_id"]) for item in expected_profiles}
+    expected_report_env = _collect_contract_report_env(expected_profiles)
+
+    captured_profiles: list[list[dict[str, object]]] = []
+
+    async def _capture_live_profile(*args: object, **kwargs: object) -> dict[str, object]:
+        _ = args
+        profiles = cast(list[dict[str, object]], kwargs["hypothesis_profiles"])
+        assert profiles
+        captured_profiles.append(profiles)
+        return {
+            "pid": 9999,
+            "wall_time": 0.01,
+            "stdout": "",
+            "stderr": "",
+            "returncode": 0,
+            "profiling_text": "context switches high",
+            "profiling_json": {
+                "contract_hypothesis_validation": {
+                    "profiles": [
+                        {"hypothesis_id": str(item["hypothesis_id"])} for item in profiles
+                    ],
+                    "report_env": _collect_contract_report_env(
+                        cast(list[dict[str, object]], profiles)
+                    ),
+                }
+            },
+            "tool_calls_used": 0,
+        }
+
+    with (
+        patch("syspilot.cli.SysPilotAgent", _DummyAgent),
+        patch("syspilot.cli._register_default_skills", _noop),
+        patch("syspilot.cli._register_profiling_tools", _noop),
+        patch("syspilot.cli._register_tuning_tools", _noop),
+        patch("syspilot.cli._run_live_profiling_pipeline", _capture_live_profile),
+        patch("syspilot.cli._run_command", _fake_run_command),
+        patch("syspilot.cli._discover_manual_root", return_value=None),
+        patch("syspilot.cli._discover_contract_root", return_value=contract_root),
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "tune",
+                "--ui-mode",
+                "plain",
+                "--command",
+                "echo hi",
+                "--manual",
+                "openmp_openblas_composed",
+                "--max-iterations",
+                "1",
+                "--timeout",
+                "1",
+                "--no-parse-output",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert captured_profiles
+    assert {str(item["hypothesis_id"]) for item in captured_profiles[0]} == expected_ids
+    assert _collect_contract_report_env(captured_profiles[0]) == expected_report_env
+    assert expected_report_env
+    prompt = _DummyAgent.instances[0].prompts[0]
+    assert "Contract Hypothesis Validation" in prompt
+    assert next(iter(expected_ids)) in prompt
+
+
 def test_build_spawn_profiling_env_enables_openmp_observability() -> None:
     env = _build_spawn_profiling_env({"OMP_NUM_THREADS": "8"})
     assert env is not None

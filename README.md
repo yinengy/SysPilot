@@ -223,7 +223,7 @@ Use OpenAI API mode:
   "model": "gpt-5.4",
   "temperature": 0.1,
   "max_tokens": 272000,
-  "timeout_seconds": 30,
+  "timeout_seconds": 120,
   "max_retries": 1
 }
 ```
@@ -238,7 +238,7 @@ To switch to ChatGPT OAuth mode, edit the same file:
   "base_url": "https://chatgpt.com/backend-api/codex",
   "temperature": 0.1,
   "max_tokens": 4096,
-  "timeout_seconds": 30,
+  "timeout_seconds": 120,
   "max_retries": 1
 }
 ```
