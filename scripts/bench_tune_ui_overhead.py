@@ -296,7 +296,6 @@ def _build_tune_command(
         "--timeout",
         str(timeout_s),
         "--dry-run",
-        "--no-parse-output",
     ]
 
 

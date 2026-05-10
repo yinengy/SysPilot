@@ -20,6 +20,8 @@ def _library_contract(name: str = "OpenMP") -> LibraryContract:
     control_name_map = {
         "OpenMP": "OMP_NUM_THREADS",
         "OpenBLAS": "OPENBLAS_NUM_THREADS",
+        "XGBoost": "nthread",
+        "scikit-learn": "SKLEARN_NUM_THREADS",
     }
     control_name = control_name_map.get(name, "THREADS")
     prefix = name.lower()
@@ -70,7 +72,8 @@ def _library_contract(name: str = "OpenMP") -> LibraryContract:
                     "kind": "env",
                     "type": "int",
                     "target": f"{prefix}_threads.workers",
-                    "effect": {"kind": "set", "value": "input"},
+                    "effect": {"kind": "set", "value": "input", "direction": "unknown"},
+                    "interacts_with": [f"{prefix}_thread_count"],
                     "evidence": [f"{name}_doc:chunk_001"],
                 }
             ],
@@ -78,17 +81,21 @@ def _library_contract(name: str = "OpenMP") -> LibraryContract:
                 {
                     "id": f"{prefix}_thread_count",
                     "target": f"{prefix}_threads.workers",
+                    "role": "config_check",
                     "metric": "active_thread_count",
                     "indicates": "effective_worker_count",
-                    "probe": {"kind": "api", "name": control_name.lower().replace("-", "_")},
+                    "virtual_probe": "process.cpu.thread_count",
+                    "expected_direction_when_mitigated": "unknown",
                     "evidence": [f"{name}_doc:chunk_001"],
                 },
                 {
                     "id": f"{prefix}_ctx_switch_rate",
                     "target": "cpu.compute",
+                    "role": "resource_signal",
                     "metric": "os.context_switch_rate",
                     "indicates": "oversubscription",
-                    "probe": {"kind": "perf", "name": "perf_stat"},
+                    "virtual_probe": "benchmark.context_switch_rate",
+                    "expected_direction_when_mitigated": "decrease",
                     "evidence": [f"{name}_doc:chunk_001"],
                 },
             ],
@@ -97,14 +104,42 @@ def _library_contract(name: str = "OpenMP") -> LibraryContract:
                     "id": f"{prefix}_recipe",
                     "for": "shared_cpu_compute_conflict",
                     "collect": [f"{prefix}_thread_count", f"{prefix}_ctx_switch_rate"],
-                    "actions": [f"set {control_name} to 1"],
-                    "accept": "effective_worker_count == 1 and throughput_not_worse",
-                    "rollback": "throughput_worse",
+                    "diagnose": [
+                        {
+                            "label": "confirm_runtime_and_contention_signals",
+                            "signals": [f"{prefix}_thread_count", f"{prefix}_ctx_switch_rate"],
+                        }
+                    ],
+                    "config_checks": [f"{prefix}_thread_count"],
+                    "outcomes": ["throughput_not_worse"],
+                    "guardrails": [f"{prefix}_ctx_switch_rate"],
+                    "actions": [
+                        {
+                            "label": f"set_{prefix}_threads_to_one",
+                            "summary": f"set {control_name} to 1",
+                            "control": f"{prefix}_threads_control",
+                            "effect": "set",
+                            "expected_changes": [
+                                {
+                                    "signal": f"{prefix}_ctx_switch_rate",
+                                    "expected_direction_when_mitigated": "decrease",
+                                }
+                            ],
+                        }
+                    ],
                     "evidence": [f"{name}_doc:chunk_001"],
                 }
             ],
         }
     )
+
+
+def _xgboost_contract() -> LibraryContract:
+    return _library_contract("XGBoost")
+
+
+def _sklearn_contract() -> LibraryContract:
+    return _library_contract("scikit-learn")
 
 
 class _FakeContractLLMClient:
@@ -230,7 +265,7 @@ def test_check_contract_command_reports_invalid_yaml(tmp_path: Path) -> None:
     assert "duplicate key 'contract'" in result.output
 
 
-def test_check_contract_requires_explicit_migration_for_legacy_payloads(tmp_path: Path) -> None:
+def test_check_contract_rejects_legacy_payloads_without_migration_path(tmp_path: Path) -> None:
     runner = CliRunner()
     legacy_path = tmp_path / "legacy.yaml"
     legacy_path.write_text(
@@ -262,16 +297,10 @@ def test_check_contract_requires_explicit_migration_for_legacy_payloads(tmp_path
         encoding="utf-8",
     )
 
-    strict_result = runner.invoke(cli, ["check-contract", str(legacy_path)])
-    migrated_result = runner.invoke(
-        cli,
-        ["check-contract", str(legacy_path), "--allow-migration"],
-    )
+    result = runner.invoke(cli, ["check-contract", str(legacy_path)])
 
-    assert strict_result.exit_code != 0
-    assert '"valid": false' in strict_result.output
-    assert migrated_result.exit_code == 0
-    assert '"valid": true' in migrated_result.output
+    assert result.exit_code != 0
+    assert '"valid": false' in result.output
 
 
 def test_compose_contracts_and_build_agent_context_commands(tmp_path: Path) -> None:
@@ -394,6 +423,96 @@ def test_compose_contracts_allows_duplicate_contract_refs(tmp_path: Path) -> Non
     assert [item.contract_id for item in contract.contract_instances] == ["OpenMP", "OpenMP"]
     assert contract.hypotheses
     assert sorted(contract.hypotheses[0].contracts) == ["openmp_1", "openmp_2"]
+
+
+def test_compose_contracts_and_build_agent_context_for_xgboost_sklearn_pair(
+    tmp_path: Path,
+) -> None:
+    runner = CliRunner()
+    artifact_root = tmp_path / "artifacts"
+    contract_root = tmp_path / "contracts"
+    write_contract_bundle("xgboost", _xgboost_contract(), artifact_root, contract_root)
+    write_contract_bundle("sklearn", _sklearn_contract(), artifact_root, contract_root)
+
+    compose_result = runner.invoke(
+        cli,
+        [
+            "compose-contracts",
+            "--app",
+            "demo1_xgboost_sklearn",
+            "--contracts",
+            "xgboost",
+            "--contracts",
+            "sklearn",
+            "--artifact-root",
+            str(artifact_root),
+            "--contract-root",
+            str(contract_root),
+        ],
+    )
+
+    assert compose_result.exit_code == 0
+    assert (
+        "[compose-contracts] demo1_xgboost_sklearn/demo1_xgboost_sklearn_composed phase=started"
+        in compose_result.output
+    )
+    assert (contract_root / "demo1_xgboost_sklearn_composed" / "contract.yaml").exists()
+    assert (contract_root / "demo1_xgboost_sklearn_composed" / "contract.lpcl").exists()
+
+    context_result = runner.invoke(
+        cli,
+        [
+            "build-agent-context",
+            "--manuals",
+            "xgboost",
+            "--manuals",
+            "sklearn",
+            "--goal",
+            "improve throughput",
+            "--contract-root",
+            str(contract_root),
+        ],
+    )
+    assert context_result.exit_code == 0
+    payload = json.loads(context_result.output)
+    assert payload["profile_first"]
+    assert payload["candidate_actions"]
+    assert payload["conflicts"]
+
+
+def test_build_agent_context_accepts_xgboost_sklearn_composed_contract_id(tmp_path: Path) -> None:
+    runner = CliRunner()
+    artifact_root = tmp_path / "artifacts"
+    contract_root = tmp_path / "contracts"
+    write_contract_bundle("xgboost", _xgboost_contract(), artifact_root, contract_root)
+    write_contract_bundle("sklearn", _sklearn_contract(), artifact_root, contract_root)
+    from syspilot_contract.compose_contracts import compose_contracts
+
+    composed = compose_contracts(
+        "xgboost_sklearn",
+        [_xgboost_contract(), _sklearn_contract()],
+    )
+    write_contract_bundle("xgboost_sklearn_composed", composed, artifact_root, contract_root)
+
+    result = runner.invoke(
+        cli,
+        [
+            "build-agent-context",
+            "--manuals",
+            "xgboost_sklearn_composed",
+            "--goal",
+            "improve throughput",
+            "--contract-root",
+            str(contract_root),
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["profile_first"]
+    assert payload["candidate_actions"]
+    assert payload["conflicts"]
+    assert payload["likely_hypotheses"]
 
 
 def test_compile_lpcl_cli_can_include_evidence(tmp_path: Path) -> None:

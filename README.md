@@ -61,7 +61,7 @@ sudo dnf install bpftrace bcc
 If eBPF profiling fails with `Operation not permitted`, run SysPilot with elevated privileges:
 
 ```bash
-sudo -E python3 -m syspilot.cli tune --command "..." --manual numactl
+sudo -E python3 -m syspilot.cli tune --command "..." --contract numactl
 ```
 
 Runtime behavior notes:
@@ -81,26 +81,23 @@ cat /proc/sys/kernel/perf_event_paranoid
 # Initialize configuration
 syspilot init
 
-# Monitor a process by PID
-syspilot monitor --pid 1234
-
-# Monitor by process name
-syspilot monitor --name nginx
-
-# Iteratively tune a running process (Attach Mode)
-syspilot tune --pid 1234 --manual numactl
-
 # Launch and tune a command (Spawn Mode)
-syspilot tune --command "./benchmark -t 4" --manual numactl --parse-output
+syspilot tune --command "./benchmark -t 4" --contract numactl
+
+# Optimize on a workload metric extracted from stdout instead of orchestration wall time
+syspilot tune --command "./benchmark -t 4" --contract numactl --primary-objective "throughput"
+
+# Add application-specific tuning hints alongside library contracts
+syspilot tune --command "./benchmark -t 4" --contract numactl --manual "parent process forks worker processes after warmup"
+
+# Optional: constrain spawn-mode runs with a MemoryHigh scope
+syspilot tune --command "./benchmark -t 4" --contract numactl --memory-high 1536M
 
 # Force plain text mode for tune (optional)
-syspilot tune --ui-mode plain --command "./benchmark -t 4" --manual numactl
+syspilot tune --ui-mode plain --command "./benchmark -t 4" --contract numactl
 
 # Enable full LLM debug logging + markdown transcript
-syspilot --debug-llm --debug-llm-md /tmp/syspilot_llm_debug.md tune --command "./benchmark -t 4" --manual numactl
-
-# Analyze a specific process
-syspilot analyze 1234
+syspilot --debug-llm --debug-llm-md /tmp/syspilot_llm_debug.md tune --command "./benchmark -t 4" --contract numactl
 
 # Profile system resources
 syspilot profile 1234
@@ -126,11 +123,11 @@ syspilot tune --ui-mode tui --tui-bin /path/to/syspilot-tui --command "./benchma
 SYSPILOT_TUI_BIN=/path/to/syspilot-tui syspilot tune --ui-mode tui --command "./benchmark -t 4"
 ```
 
-## Tuning Workflows
+## Tuning Workflow
 
-SysPilot supports two primary tuning workflows via the `tune` command:
+SysPilot now supports one tuning workflow via the `tune` command:
 
-### 1. Spawn Mode (Recommended for Benchmarks)
+### Spawn Mode
 
 Use this when you want SysPilot to manage the entire lifecycle: launch, baseline, tune, and verify.
 
@@ -139,9 +136,8 @@ syspilot tune \
   --command "/path/to/app --args" \
   --ui-mode tui \
   --workdir /path/to/working/dir \
-  --manual numactl \
-  --max-iterations 5 \
-  --parse-output
+  --contract numactl \
+  --max-iterations 5
 ```
 
 **Features:**
@@ -150,8 +146,17 @@ syspilot tune \
 - Uses process-tree-aware profiling (manager + heavy child workers) to avoid parent-only blind spots
 - Stops by convergence (non-improving iteration patience) or `--max-iterations`
 - Compares baseline vs best-found configuration side-by-side
-- `--parse-output` uses LLM to extract app-specific metrics (e.g., tokens/sec) from stdout
+- `--contract <name[,name...]>` loads library contract context for spawn-mode tune. Repeat the option or use comma-separated values when multiple libraries are involved.
+- When multiple contracts are present, SysPilot synthesizes contract-guided hypotheses and uses them to steer profiling and candidate selection.
+- `--manual <hint[,hint...]>` adds application-specific natural-language hints directly to the tuning prompt. Manual hints never generate LPCL hypotheses.
+- `--contract` and `--manual` are orthogonal and can be used together in the same tune run.
+- When `--primary-objective` is set, SysPilot uses the LLM to extract workload outcome metrics (for example elapsed time, throughput, latency, or bandwidth) from stdout and rank candidates on the resolved metric first.
+- `--primary-objective <query>` is free-form user intent, so phrases like `"wall time"`, `"throughput"`, or even near-miss strings like `"ELAPSED SED"` can resolve onto extracted numeric metrics.
+- `--primary-objective-mode {minimize,maximize}` remains available when the resolved metric is real but its optimization direction is not obvious from the metric name.
+- When a primary objective is configured, orchestration `wall_time` becomes a secondary tie-breaker instead of the main search objective, so wrapper/setup noise does not silently override a better workload result.
+- `--memory-high <value>` optionally launches the spawn-mode command through `systemd-run --user --scope -p MemoryHigh=...` so baseline and candidate runs stay inside the same user-scope memory-pressure envelope
 - If `--command` begins with `env KEY=VALUE ...`, SysPilot now treats those assignments as tunable baseline environment overrides instead of opaque command tokens, so spawn-mode env tuning can adjust the user-specified starting values across candidate trials.
+- Candidate command rewrites that include inline `env KEY=VALUE ...` are normalized the same way, so the tuning engine can safely try env-prefixed command variants without rejecting them as different executables.
 
 ### Tune UI Overhead Gate
 
@@ -179,30 +184,16 @@ Use debug mode to inspect every LLM request/response and tool-calling turn.
 
 ```bash
 # Console JSON logs
-syspilot --debug-llm tune --command "./benchmark -t 4" --manual numactl
+syspilot --debug-llm tune --command "./benchmark -t 4" --contract numactl
 
 # Human-readable markdown transcript
-syspilot --debug-llm-md /tmp/syspilot_llm_debug.md tune --command "./benchmark -t 4" --manual numactl
+syspilot --debug-llm-md /tmp/syspilot_llm_debug.md tune --command "./benchmark -t 4" --contract numactl
 ```
 
 The markdown transcript includes:
 - per-exchange request metadata (model/tools/kwargs)
 - new messages sent to the model
 - full model response, tool calls, and token usage
-
-### 2. Attach Mode (Recommended for Services)
-
-Use this for long-running services (databases, web servers) that are already running.
-
-```bash
-syspilot tune --pid 12345 --manual postgresql --dry-run
-```
-
-**Features:**
-- Connects to existing process
-- Profiles live metrics (CPU, memory, NUMA placement)
-- Recommends runtime changes (sysctl, prlimit) or restart configurations
-- `--dry-run` allows safe inspection of recommended actions
 
 ## Demos
 
@@ -284,12 +275,13 @@ from syspilot import SysPilotAgent, SysPilotConfig
 from syspilot.profiling import ProfilingManager
 
 async def main():
-    config = SysPilotConfig(target_pid=1234)
+    config = SysPilotConfig()
     agent = SysPilotAgent(config)
+    manager = ProfilingManager()
     
-    # Analyze target application
-    result = await agent.analyze_target(pid=1234)
-    print(result)
+    # Collect a profiling snapshot that can inform spawn-mode tuning
+    results = await manager.collect_all()
+    print(manager.summarize_results(results))
 
 asyncio.run(main())
 ```

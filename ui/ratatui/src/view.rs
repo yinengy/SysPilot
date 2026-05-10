@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::DateTime;
 use ratatui::{
@@ -57,7 +54,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     render_run_phase(f, left[1], state);
 
     render_analysis_phase(f, mid_top[0], state);
-    render_profiling_phase(f, mid_top[1], state);
+    render_profiling_evidence(f, mid_top[1], state);
     render_candidate_phase(f, bottom[0], state);
 
     render_decision_and_details(f, top_cols[2], state);
@@ -210,7 +207,7 @@ pub(crate) fn run_phase_entry_messages(state: &AppState) -> Vec<String> {
         .collect()
 }
 
-fn render_profiling_phase(f: &mut Frame, area: Rect, state: &AppState) {
+fn render_profiling_evidence(f: &mut Frame, area: Rect, state: &AppState) {
     let focused = state.focused == Panel::Metrics;
     let mut lines = Vec::new();
 
@@ -236,17 +233,12 @@ fn render_profiling_phase(f: &mut Frame, area: Rect, state: &AppState) {
                 Style::default()
             };
 
-            let round = payload_u64(snapshot, "iteration").unwrap_or(0);
-
-            lines.push(Line::styled(
-                format!("round {round} profiling"),
-                style,
-            ));
+            lines.push(Line::styled(profile_snapshot_label(snapshot), style));
         }
     }
 
     let p = Paragraph::new(Text::from(lines))
-        .block(panel_block("Profiling Phase", focused));
+        .block(panel_block("Profiling Evidence", focused));
     f.render_widget(p, area);
 }
 
@@ -255,16 +247,7 @@ fn render_analysis_phase(f: &mut Frame, area: Rect, state: &AppState) {
     let mut lines = Vec::new();
 
     if let Some(rec) = latest_by_name(state, "recommendation.ready") {
-        lines.push(Line::from(format!(
-            "summary: {}",
-            truncate(payload_str(rec, "summary").unwrap_or("-"), 66)
-        )));
-        if let Some(manual) = payload_str(rec, "manual_citation") {
-            lines.push(Line::from(format!("manual: {}", truncate(manual, 66))));
-        }
-        if let Some(action_count) = payload_u64(rec, "action_count") {
-            lines.push(Line::from(format!("candidate count: {action_count}")));
-        }
+        lines.extend(recommendation_header_lines(rec).into_iter().map(Line::from));
     } else {
         lines.push(Line::from("(no AI analysis yet)"));
     }
@@ -300,6 +283,28 @@ fn render_analysis_phase(f: &mut Frame, area: Rect, state: &AppState) {
     let p = Paragraph::new(Text::from(lines))
         .block(panel_block("Analysis Phase", focused));
     f.render_widget(p, area);
+}
+
+fn recommendation_header_lines(rec: &TuneEventEnvelope) -> Vec<String> {
+    let mut lines = vec![format!(
+        "summary: {}",
+        truncate(payload_str(rec, "summary").unwrap_or("-"), 66)
+    )];
+
+    if let Some(next_action) = payload_str(rec, "next_action") {
+        if !next_action.trim().is_empty() {
+            lines.push(format!("next action: {}", truncate(next_action, 66)));
+        }
+    }
+
+    if let Some(manual) = payload_str(rec, "manual_citation") {
+        lines.push(format!("manual: {}", truncate(manual, 66)));
+    }
+    if let Some(action_count) = payload_u64(rec, "action_count") {
+        lines.push(format!("candidate count: {action_count}"));
+    }
+
+    lines
 }
 
 fn render_candidate_phase(f: &mut Frame, area: Rect, state: &AppState) {
@@ -372,19 +377,19 @@ fn render_candidate_phase(f: &mut Frame, area: Rect, state: &AppState) {
         if selected {
             style = style.add_modifier(Modifier::REVERSED);
         }
-        let improvement_pct = improvement_pct_vs_baseline(run.wall_time_s, baseline_wall);
-        let status_suffix = run
-            .profiling_status
-            .map(|status| format!(" | {status}"))
-            .unwrap_or_default();
+        let baseline_comparison = baseline_comparison_label(run.wall_time_s, baseline_wall);
+        let profiling_suffix = if run.profiled {
+            " | profiled"
+        } else {
+            " | no snapshot"
+        };
         legend_lines.push(Line::styled(
             format!(
-                "S{idx} {:.2}s | {:+.1}% | round {} c{}{}",
+                "S{idx} {:.2}s | {} | {}{}",
                 run.wall_time_s,
-                improvement_pct,
-                run.round,
-                run.candidate_id,
-                status_suffix
+                baseline_comparison,
+                run.label,
+                profiling_suffix
             ),
             style,
         ));
@@ -401,14 +406,12 @@ fn render_candidate_phase(f: &mut Frame, area: Rect, state: &AppState) {
 struct CandidateRunEntry {
     wall_time_s: f64,
     round: u64,
-    candidate_id: u64,
-    profiling_status: Option<&'static str>,
+    label: String,
+    profiled: bool,
 }
 
 fn candidate_run_entries(state: &AppState) -> Vec<CandidateRunEntry> {
     let mut runs = Vec::new();
-    let selected_candidates = selected_candidates_for_profiling(state);
-    let (profiling_in_progress_round, completed_profiling_rounds) = profiling_state(state);
 
     for event in state.evidence_events.iter() {
         if event.event == "phase.finished" {
@@ -420,14 +423,8 @@ fn candidate_run_entries(state: &AppState) -> Vec<CandidateRunEntry> {
                 runs.push(CandidateRunEntry {
                     wall_time_s,
                     round: 0,
-                    candidate_id: 0,
-                    profiling_status: candidate_profiling_status(
-                        0,
-                        None,
-                        &selected_candidates,
-                        profiling_in_progress_round,
-                        &completed_profiling_rounds,
-                    ),
+                    label: candidate_run_label(event),
+                    profiled: has_profile_snapshot_for_run(state, event),
                 });
             }
             continue;
@@ -436,18 +433,11 @@ fn candidate_run_entries(state: &AppState) -> Vec<CandidateRunEntry> {
         if event.event == "candidate.evaluated" {
             if let Some(wall_time_s) = payload_f64(event, "wall_time_s") {
                 let round = payload_u64(event, "iteration").unwrap_or(0);
-                let candidate_id = payload_u64(event, "candidate_id");
                 runs.push(CandidateRunEntry {
                     wall_time_s,
                     round,
-                    candidate_id: candidate_id.unwrap_or(0),
-                    profiling_status: candidate_profiling_status(
-                        round,
-                        candidate_id,
-                        &selected_candidates,
-                        profiling_in_progress_round,
-                        &completed_profiling_rounds,
-                    ),
+                    label: candidate_run_label(event),
+                    profiled: has_profile_snapshot_for_run(state, event),
                 });
             }
         }
@@ -468,120 +458,90 @@ fn candidate_bar_style(round: u64) -> Style {
     }
 }
 
-fn improvement_pct_vs_baseline(wall_time_s: f64, baseline_wall_time_s: f64) -> f64 {
+fn baseline_comparison_label(wall_time_s: f64, baseline_wall_time_s: f64) -> String {
     if baseline_wall_time_s <= 0.0 {
-        return 0.0;
+        return "baseline".to_string();
     }
-    ((baseline_wall_time_s - wall_time_s) / baseline_wall_time_s) * 100.0
+
+    if (wall_time_s - baseline_wall_time_s).abs() < f64::EPSILON {
+        return "baseline".to_string();
+    }
+
+    if wall_time_s < baseline_wall_time_s && wall_time_s > 0.0 {
+        return format!("{:.2}x speed up", baseline_wall_time_s / wall_time_s);
+    }
+
+    let slower_pct = ((wall_time_s - baseline_wall_time_s) / baseline_wall_time_s) * 100.0;
+    format!("{:.1}% slower", slower_pct)
 }
 
-fn selected_candidates_for_profiling(state: &AppState) -> HashMap<u64, u64> {
-    let mut selected = HashMap::new();
-    for event in state.all_events.iter() {
-        if event.event != "candidate.evaluated" {
-            continue;
-        }
-        if payload_str(event, "verdict") != Some("improved") {
-            continue;
-        }
+fn candidate_run_label(event: &TuneEventEnvelope) -> String {
+    let round = payload_u64(event, "iteration").unwrap_or(0);
 
-        let round = payload_u64(event, "iteration").unwrap_or(0);
-        let candidate_id = payload_u64(event, "candidate_id").unwrap_or(0);
-        if round > 0 && candidate_id > 0 {
-            selected.insert(round, candidate_id);
-        }
-    }
-    selected
-}
-
-fn profiling_state(state: &AppState) -> (Option<u64>, HashSet<u64>) {
-    let mut completed_rounds = HashSet::new();
-    for event in state.all_events.iter() {
-        if event.event != "profile.finished" {
-            continue;
-        }
-        if let Some(round) = payload_u64(event, "iteration") {
-            completed_rounds.insert(round);
-        }
+    if payload_str(event, "phase")
+        .map(|phase| phase.contains("baseline"))
+        .unwrap_or(false)
+        || round == 0
+    {
+        return payload_str(event, "run_label")
+            .map(str::to_string)
+            .unwrap_or_else(|| "baseline".to_string());
     }
 
-    if completed_rounds.is_empty() {
-        for event in state.all_events.iter() {
-            if event.event != "profile.snapshot" {
-                continue;
-            }
-            if let Some(round) = payload_u64(event, "iteration") {
-                completed_rounds.insert(round);
-            }
-        }
-    }
-
-    let mut active_round = state
-        .all_events
-        .iter()
-        .rev()
-        .find(|event| event.event == "profile.started" || event.event == "profile.finished")
-        .and_then(|event| {
-            if event.event == "profile.started" {
-                payload_u64(event, "iteration")
+    let candidate_label = payload_str(event, "candidate_label")
+        .or_else(|| payload_str(event, "run_label"))
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            let candidate_id = payload_u64(event, "candidate_id").unwrap_or(0);
+            if candidate_id > 0 {
+                format!("c{candidate_id}")
             } else {
-                None
+                "candidate".to_string()
             }
         });
 
-    if active_round.is_none() {
-        active_round = state
-            .all_events
-            .iter()
-            .rev()
-            .find(|event| {
-                (event.event == "exec.started" || event.event == "exec.finished")
-                    && payload_str(event, "phase") == Some("spawn.profiling")
-            })
-            .and_then(|event| {
-                if event.event == "exec.started" {
-                    payload_u64(event, "iteration")
-                } else {
-                    None
-                }
-            });
-    }
-
-    (active_round, completed_rounds)
+    format!("round {round} {candidate_label}")
 }
 
-fn candidate_profiling_status(
-    round: u64,
-    candidate_id: Option<u64>,
-    selected_candidates: &HashMap<u64, u64>,
-    profiling_in_progress_round: Option<u64>,
-    completed_profiling_rounds: &HashSet<u64>,
-) -> Option<&'static str> {
-    if round == 0 {
-        if profiling_in_progress_round == Some(1) {
-            return Some("under profiling");
-        }
-        return Some("selected for profiling");
+fn has_profile_snapshot_for_run(state: &AppState, event: &TuneEventEnvelope) -> bool {
+    let phase = payload_str(event, "phase");
+    let run_label = payload_str(event, "run_label");
+    let iteration = payload_u64(event, "iteration");
+    let candidate_id = payload_u64(event, "candidate_id");
+
+    state.profiling_events.iter().any(|snapshot| {
+        payload_str(snapshot, "phase") == phase
+            && payload_str(snapshot, "run_label") == run_label
+            && payload_u64(snapshot, "iteration") == iteration
+            && payload_u64(snapshot, "candidate_id") == candidate_id
+    })
+}
+
+fn profile_snapshot_label(snapshot: &TuneEventEnvelope) -> String {
+    let phase = payload_str(snapshot, "phase").unwrap_or("");
+    let run_label = payload_str(snapshot, "run_label");
+    let candidate_label = payload_str(snapshot, "candidate_label");
+    let round = payload_u64(snapshot, "iteration").unwrap_or(0);
+
+    if phase.contains("baseline") || round == 0 {
+        return run_label
+            .map(|label| format!("baseline snapshot ({label})"))
+            .unwrap_or_else(|| "baseline snapshot".to_string());
     }
 
-    let candidate_id = candidate_id?;
-    if candidate_id == 0 {
-        return None;
-    }
+    let label = candidate_label
+        .or(run_label)
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            let candidate_id = payload_u64(snapshot, "candidate_id").unwrap_or(0);
+            if candidate_id > 0 {
+                format!("c{candidate_id}")
+            } else {
+                "candidate".to_string()
+            }
+        });
 
-    let selected_candidate_id = selected_candidates.get(&round)?;
-    if *selected_candidate_id != candidate_id {
-        return None;
-    }
-
-    let next_round = round + 1;
-    if profiling_in_progress_round == Some(next_round) {
-        return Some("under profiling");
-    }
-    if completed_profiling_rounds.contains(&next_round) {
-        return Some("selected for profiling");
-    }
-    None
+    format!("round {round} snapshot ({label})")
 }
 
 fn render_decision_and_details(f: &mut Frame, area: Rect, state: &AppState) {
@@ -709,28 +669,42 @@ fn details_event_for_panel(state: &AppState, panel: Panel) -> Option<&TuneEventE
 
 fn run_event_label(event: &TuneEventEnvelope) -> String {
     match event.event.as_str() {
-        "run.started" => "round 0 step 0 baseline run start".to_string(),
-        "baseline.finished" => "round 0 step 0 baseline run finish".to_string(),
+        "run.started" => "round 0 step 0 initial baseline run (profiled) start".to_string(),
+        "baseline.finished" => "round 0 step 0 initial baseline run (profiled) finish".to_string(),
         "profile.started" => {
             let round = round_for_event(event);
-            format!("round {round} step 1 profiling start")
+            if round == 0 {
+                "round 0 step 0 baseline profiling started".to_string()
+            } else {
+                let run_label = payload_str(event, "candidate_label")
+                    .or_else(|| payload_str(event, "run_label"))
+                    .unwrap_or("candidate");
+                format!("round {round} run profiling started ({run_label})")
+            }
         }
         "profile.finished" => {
             let round = round_for_event(event);
-            format!("round {round} step 1 profiling finish")
+            if round == 0 {
+                "round 0 step 0 baseline profiling finished".to_string()
+            } else {
+                let run_label = payload_str(event, "candidate_label")
+                    .or_else(|| payload_str(event, "run_label"))
+                    .unwrap_or("candidate");
+                format!("round {round} run profiling finished ({run_label})")
+            }
         }
         "recommendation.ready" => {
             let round = round_for_event(event);
-            format!("round {round} step 2 analysis")
+            format!("round {round} step 1 agent tuning analysis")
         }
         "progress.update" => {
             let round = round_for_event(event);
             let current_trial = payload_u64(event, "current_trial").unwrap_or(0);
             let total_trials = payload_u64(event, "total_trials").unwrap_or(0);
             if current_trial > 0 && total_trials > 0 {
-                format!("round {round} step 3 candidate search {current_trial}/{total_trials}")
+                format!("round {round} step 2 candidate search ({current_trial}/{total_trials})")
             } else {
-                format!("round {round} step 3 candidate search")
+                format!("round {round} step 2 candidate search")
             }
         }
         "progress.finished" => {
@@ -739,22 +713,22 @@ fn run_event_label(event: &TuneEventEnvelope) -> String {
             let total_trials = payload_u64(event, "total_trials").unwrap_or(0);
             if current_trial > 0 && total_trials > 0 {
                 format!(
-                    "round {round} step 3 candidate search {current_trial}/{total_trials} finish"
+                    "round {round} step 2 candidate search ({current_trial}/{total_trials}) finish"
                 )
             } else {
-                format!("round {round} step 3 candidate search finish")
+                format!("round {round} step 2 candidate search finish")
             }
         }
         "candidate.evaluated" => {
             let round = round_for_event(event);
             let candidate_id = payload_u64(event, "candidate_id").unwrap_or(0);
             if candidate_id > 0 {
-                format!("round {round} step 3 candidate {candidate_id} evaluated")
+                format!("round {round} step 2 candidate {candidate_id} evaluated")
             } else {
-                format!("round {round} step 3 candidate evaluated")
+                format!("round {round} step 2 candidate evaluated")
             }
         }
-        "result.comparison" => "round final step 4 results comparison".to_string(),
+        "result.comparison" => "round final step 3 results comparison".to_string(),
         _ => event.event.clone(),
     }
 }
@@ -1249,4 +1223,48 @@ fn clamped_index_window_start(start: usize, len: usize, max_rows: usize) -> usiz
         return 0;
     }
     start.min(len - max_rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{baseline_comparison_label, recommendation_header_lines};
+    use crate::event::TuneEventEnvelope;
+
+    #[test]
+    fn recommendation_header_includes_next_action_when_present() {
+        let env = TuneEventEnvelope {
+            schema_version: "v1".to_string(),
+            run_id: "run-1".to_string(),
+            seq: 1,
+            ts: "2026-04-30T00:00:00Z".to_string(),
+            event_type: "event".to_string(),
+            event: "recommendation.ready".to_string(),
+            payload: json!({
+                "summary": "try one candidate",
+                "next_action": "OMP_PROC_BIND=close",
+                "manual_citation": "rule",
+                "action_count": 1,
+            }),
+        };
+
+        let lines = recommendation_header_lines(&env);
+        assert_eq!(
+            lines,
+            vec![
+                "summary: try one candidate".to_string(),
+                "next action: OMP_PROC_BIND=close".to_string(),
+                "manual: rule".to_string(),
+                "candidate count: 1".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn baseline_comparison_label_uses_speedup_for_faster_runs() {
+        assert_eq!(baseline_comparison_label(146.0, 678.0), "4.64x speed up");
+        assert_eq!(baseline_comparison_label(678.0, 678.0), "baseline");
+        assert_eq!(baseline_comparison_label(700.0, 678.0), "3.2% slower");
+    }
 }

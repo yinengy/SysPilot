@@ -595,16 +595,28 @@ fn run_reserved_lines(state: &AppState, width: u16) -> usize {
 fn analysis_reserved_lines(state: &AppState) -> usize {
     let mut reserved = 0usize;
     if let Some(rec) = latest_event_by_name(state, "recommendation.ready") {
-        let _ = rec;
         reserved += 1;
-        if latest_event_by_name(state, "recommendation.ready")
-            .and_then(|event| event.payload.get("manual_citation").and_then(|v| v.as_str()))
+        if rec
+            .payload
+            .get("next_action")
+            .and_then(|v| v.as_str())
+            .filter(|value| !value.trim().is_empty())
             .is_some()
         {
             reserved += 1;
         }
-        if latest_event_by_name(state, "recommendation.ready")
-            .and_then(|event| event.payload.get("action_count").and_then(|v| v.as_u64()))
+        if rec
+            .payload
+            .get("manual_citation")
+            .and_then(|v| v.as_str())
+            .is_some()
+        {
+            reserved += 1;
+        }
+        if rec
+            .payload
+            .get("action_count")
+            .and_then(|v| v.as_u64())
             .is_some()
         {
             reserved += 1;

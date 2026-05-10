@@ -26,7 +26,6 @@ from syspilot_contract.integration import (
     synthesize_library_contract_bundle,
     write_contract_bundle,
 )
-from syspilot_contract.migration import migrate_contract_payload
 from syspilot_contract.query_store import ContractStore
 from syspilot_contract.render_contract import render_contract_lpcl, render_contract_markdown
 from syspilot_contract.schemas import (
@@ -50,7 +49,6 @@ from syspilot_contract.schemas import (
     LibraryContract,
     PHASES,
     PREDICATE_KINDS,
-    PROBE_KINDS,
     RESOURCE_TYPES,
     SHARE_MODES,
     SCOPES,
@@ -58,7 +56,6 @@ from syspilot_contract.schemas import (
     ResourceUse,
     SharedResourceItem,
     Signal,
-    SignalProbe,
     SourceArtifact,
 )
 from syspilot_contract.synthesize_contract import synthesize_library_contract
@@ -85,7 +82,6 @@ __all__ = [
     "LibraryContract",
     "PHASES",
     "PREDICATE_KINDS",
-    "PROBE_KINDS",
     "RESOURCE_TYPES",
     "Recipe",
     "ResourceUse",
@@ -93,7 +89,6 @@ __all__ = [
     "SHARE_MODES",
     "SharedResourceItem",
     "Signal",
-    "SignalProbe",
     "SourceArtifact",
     "assert_valid_contract",
     "build_agent_context_bundle",
@@ -112,7 +107,6 @@ __all__ = [
     "load_contract",
     "load_contract_yaml",
     "load_store",
-    "migrate_contract_payload",
     "parse_contract_yaml",
     "render_contract_lpcl",
     "render_contract_markdown",

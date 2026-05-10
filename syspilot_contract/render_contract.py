@@ -60,17 +60,19 @@ def render_contract_markdown(contract: LibraryContract | ComposedContract) -> st
         for item in contract.controls:
             effect = item.effect.model_dump(mode="json", exclude_none=True)
             lines.append(
-                f"- `{item.name}` (`{item.kind}`, `{item.type}`) targets `{item.target}` with `{effect}`"
+                f"- `{item.name}` (`{item.kind}`, `{item.type}`) targets `{item.target}` with `{effect}` interacts_with={item.interacts_with or '(none)'}`"
             )
         lines.extend(["", "## Signals", ""])
         for item in contract.signals:
             lines.append(
-                f"- `{item.id}`: `{item.metric}` targets `{item.target}` via `{item.probe.kind}:{item.probe.name}` → `{item.indicates}`"
+                f"- `{item.id}`: `{item.metric}` targets `{item.target}` via `{item.virtual_probe}` role=`{item.role}` expect=`{item.expected_direction_when_mitigated}` → `{item.indicates}`"
             )
         lines.extend(["", "## Recipes", ""])
         for item in contract.recipes:
+            action_text = ", ".join(action.summary for action in item.actions)
+            diagnose_text = ", ".join(diagnose.label for diagnose in item.diagnose)
             lines.append(
-                f"- `{item.id}` for `{item.hypothesis_kind}`: collect {', '.join(item.collect)}; actions: {', '.join(item.actions)}"
+                f"- `{item.id}` for `{item.hypothesis_kind}`: collect {', '.join(item.collect)}; diagnose: {diagnose_text}; config_checks: {', '.join(item.config_checks)}; outcomes: {', '.join(item.outcomes)}; guardrails: {', '.join(item.guardrails)}; actions: {action_text}"
             )
         return "\n".join(lines).strip() + "\n"
 

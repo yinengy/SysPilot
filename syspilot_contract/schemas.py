@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -85,14 +86,19 @@ EFFECT_KINDS: tuple[str, ...] = (
     "enable",
 )
 
-PROBE_KINDS: tuple[str, ...] = (
-    "api",
-    "perf",
-    "os",
-    "log",
-    "profiler",
-    "benchmark",
-    "manual",
+SIGNAL_ROLES: tuple[str, ...] = (
+    "config_check",
+    "resource_signal",
+    "subcomponent_signal",
+    "outcome",
+    "guardrail",
+)
+
+EXPECTED_DIRECTIONS: tuple[str, ...] = (
+    "increase",
+    "decrease",
+    "stable",
+    "unknown",
 )
 
 HYPOTHESIS_KINDS: tuple[str, ...] = (
@@ -188,7 +194,10 @@ PredicateKind = Literal[
 ControlKind = Literal["env", "api", "config", "cli", "vlc"]
 ControlType = Literal["int", "float", "bool", "string", "enum", "set"]
 EffectKind = Literal["set", "increase", "decrease", "partition", "disable", "enable"]
-ProbeKind = Literal["api", "perf", "os", "log", "profiler", "benchmark", "manual"]
+SignalRole = Literal[
+    "config_check", "resource_signal", "subcomponent_signal", "outcome", "guardrail"
+]
+ExpectedDirection = Literal["increase", "decrease", "stable", "unknown"]
 HypothesisKind = Literal[
     "shared_cpu_compute_conflict",
     "cpu_placement_conflict",
@@ -255,6 +264,42 @@ def _validate_enum(value: str, allowed: tuple[str, ...], label: str) -> str:
     if text not in allowed:
         raise ValueError(f"Unknown {label} {text}. Allowed values: {', '.join(allowed)}")
     return text
+
+
+def _normalize_probe_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", ".", value.lower()).strip(".")
+
+
+def _validate_metric_name(metric: str) -> str:
+    text = str(metric).strip()
+    if not text:
+        raise ValueError("Signal metric must not be empty")
+    normalized = _normalize_probe_key(text)
+    vague = {
+        "metric",
+        "value",
+        "usage",
+        "performance",
+        "runtime",
+        "memory",
+        "cpu",
+        "gpu",
+        "io",
+        "signal",
+        "status",
+        "settings",
+    }
+    if normalized in vague:
+        raise ValueError(f"Signal metric '{text}' is too vague")
+    return text
+
+
+def _string_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return _clean_strings([str(item) for item in value])
+    if value is None:
+        return []
+    return _clean_strings([str(value)])
 
 
 def _resource_root(target: str) -> str | None:
@@ -428,11 +473,12 @@ def _validate_predicate(resource: str, predicate: dict[str, Any]) -> dict[str, A
     if kind in {"total_at_most", "competitors_at_most"}:
         if not _is_number_or_symbol(predicate.get("value")):
             raise ValueError(f"Predicate {kind} requires a value")
+        return {"kind": kind, "value": predicate.get("value")}
     if kind == "not_nested" and resource not in {"cpu.compute", "gpu.compute"}:
         raise ValueError(f"Predicate not_nested is not valid for resource {resource}")
     if kind == "placement_compatible" and resource != "cpu.placement":
         raise ValueError(f"Predicate placement_compatible is not valid for resource {resource}")
-    return predicate
+    return {"kind": kind}
 
 
 class ContractBaseModel(BaseModel):
@@ -545,6 +591,8 @@ class Assumption(ContractBaseModel):
 class ControlEffect(ContractBaseModel):
     kind: str
     value: Any | None = None
+    formula: str | None = None
+    direction: str | None = None
     resource: str | None = None
 
     @field_validator("kind", mode="after")
@@ -558,6 +606,18 @@ class ControlEffect(ContractBaseModel):
         if value is None:
             return None
         return _validate_resource(value)
+
+    @field_validator("formula", mode="before")
+    @classmethod
+    def _normalize_formula(cls, value: Any) -> str | None:
+        return _normalize_condition(value)
+
+    @field_validator("direction", mode="after")
+    @classmethod
+    def _validate_direction(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _validate_enum(value, EXPECTED_DIRECTIONS, "control effect direction")
 
     @model_validator(mode="after")
     def _validate_shape(self) -> "ControlEffect":
@@ -575,6 +635,7 @@ class Control(ContractBaseModel):
     type: str
     target: str
     effect: ControlEffect
+    interacts_with: list[str] = Field(default_factory=list)
     when: str | None = None
     evidence: list[str]
 
@@ -598,33 +659,46 @@ class Control(ContractBaseModel):
     def _validate_evidence(cls, values: list[str]) -> list[str]:
         return _require_non_empty_evidence(values, "Controls")
 
-
-class SignalProbe(ContractBaseModel):
-    kind: str
-    name: str
-
-    @field_validator("kind", mode="after")
+    @field_validator("interacts_with", mode="after")
     @classmethod
-    def _validate_kind(cls, value: str) -> str:
-        return _validate_enum(value, PROBE_KINDS, "probe kind")
-
-    @field_validator("name", mode="after")
-    @classmethod
-    def _validate_name(cls, value: str) -> str:
-        text = str(value).strip()
-        if not text:
-            raise ValueError("Probe name must not be empty")
-        return text
-
+    def _normalize_interacts_with(cls, values: list[str]) -> list[str]:
+        return _clean_strings(values)
 
 class Signal(ContractBaseModel):
     id: str
     target: str
+    role: str
     metric: str
     indicates: str
-    probe: SignalProbe
+    virtual_probe: str
+    expected_direction_when_mitigated: str
     when: str | None = None
     evidence: list[str]
+
+    @field_validator("metric", mode="after")
+    @classmethod
+    def _validate_metric(cls, value: str) -> str:
+        return _validate_metric_name(value)
+
+    @field_validator("role", mode="after")
+    @classmethod
+    def _validate_role(cls, value: str) -> str:
+        return _validate_enum(value, SIGNAL_ROLES, "signal role")
+
+    @field_validator("virtual_probe", mode="after")
+    @classmethod
+    def _validate_virtual_probe(cls, value: str) -> str:
+        text = str(value).strip()
+        if not text:
+            raise ValueError("Signal must declare a non-empty virtual_probe")
+        if "/" in text or text.endswith(".py"):
+            raise ValueError("Signal virtual_probe must not be a concrete script path")
+        return text
+
+    @field_validator("expected_direction_when_mitigated", mode="after")
+    @classmethod
+    def _validate_expected_direction(cls, value: str) -> str:
+        return _validate_enum(value, EXPECTED_DIRECTIONS, "expected direction")
 
     @field_validator("when", mode="before")
     @classmethod
@@ -637,13 +711,87 @@ class Signal(ContractBaseModel):
         return _require_non_empty_evidence(values, "Signals")
 
 
+class RecipeExpectedSignalChange(ContractBaseModel):
+    signal: str
+    expected_direction_when_mitigated: str
+    reason: str | None = None
+
+    @field_validator("expected_direction_when_mitigated", mode="after")
+    @classmethod
+    def _validate_direction(cls, value: str) -> str:
+        return _validate_enum(value, EXPECTED_DIRECTIONS, "expected direction")
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def _normalize_reason(cls, value: Any) -> str | None:
+        return _normalize_condition(value)
+
+
+class RecipeDiagnose(ContractBaseModel):
+    label: str
+    signals: list[str] = Field(default_factory=list)
+    question: str | None = None
+
+    @field_validator("label", mode="after")
+    @classmethod
+    def _validate_label(cls, value: str) -> str:
+        text = str(value).strip()
+        if not text:
+            raise ValueError("Recipe diagnose blocks must include a label")
+        return text
+
+    @field_validator("signals", mode="after")
+    @classmethod
+    def _normalize_signals(cls, values: list[str]) -> list[str]:
+        return _clean_strings(values)
+
+    @field_validator("question", mode="before")
+    @classmethod
+    def _normalize_question(cls, value: Any) -> str | None:
+        return _normalize_condition(value)
+
+
+class RecipeAction(ContractBaseModel):
+    label: str
+    summary: str
+    control: str | None = None
+    effect: str | None = None
+    value: Any | None = None
+    expected_changes: list[RecipeExpectedSignalChange] = Field(default_factory=list)
+
+    @field_validator("label", mode="after")
+    @classmethod
+    def _validate_label(cls, value: str) -> str:
+        text = str(value).strip()
+        if not text:
+            raise ValueError("Recipe actions must include a label")
+        return text
+
+    @field_validator("summary", mode="after")
+    @classmethod
+    def _validate_summary(cls, value: str) -> str:
+        text = str(value).strip()
+        if not text:
+            raise ValueError("Recipe actions must include a summary")
+        return text
+
+    @field_validator("control", "effect", mode="before")
+    @classmethod
+    def _normalize_action_strings(cls, value: Any) -> str | None:
+        text = _normalize_condition(value)
+        return text
+
+
 class Recipe(ContractBaseModel):
     id: str
     hypothesis_kind: str = Field(alias="for", serialization_alias="for")
     collect: list[str] = Field(default_factory=list)
-    actions: list[str] = Field(default_factory=list)
-    accept: str
-    rollback: str
+    diagnose: list[RecipeDiagnose] = Field(default_factory=list)
+    config_checks: list[str] = Field(default_factory=list)
+    outcomes: list[str] = Field(default_factory=list)
+    guardrails: list[str] = Field(default_factory=list)
+    search_space_hints: list[str] = Field(default_factory=list)
+    actions: list[RecipeAction] = Field(default_factory=list)
     when: str | None = None
     evidence: list[str]
 
@@ -652,7 +800,9 @@ class Recipe(ContractBaseModel):
     def _validate_hypothesis_kind(cls, value: str) -> str:
         return _validate_enum(value, HYPOTHESIS_KINDS, "hypothesis kind")
 
-    @field_validator("collect", "actions", mode="after")
+    @field_validator(
+        "collect", "config_checks", "outcomes", "guardrails", "search_space_hints", mode="after"
+    )
     @classmethod
     def _normalize_lists(cls, values: list[str]) -> list[str]:
         return _clean_strings(values)
@@ -671,8 +821,16 @@ class Recipe(ContractBaseModel):
     def _validate_content(self) -> "Recipe":
         if not self.collect:
             raise ValueError("Recipes must collect at least one signal")
+        if not self.diagnose:
+            raise ValueError("Recipes must include at least one diagnose block")
         if not self.actions:
             raise ValueError("Recipes must include at least one action")
+        if not self.config_checks:
+            raise ValueError("Recipes must include at least one config_check")
+        if not self.outcomes:
+            raise ValueError("Recipes must include at least one outcome")
+        if not self.guardrails:
+            raise ValueError("Recipes must include at least one guardrail")
         return self
 
 
@@ -702,12 +860,19 @@ class LibraryContract(ContractBaseModel):
 
         component_ids = {item.id for item in self.components}
         signal_ids = {item.id for item in self.signals}
+        control_ids = {item.id for item in self.controls}
 
         for item in self.uses:
             if item.by not in component_ids:
                 issues.append(f"Use {item.id} references missing component {item.by}.")
 
         for control in self.controls:
+            if control.name.startswith("BENCHMARK_") and not any(
+                token in self.contract.lower() for token in ("benchmark", "wrapper")
+            ):
+                issues.append(
+                    f"Control {control.name} is a benchmark-wrapper variable and must not appear in library contract {self.contract}."
+                )
             if not _target_exists(control.target, self):
                 if control.target == "cpu.thread" and _looks_like_worker_control(control.name):
                     issues.append(
@@ -736,6 +901,27 @@ class LibraryContract(ContractBaseModel):
                 issues.append(
                     f"Recipe {recipe.id} collects missing signals: {', '.join(sorted(missing_signals))}."
                 )
+            for diagnose in recipe.diagnose:
+                missing_diagnose_signals = [item for item in diagnose.signals if item not in signal_ids]
+                if missing_diagnose_signals:
+                    issues.append(
+                        f"Recipe {recipe.id} diagnose block '{diagnose.label}' references missing signals: {', '.join(sorted(missing_diagnose_signals))}."
+                    )
+            missing_config_checks = [item for item in recipe.config_checks if item not in signal_ids]
+            if missing_config_checks:
+                issues.append(
+                    f"Recipe {recipe.id} config_checks reference missing signals: {', '.join(sorted(missing_config_checks))}."
+                )
+            for action in recipe.actions:
+                if action.control and action.control not in control_ids:
+                    issues.append(
+                        f"Recipe {recipe.id} action '{action.summary}' references missing control {action.control}."
+                    )
+                for change in action.expected_changes:
+                    if change.signal not in signal_ids:
+                        issues.append(
+                            f"Recipe {recipe.id} action '{action.summary}' references missing signal {change.signal}."
+                        )
 
         if issues:
             raise ValueError("; ".join(issues))

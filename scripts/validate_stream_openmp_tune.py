@@ -155,23 +155,39 @@ def parse_tune_output(output: str) -> dict[str, object]:
     baseline_match = re.search(
         r"Round 0 Step 0: Initial Baseline Run.*?Wall time:\s*([0-9.]+)s", output, re.S
     )
-    success_match = re.search(r"Success!\s+([0-9.]+)% improvement with actions:\s*(.+)", output)
+    comparison_times_match = re.search(
+        r"│ Wall Time\s*│\s*([0-9.]+)s\s*│\s*([0-9.]+)s\s*│",
+        output,
+    )
+    success_match = re.search(
+        r"Success!\s+(?:([0-9.]+)x speed up \(([0-9.]+)% improvement\)|([0-9.]+)% improvement) with actions:\s*(.+)",
+        output,
+    )
     comparison_match = re.search(
-        r"│ Wall Time\s*│\s*([0-9.]+)s\s*│\s*([0-9.]+)s\s*│\s*\+?([0-9.]+)%",
+        r"│ Wall Time\s*│\s*([0-9.]+)s\s*│\s*([0-9.]+)s\s*│\s*(?:([0-9.]+)x speed up \(\+?([0-9.]+)%\)|\+?([0-9.]+)%)",
         output,
     )
 
     baseline_wall_s = float(baseline_match.group(1)) if baseline_match else None
-    tuned_wall_s = float(comparison_match.group(2)) if comparison_match else None
+    comparison_baseline_s = float(comparison_times_match.group(1)) if comparison_times_match else None
+    tuned_wall_s = float(comparison_times_match.group(2)) if comparison_times_match else None
+    if baseline_wall_s is None:
+        baseline_wall_s = comparison_baseline_s
     improvement_pct = None
     if success_match:
-        improvement_pct = float(success_match.group(1))
+        if success_match.group(2):
+            improvement_pct = float(success_match.group(2))
+        elif success_match.group(3):
+            improvement_pct = float(success_match.group(3))
     elif comparison_match:
-        improvement_pct = float(comparison_match.group(3))
+        if comparison_match.group(4):
+            improvement_pct = float(comparison_match.group(4))
+        elif comparison_match.group(5):
+            improvement_pct = float(comparison_match.group(5))
     elif baseline_wall_s is not None and tuned_wall_s is not None and baseline_wall_s > 0:
         improvement_pct = max(0.0, ((baseline_wall_s - tuned_wall_s) / baseline_wall_s) * 100.0)
 
-    actions = success_match.group(2).strip() if success_match else ""
+    actions = success_match.group(4).strip() if success_match else ""
     if not actions:
         best_command_match = re.search(r"Best command:\s*(.+)", output)
         best_env_match = re.search(r"Best environment overrides:\s*(\{.+\})", output)

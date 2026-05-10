@@ -93,7 +93,6 @@ log
 node_modules
 ui/ratatui/target/
 manual/*
-manual_sources/*
 contracts/*
 
 # OpenCode
@@ -106,4 +105,4 @@ experiments/*/*/env
 experiments/*/*/runs
 experiments/*/*/work
 artifacts
-contract_sources
+library_sources/*

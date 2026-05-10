@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import json
 import logging
 import os
@@ -9,16 +10,17 @@ import shlex
 import subprocess
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 import click
 import psutil
 import yaml
 from rich.console import Console
+from rich.markup import escape as rich_escape
 from rich.table import Table
 from rich.panel import Panel
 
@@ -47,8 +49,7 @@ from syspilot.skills.builtin import (
 )
 from syspilot.skills.ebpf import EBPFSkill
 from syspilot.tuning import ApplicationTuner
-from syspilot.tuning.engine import TuningEngine
-from syspilot.utils import setup_logging, find_process_by_name
+from syspilot.utils import setup_logging
 from syspilot.ui.emitter import TuneEventEmitter
 from syspilot.ui.output_sink import OutputSink, SwitchableOutputSink, TuneUIMode, make_output_sink
 from syspilot.ui.tui_sidecar import TuneTuiOrchestrator, should_wait_for_user_on_close
@@ -360,104 +361,6 @@ def auth_login(auto: bool, timeout: int, auth_file: str | None) -> None:
 
 
 @cli.command()
-@click.option("--pid", "-p", type=int, help="Target process ID")
-@click.option("--name", "-n", help="Target process name")
-@click.option("--interval", "-i", default=5.0, help="Monitoring interval (seconds)")
-@click.option(
-    "--manual", "-m", multiple=True, help="Load specific manuals (e.g., numactl, pytorch)"
-)
-@click.pass_context
-def monitor(
-    ctx: click.Context, pid: int | None, name: str | None, interval: float, manual: tuple[str, ...]
-) -> None:
-    config: SysPilotConfig = ctx.obj["config"]
-    config.target_pid = pid
-    config.target_name = name
-    config.monitoring.interval_seconds = interval
-
-    if name and not pid:
-        processes = find_process_by_name(name)
-        if not processes:
-            console.print(f"[red]No process found matching '{name}'[/red]")
-            sys.exit(1)
-        if len(processes) > 1:
-            console.print(f"[yellow]Multiple processes found:[/yellow]")
-            for p in processes:
-                console.print(f"  PID {p.pid}: {p.name} - {' '.join(p.cmdline[:3])}")
-            console.print("[yellow]Please specify --pid[/yellow]")
-            sys.exit(1)
-        config.target_pid = processes[0].pid
-
-    agent = SysPilotAgent(config)
-
-    if manual:
-        console.print(f"[cyan]Loading manuals: {', '.join(manual)}[/cyan]")
-        results = agent.load_manuals(list(manual))
-        for manual_name, success in results.items():
-            if success:
-                console.print(f"  [green]✓ Loaded: {manual_name}[/green]")
-            else:
-                console.print(f"  [red]✗ Failed: {manual_name}[/red]")
-
-    manager = ProfilingManager()
-    tuner = ApplicationTuner(config.tuning)
-
-    _register_default_skills(agent)
-    _register_profiling_tools(agent, manager)
-    _register_tuning_tools(agent, tuner)
-
-    console.print(
-        Panel(
-            f"[bold green]SysPilot Monitor[/bold green]\n"
-            f"Target: PID {config.target_pid or 'System-wide'}\n"
-            f"Interval: {interval}s\n"
-            f"Manuals: {len(agent.context.loaded_manuals)} loaded",
-            title="Starting",
-        )
-    )
-
-    try:
-        asyncio.run(agent.run_monitoring_loop())
-    except KeyboardInterrupt:
-        console.print("\n[yellow]Stopping monitor...[/yellow]")
-        agent.stop()
-
-
-@cli.command()
-@click.argument("pid", type=int)
-@click.option(
-    "--manual", "-m", multiple=True, help="Load specific manuals (e.g., numactl, pytorch)"
-)
-@click.pass_context
-def analyze(ctx: click.Context, pid: int, manual: tuple[str, ...]) -> None:
-    config: SysPilotConfig = ctx.obj["config"]
-    config.target_pid = pid
-
-    agent = SysPilotAgent(config)
-
-    if manual:
-        console.print(f"[cyan]Loading manuals: {', '.join(manual)}[/cyan]")
-        results = agent.load_manuals(list(manual))
-        for manual_name, success in results.items():
-            if success:
-                console.print(f"  [green]✓ Loaded: {manual_name}[/green]")
-            else:
-                console.print(f"  [red]✗ Failed: {manual_name}[/red]")
-
-    manager = ProfilingManager()
-    tuner = ApplicationTuner(config.tuning)
-
-    _register_default_skills(agent)
-    _register_profiling_tools(agent, manager)
-    _register_tuning_tools(agent, tuner)
-
-    console.print(f"[bold]Analyzing process {pid}...[/bold]")
-
-    result = asyncio.run(agent.analyze_target(pid=pid))
-    console.print(Panel(result, title="Analysis Result"))
-
-
-@cli.command()
 @click.argument("pid", type=int)
 @click.option("--collector", "-c", multiple=True, help="Specific collectors to use")
 @click.pass_context
@@ -512,9 +415,9 @@ def manuals() -> None:
         table.add_row(manual_name, str(manuals_map[manual_name]))
 
     console.print(table)
-    console.print("\n[dim]Use --manual/-m with monitor, analyze, or tune commands[/dim]")
+    console.print("\n[dim]Use --manual/-m for spawn-mode application hints or agent/manual tooling[/dim]")
     console.print(
-        "[dim]Examples: syspilot analyze 1234 --manual numactl | syspilot tune --pid 1234 --manual numactl[/dim]"
+        "[dim]Example: syspilot tune --command \"./benchmark\" --contract numactl --manual \"worker pool expands after warmup\"[/dim]"
     )
 
 
@@ -590,6 +493,46 @@ def _has_structured_context(bundle: dict[str, object]) -> bool:
     return any(
         bundle.get(key) for key in ("profile_first", "candidate_actions", "conflicts", "validation")
     )
+
+
+def _split_escaped_csv_values(value: str) -> list[str]:
+    parts: list[str] = []
+    current: list[str] = []
+    escaping = False
+    for char in value:
+        if escaping:
+            current.append(char)
+            escaping = False
+            continue
+        if char == "\\":
+            escaping = True
+            continue
+        if char == ",":
+            item = "".join(current).strip()
+            if item:
+                parts.append(item)
+            current = []
+            continue
+        current.append(char)
+
+    if escaping:
+        current.append("\\")
+    item = "".join(current).strip()
+    if item:
+        parts.append(item)
+    return parts
+
+
+def _normalize_multi_value_option(values: Sequence[str]) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_value in values:
+        for item in _split_escaped_csv_values(raw_value):
+            if item in seen:
+                continue
+            normalized.append(item)
+            seen.add(item)
+    return normalized
 
 
 def _build_structured_context_bundle(
@@ -922,30 +865,23 @@ def compile_lpcl_cmd(input_path: Path, output_path: Path, include_evidence: bool
     type=click.Path(path_type=Path),
     help="Optional runtime contract root for ID lookup",
 )
-@click.option(
-    "--allow-migration/--no-allow-migration",
-    default=False,
-    show_default=True,
-    help="Allow legacy LPCL payload migration before validation",
-)
 def check_contract_cmd(
     contract_ref: str,
     contract_root: Path | None,
-    allow_migration: bool,
 ) -> None:
     from syspilot_contract.checker import validate_contract_file
 
     contract_path = _resolve_contract_path(contract_ref, contract_root)
     if not contract_path.exists():
         raise click.ClickException(f"Contract not found: {contract_path}")
-    contract, result = validate_contract_file(contract_path, allow_migration=allow_migration)
+    contract, result = validate_contract_file(contract_path)
     click.echo(
         json.dumps(
             {
                 "contract_path": str(contract_path),
                 "valid": result.valid,
                 "issues": result.issues,
-                "contract_type": getattr(contract, "contract_type", None),
+                "type": getattr(contract, "contract_type", None),
                 "contract": getattr(contract, "contract", None),
             },
             indent=2,
@@ -1083,12 +1019,6 @@ def compose_manuals_cmd(
     type=click.Path(path_type=Path),
 )
 @click.option(
-    "--allow-migration/--no-allow-migration",
-    default=False,
-    show_default=True,
-    help="Allow legacy LPCL payload migration before composition",
-)
-@click.option(
     "--include-evidence/--no-include-evidence",
     default=False,
     show_default=True,
@@ -1100,7 +1030,6 @@ def compose_contracts_cmd(
     contract_id: str | None,
     artifact_root: Path,
     contract_root: Path | None,
-    allow_migration: bool,
     include_evidence: bool,
 ) -> None:
     from syspilot_contract.integration import compose_and_write_contract
@@ -1113,7 +1042,6 @@ def compose_contracts_cmd(
         contract_refs=list(contracts),
         artifact_root=artifact_root,
         contract_root=resolved_contract_root,
-        allow_migration=allow_migration,
         include_evidence=include_evidence,
         progress_callback=_contract_composition_progress_callback,
     )
@@ -1224,7 +1152,6 @@ def skills() -> None:
 
 
 @cli.command()
-@click.option("--pid", "-p", type=int, help="Target process ID (attach mode)")
 @click.option("--command", "-c", type=str, help="Command to run and tune (spawn mode)")
 @click.option(
     "--ui-mode",
@@ -1244,50 +1171,99 @@ def skills() -> None:
     help="Working directory for spawn mode command execution",
 )
 @click.option(
-    "--manual", "-m", multiple=True, help="Load specific manuals (e.g., numactl, pytorch)"
+    "--memory-high",
+    type=str,
+    help="If set in spawn mode, launch the command via systemd-run --user --scope -p MemoryHigh=...",
+)
+@click.option(
+    "--contract",
+    multiple=True,
+    help=(
+        "Library contract context(s) for spawn-mode tune. Repeat the option or use comma-separated "
+        "values (escape literal commas as \\,)."
+    ),
+)
+@click.option(
+    "--manual",
+    "-m",
+    multiple=True,
+    help=(
+        "Application-specific natural-language tune hint(s). Repeat the option or use comma-separated "
+        "values (escape literal commas as \\,)."
+    ),
 )
 @click.option("--max-iterations", default=5, help="Maximum tuning iterations")
 @click.option("--dry-run/--no-dry-run", default=True, help="Show changes without applying")
 @click.option("--timeout", default=120, help="Timeout per command run in seconds")
 @click.option(
-    "--parse-output/--no-parse-output",
-    default=False,
-    help="Use LLM to extract metrics from program output",
+    "--primary-objective",
+    type=str,
+    help=(
+        "Free-form workload objective to optimize during spawn-mode tune "
+        "(for example: wall time, throughput, latency). SysPilot extracts "
+        "runtime outcome metrics from program output, resolves this intent to "
+        "a numeric metric, and uses orchestration wall time only as a tie-breaker."
+    ),
+)
+@click.option(
+    "--primary-objective-mode",
+    type=click.Choice(["minimize", "maximize"], case_sensitive=False),
+    help=(
+        "How to optimize --primary-objective. If omitted, SysPilot infers a direction "
+        "for common metric names."
+    ),
 )
 @click.pass_context
 def tune(
     ctx: click.Context,
-    pid: int | None,
     command: str | None,
     ui_mode: str,
     tui_bin: Path | None,
     workdir: Path | None,
+    memory_high: str | None,
+    contract: tuple[str, ...],
     manual: tuple[str, ...],
     max_iterations: int,
     dry_run: bool,
     timeout: int,
-    parse_output: bool,
+    primary_objective: str | None,
+    primary_objective_mode: str | None,
 ) -> None:
-    """Iteratively tune a running application.
+    """Iteratively tune a spawned command.
 
-    Two modes:
-      --pid: Attach to existing process and profile it
-      --command: Spawn command, profile, get recommendations, respawn with tuning
-
-    Example (spawn mode):
-      syspilot tune -c "./app --arg value" --workdir /path/to/app -m numactl
+    Example:
+      syspilot tune -c "./app --arg value" --workdir /path/to/app --contract numactl
     """
     requested_mode = TuneUIMode(ui_mode.lower())
     plain_sink = make_output_sink(ui_mode=TuneUIMode.PLAIN, console=console)
     sink: OutputSink = plain_sink
 
-    if not pid and not command:
-        sink.print("[red]Error: Must specify either --pid or --command[/red]")
+    if not command:
+        sink.print("[red]Error: --command is required; tune is spawn-mode only[/red]")
         raise SystemExit(1)
 
-    if pid and command:
-        sink.print("[red]Error: Cannot specify both --pid and --command[/red]")
+    resolved_primary_objective: str | None = None
+    resolved_primary_objective_mode: str | None = None
+    contract_names = _normalize_multi_value_option(contract)
+    manual_hints = _normalize_multi_value_option(manual)
+    if primary_objective is not None:
+        resolved_primary_objective = primary_objective.strip()
+        if not resolved_primary_objective:
+            sink.print("[red]Error: --primary-objective cannot be empty[/red]")
+            raise SystemExit(1)
+        resolved_primary_objective_mode = (
+            primary_objective_mode.lower() if primary_objective_mode else None
+        )
+    elif primary_objective_mode is not None:
+        sink.print("[red]Error: --primary-objective-mode requires --primary-objective[/red]")
         raise SystemExit(1)
+
+    normalized_memory_high: str | None = None
+    if memory_high is not None:
+        normalized_memory_high = memory_high.strip()
+        if not normalized_memory_high:
+            sink.print("[red]Error: --memory-high cannot be empty[/red]")
+            raise SystemExit(1)
 
     tui_orchestrator: TuneTuiOrchestrator | None = None
     tui_sink: SwitchableOutputSink | None = None
@@ -1314,14 +1290,12 @@ def tune(
     prompt_log_path = agent.enable_llm_prompt_logging(_default_tune_prompt_log_path())
     sink.print(f"[cyan]Saving LLM prompts to: {prompt_log_path}[/cyan]")
 
-    contract_root = _discover_contract_root()
-    manual_root = _discover_manual_root() if manual else None
-    structured_context_bundle = _build_structured_context_bundle(
-        list(manual),
+    contract_root = _discover_contract_root() if contract_names else None
+    structured_context_bundle = _build_contract_context_bundle(
+        contract_names,
         goal="improve throughput",
         symptom=None,
         max_items_per_section=5,
-        manual_root=manual_root,
         contract_root=contract_root,
     )
     initial_hypothesis_profiles = _extract_hypothesis_profiles(
@@ -1329,17 +1303,16 @@ def tune(
         max_profiles=None,
     )
 
-    if manual:
+    if contract_names:
         if _has_structured_context(structured_context_bundle):
-            sink.print(f"[cyan]Using structured contract context: {', '.join(manual)}[/cyan]")
+            sink.print(f"[cyan]Using structured contract context: {', '.join(contract_names)}[/cyan]")
         else:
-            sink.print(f"[cyan]Loading manuals: {', '.join(manual)}[/cyan]")
-            results = agent.load_manuals(list(manual))
-            for manual_name, success in results.items():
-                if success:
-                    sink.print(f"  [green]✓ Loaded: {manual_name}[/green]")
-                else:
-                    sink.print(f"  [red]✗ Failed: {manual_name}[/red]")
+            sink.print(
+                f"[yellow]No structured contract context found for: {', '.join(contract_names)}[/yellow]"
+            )
+
+    if manual_hints:
+        sink.print(f"[cyan]Using application manual hint(s): {', '.join(manual_hints)}[/cyan]")
 
     if initial_hypothesis_profiles:
         sink.print(
@@ -1371,34 +1344,22 @@ def tune(
         syspilot_logger.addHandler(logger_forward_handler)
 
     try:
-        if command:
-            _run_spawn_tune_loop(
-                agent,
-                command,
-                manual,
-                max_iterations,
-                timeout,
-                parse_output,
-                workdir,
-                sink,
-                event_emitter,
-                structured_context_bundle
-                if _has_structured_context(structured_context_bundle)
-                else None,
-                initial_hypothesis_profiles,
-            )
-        else:
-            assert pid is not None
-            _run_attach_tune_loop(
-                agent,
-                manager,
-                tuner,
-                pid,
-                max_iterations,
-                dry_run,
-                sink,
-                event_emitter,
-            )
+        _run_spawn_tune_loop(
+            agent,
+            command,
+            contract_names,
+            manual_hints,
+            max_iterations,
+            timeout,
+            resolved_primary_objective,
+            resolved_primary_objective_mode,
+            workdir,
+            normalized_memory_high,
+            sink,
+            event_emitter,
+            structured_context_bundle if _has_structured_context(structured_context_bundle) else None,
+            initial_hypothesis_profiles,
+        )
     finally:
         if logger_forward_handler is not None:
             syspilot_logger.removeHandler(logger_forward_handler)
@@ -1557,89 +1518,6 @@ def _emit_tune_event(
         return
 
 
-def _run_attach_tune_loop(
-    agent: SysPilotAgent,
-    manager: ProfilingManager,
-    tuner: ApplicationTuner,
-    pid: int,
-    max_iterations: int,
-    dry_run: bool,
-    sink: OutputSink,
-    event_emitter: _TuneEmitter | None = None,
-) -> None:
-    agent.config.target_pid = pid
-
-    engine = TuningEngine(
-        profiling_manager=manager,
-        tuner=tuner,
-        max_iterations=max_iterations,
-    )
-
-    sink.panel(
-        f"[bold green]SysPilot Tuning Engine (Attach Mode)[/bold green]\n"
-        f"Target: PID {pid}\n"
-        f"Max Iterations: {max_iterations}\n"
-        f"Dry Run: {dry_run}\n"
-        f"Manuals: {len(agent.context.loaded_manuals)} loaded",
-        title="Starting",
-    )
-
-    loaded_manual_names = sorted(agent.context.loaded_manuals.keys())
-
-    _emit_tune_event(
-        event_emitter,
-        "run.started",
-        {
-            "mode": "attach",
-            "pid": pid,
-            "max_iterations": max_iterations,
-            "dry_run": dry_run,
-            "loaded_manuals": loaded_manual_names,
-        },
-    )
-    _emit_tune_event(
-        event_emitter,
-        "phase.started",
-        {"mode": "attach", "phase": "attach.tuning_loop"},
-    )
-
-    try:
-        result = asyncio.run(agent.run_tuning_loop(engine, max_iterations))
-        sink.panel(result, title="Tuning Results")
-        _emit_tune_event(
-            event_emitter,
-            "phase.finished",
-            {"mode": "attach", "phase": "attach.tuning_loop", "status": "success"},
-        )
-        _emit_tune_event(
-            event_emitter,
-            "run.finished",
-            {"mode": "attach", "status": "success"},
-        )
-    except KeyboardInterrupt:
-        _emit_tune_event(
-            event_emitter,
-            "error",
-            {
-                "mode": "attach",
-                "phase": "attach.tuning_loop",
-                "message": "Keyboard interrupt",
-            },
-        )
-        _emit_tune_event(
-            event_emitter,
-            "phase.finished",
-            {"mode": "attach", "phase": "attach.tuning_loop", "status": "interrupted"},
-        )
-        _emit_tune_event(
-            event_emitter,
-            "run.finished",
-            {"mode": "attach", "status": "interrupted"},
-        )
-        sink.print("\n[yellow]Stopping tuning...[/yellow]")
-        agent.stop()
-
-
 def _run_command(
     cmd: list[str],
     timeout: int,
@@ -1689,27 +1567,141 @@ def _event_output_payload(
     }
 
 
-def _build_spawn_manual_context(manuals: tuple[str, ...]) -> str:
+def _profile_run_event_payload(
+    *,
+    phase: str,
+    iteration: int | None = None,
+    candidate_id: int | None = None,
+    candidate_label: str | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {"mode": "spawn", "phase": phase}
+    if iteration is not None:
+        payload["iteration"] = iteration
+    if candidate_id is not None:
+        payload["candidate_id"] = candidate_id
+    if candidate_label:
+        payload["candidate_label"] = candidate_label
+        payload["run_label"] = candidate_label
+    elif phase == "spawn.baseline":
+        payload["run_label"] = "baseline"
+    return payload
+
+
+def _emit_profile_artifact_events(
+    event_emitter: _TuneEmitter | None,
+    profiling_artifacts: dict[str, Any],
+    *,
+    phase: str,
+    iteration: int | None = None,
+    candidate_id: int | None = None,
+    candidate_label: str | None = None,
+) -> None:
+    profiling_json = profiling_artifacts.get("profiling_json", {})
+    profiling_text = str(profiling_artifacts.get("profiling_text", ""))
+    profile_json_payload: dict[str, Any] = {}
+    profile_tools: list[str] = []
+    if isinstance(profiling_json, dict):
+        profile_json_payload = dict(profiling_json)
+        raw_tools = profiling_json.get("tools_used")
+        if isinstance(raw_tools, list):
+            profile_tools = [str(tool) for tool in raw_tools if str(tool).strip()]
+
+    base_payload = _profile_run_event_payload(
+        phase=phase,
+        iteration=iteration,
+        candidate_id=candidate_id,
+        candidate_label=candidate_label,
+    )
+    _emit_tune_event(
+        event_emitter,
+        "profile.snapshot",
+        {
+            **base_payload,
+            "profile_tools": profile_tools,
+            "profile_json": profile_json_payload,
+            "profile_summary": profiling_text,
+            "metrics": {
+                "pid": profiling_artifacts["pid"],
+                "wall_time_s": profiling_artifacts["wall_time"],
+                "returncode": profiling_artifacts["returncode"],
+                "tool_calls_used": profiling_artifacts.get("tool_calls_used", 0),
+            },
+        },
+    )
+    _emit_tune_event(
+        event_emitter,
+        "profile.finished",
+        {
+            **base_payload,
+            "status": "success" if profiling_artifacts["returncode"] == 0 else "failed",
+            "returncode": profiling_artifacts["returncode"],
+            "wall_time_s": profiling_artifacts["wall_time"],
+            **_event_output_payload(
+                str(profiling_artifacts.get("stdout", "")),
+                str(profiling_artifacts.get("stderr", "")),
+            ),
+        },
+    )
+
+
+def _print_profile_artifact_summary(
+    sink: OutputSink,
+    profiling_artifacts: dict[str, Any],
+    *,
+    prefix: str,
+) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    profiling_text = str(profiling_artifacts.get("profiling_text", ""))
+    profiling_json = profiling_artifacts.get("profiling_json", {})
+    if not isinstance(profiling_json, dict):
+        profiling_json = {}
+
+    sink.print(f"  {prefix} PID: {profiling_artifacts['pid']}")
+    sink.print(f"  {prefix} wall time: {profiling_artifacts['wall_time']:.2f}s")
+    sink.print(f"  Agent tool calls used: {profiling_artifacts.get('tool_calls_used', 0)}")
+    if profiling_artifacts["returncode"] != 0:
+        sink.print(f"  [yellow]{prefix} return code: {profiling_artifacts['returncode']}[/yellow]")
+
+    target_pids = profiling_json.get("target_pids", []) if profiling_json else []
+    primary_pid = profiling_json.get("primary_pid") if profiling_json else None
+    if target_pids:
+        sink.print(f"  Profiling targets: {target_pids} (primary={primary_pid})")
+
+    contract_validation = (
+        profiling_json.get("contract_hypothesis_validation", {}) if profiling_json else {}
+    )
+    if isinstance(contract_validation, dict) and contract_validation.get("profiles"):
+        profiles = contract_validation.get("profiles", [])
+        sink.print(f"  Contract-guided validation profiles: {len(profiles)}")
+        if isinstance(profiles, list):
+            for profile in profiles[:3]:
+                if not isinstance(profile, dict):
+                    continue
+                signal_results = profile.get("signal_results", [])
+                observed = (
+                    sum(
+                        1
+                        for item in signal_results
+                        if isinstance(item, dict) and bool(item.get("observed"))
+                    )
+                    if isinstance(signal_results, list)
+                    else 0
+                )
+                total = len(signal_results) if isinstance(signal_results, list) else 0
+                sink.print(
+                    f"    - {profile.get('hypothesis_id')}: observed {observed}/{total} signal(s)"
+                )
+
+    return (
+        profiling_text,
+        profiling_json,
+        contract_validation if isinstance(contract_validation, dict) else {},
+    )
+
+
+def _render_spawn_manual_hints(manuals: Sequence[str]) -> str:
     if not manuals:
         return ""
-
-    manual_root = _discover_manual_root()
-    contract_root = _discover_contract_root()
-    if manual_root is None and contract_root is None:
-        return ""
-
-    context_bundle = _build_structured_context_bundle(
-        list(manuals),
-        goal="improve throughput",
-        symptom=None,
-        max_items_per_section=5,
-        manual_root=manual_root,
-        contract_root=contract_root,
-    )
-    if not _has_structured_context(context_bundle):
-        return ""
-
-    return json.dumps(context_bundle, indent=2)
+    return "\n".join(f"- {manual}" for manual in manuals)
 
 
 def _format_progress_duration(seconds: float) -> str:
@@ -1902,6 +1894,11 @@ def _collect_contract_report_env(hypothesis_profiles: list[dict[str, Any]]) -> d
     return report_env
 
 
+def _virtual_probe_search_terms(signal: dict[str, Any], virtual_probe: str) -> list[str]:
+    terms = [virtual_probe, str(signal.get("metric", "")).strip(), str(signal.get("indicates", "")).strip()]
+    return [term for term in terms if term]
+
+
 def _build_contract_hypothesis_validation_script(
     hypothesis_profiles: list[dict[str, Any]],
     profiling_json: dict[str, Any],
@@ -1932,6 +1929,8 @@ def _build_contract_hypothesis_validation_script(
         "collect_profile_data = profiling.get('collect_profile_data', {}) if isinstance(profiling, dict) else {}\n"
         "cpu_collector = collect_profile_data.get('cpu', {}) if isinstance(collect_profile_data, dict) else {}\n"
         "cpu_data = cpu_collector.get('data', {}) if isinstance(cpu_collector, dict) else {}\n"
+        "memory_collector = collect_profile_data.get('memory', {}) if isinstance(collect_profile_data, dict) else {}\n"
+        "memory_data = memory_collector.get('data', {}) if isinstance(memory_collector, dict) else {}\n"
         "combined_output = str(payload.get('combined_output', ''))\n"
         "report_env = payload.get('report_env', {}) if isinstance(payload.get('report_env', {}), dict) else {}\n"
         "active_env = payload.get('active_env', {}) if isinstance(payload.get('active_env', {}), dict) else {}\n"
@@ -1952,34 +1951,36 @@ def _build_contract_hypothesis_validation_script(
         "    return total or None\n"
         "def _signal_result(signal_entry):\n"
         "    signal = signal_entry.get('signal', {}) if isinstance(signal_entry, dict) else {}\n"
-        "    probe = signal.get('probe', {}) if isinstance(signal, dict) else {}\n"
-        "    target = str(probe.get('name', probe.get('target', ''))).strip()\n"
-        "    kind = str(probe.get('kind', '')).strip()\n"
+        "    resolved_probe = signal_entry.get('resolved_probe', {}) if isinstance(signal_entry, dict) else {}\n"
+        "    virtual_probe = str(signal.get('virtual_probe', ''))\n"
         "    result = {\n"
         "        'ref': signal_entry.get('ref'),\n"
         "        'metric': signal.get('metric'),\n"
-        "        'probe': probe,\n"
+        "        'virtual_probe': virtual_probe,\n"
         "        'observed': False,\n"
         "        'source': 'unsupported',\n"
         "        'value': None,\n"
         "        'excerpt': [],\n"
         "    }\n"
         "    lines = combined_output.splitlines()\n"
-        "    if kind in ('log', 'manual'):\n"
-        "        matches = [line.strip() for line in lines if target.lower() in line.lower()]\n"
+        "    terms = [virtual_probe.lower(), str(signal.get('metric', '')).lower(), str(signal.get('indicates', '')).lower()]\n"
+        "    searchable_terms = [term for term in terms if term]\n"
+        "    if virtual_probe in ('runtime.config.startup_properties', 'runtime.config.startup_profile'):\n"
+        "        matches = [line.strip() for line in lines if any(term in line.lower() for term in searchable_terms)]\n"
         "        result['observed'] = bool(matches)\n"
         "        result['source'] = 'runtime_output' if matches else 'runtime_output_missing'\n"
         "        result['value'] = matches[:8] if matches else None\n"
         "        result['excerpt'] = matches[:8]\n"
         "        return result\n"
-        "    if kind == 'os':\n"
-        "        value = refined_runtime_maps.get(target)\n"
+        "    if virtual_probe == 'cgroup.memory.events.high':\n"
+        "        value = refined_runtime_maps.get('memory.events.high')\n"
+        "        if value is None:\n"
+        "            value = refined_runtime_maps.get('memory.events')\n"
         "        result['observed'] = value is not None\n"
         "        result['source'] = 'refined_runtime_maps' if value is not None else 'os_missing'\n"
         "        result['value'] = value\n"
         "        return result\n"
-        "    if kind == 'api':\n"
-        "        if target == 'openblas_get_num_threads':\n"
+        "    if virtual_probe == 'process.cpu.thread_count':\n"
         "            value = runtime_output.get('threads_counted')\n"
         "            if value is None:\n"
         "                value = cpu_data.get('num_threads')\n"
@@ -1987,56 +1988,36 @@ def _build_contract_hypothesis_validation_script(
         "            result['source'] = 'runtime_output.threads_counted' if runtime_output.get('threads_counted') is not None else ('collect_profile.cpu.num_threads' if cpu_data.get('num_threads') is not None else 'unsupported')\n"
         "            result['value'] = value\n"
         "            return result\n"
-        "        if target == 'openblas_get_num_procs':\n"
+        "    if virtual_probe == 'process.cpu.allowed_cpus':\n"
         "            cpus_allowed = refined_runtime_maps.get('Cpus_allowed_list')\n"
         "            value = _parse_cpu_list(cpus_allowed)\n"
         "            result['observed'] = value is not None\n"
         "            result['source'] = 'refined_runtime_maps.Cpus_allowed_list' if value is not None else 'unsupported'\n"
         "            result['value'] = value\n"
         "            return result\n"
-        "        if target == 'openblas_getaffinity':\n"
-        "            cpus_allowed = refined_runtime_maps.get('Cpus_allowed_list')\n"
-        "            result['observed'] = cpus_allowed is not None\n"
-        "            result['source'] = 'refined_runtime_maps.Cpus_allowed_list' if cpus_allowed is not None else 'unsupported'\n"
-        "            result['value'] = cpus_allowed\n"
-        "            return result\n"
-        "        if target == 'openblas_get_parallel':\n"
-        "            hints = []\n"
-        "            if 'OPENMP DISPLAY ENVIRONMENT BEGIN' in combined_output:\n"
-        "                hints.append('openmp_runtime_output_present')\n"
-        "            for key in ('OPENBLAS_NUM_THREADS', 'GOTO_NUM_THREADS', 'OMP_NUM_THREADS'):\n"
-        "                if key in active_env:\n"
-        "                    hints.append(f'{key}=' + str(active_env.get(key)))\n"
-        "            result['observed'] = bool(hints)\n"
-        "            result['source'] = 'runtime_output+active_env' if hints else 'unsupported'\n"
-        "            result['value'] = hints or None\n"
-        "            return result\n"
-        "        if target == 'openblas_get_config':\n"
-        "            value = {key: active_env.get(key) for key in ('OPENBLAS_NUM_THREADS', 'GOTO_NUM_THREADS', 'OMP_NUM_THREADS') if key in active_env}\n"
-        "            result['observed'] = bool(value)\n"
-        "            result['source'] = 'active_env' if value else 'unsupported'\n"
-        "            result['value'] = value or None\n"
-        "            return result\n"
-        "        if target == 'openblas_get_corename':\n"
-        "            matches = [line.strip() for line in lines if 'core' in line.lower() or 'target' in line.lower()]\n"
-        "            result['observed'] = bool(matches)\n"
-        "            result['source'] = 'runtime_output' if matches else 'unsupported'\n"
-        "            result['value'] = matches[:8] if matches else None\n"
-        "            result['excerpt'] = matches[:8]\n"
-        "            return result\n"
-        "        matches = [line.strip() for line in lines if target.lower() in line.lower()]\n"
+        "    if virtual_probe in ('process.memory.rss', 'process.memory.rss_peak'):\n"
+        "        value = refined_runtime_maps.get('process_rss')\n"
+        "        if value is None:\n"
+        "            value = memory_data.get('peak_memory_mb') or memory_data.get('rss_mb')\n"
+        "        result['observed'] = value is not None\n"
+        "        result['source'] = 'refined_runtime_maps.process_rss' if refined_runtime_maps.get('process_rss') is not None else ('collect_profile.memory' if value is not None else 'os_missing')\n"
+        "        result['value'] = value\n"
+        "        return result\n"
+        "    if virtual_probe.startswith('benchmark.'):\n"
+        "        matches = [line.strip() for line in lines if any(term in line.lower() for term in searchable_terms)]\n"
         "        result['observed'] = bool(matches)\n"
         "        result['source'] = 'runtime_output' if matches else 'unsupported'\n"
         "        result['value'] = matches[:8] if matches else None\n"
         "        result['excerpt'] = matches[:8]\n"
         "        return result\n"
-        "    if kind in ('perf', 'profiler', 'benchmark'):\n"
-        "        matches = [line.strip() for line in lines if target.lower() in line.lower()]\n"
-        "        result['observed'] = bool(matches)\n"
-        "        result['source'] = 'runtime_output' if matches else 'unsupported'\n"
-        "        result['value'] = matches[:8] if matches else None\n"
-        "        result['excerpt'] = matches[:8]\n"
+        "    if isinstance(resolved_probe, dict) and resolved_probe.get('availability') == 'unavailable':\n"
+        "        result['source'] = 'unavailable'\n"
         "        return result\n"
+        "    matches = [line.strip() for line in lines if any(term in line.lower() for term in searchable_terms)]\n"
+        "    result['observed'] = bool(matches)\n"
+        "    result['source'] = 'runtime_output' if matches else 'unsupported'\n"
+        "    result['value'] = matches[:8] if matches else None\n"
+        "    result['excerpt'] = matches[:8]\n"
         "    return result\n"
         "profiles = []\n"
         "for plan in plans:\n"
@@ -2047,7 +2028,7 @@ def _build_contract_hypothesis_validation_script(
         "    profiles.append({\n"
         "        'hypothesis_id': plan.get('hypothesis_id'),\n"
         "        'resource': plan.get('resource'),\n"
-        "        'libraries': plan.get('libraries'),\n"
+        "        'libraries': plan.get('contracts'),\n"
         "        'report_env': plan.get('report_controls', []),\n"
         "        'signal_results': signal_results,\n"
         "        'findings': findings,\n"
@@ -2358,6 +2339,28 @@ def _help_target_tokens(command_tokens: list[str]) -> tuple[str, ...]:
     return tuple(help_target)
 
 
+def _first_positional_index(command_tokens: list[str]) -> int | None:
+    idx = 1
+    while idx < len(command_tokens):
+        token = command_tokens[idx]
+        if not _is_option_token(token):
+            return idx
+
+        idx += 1
+        if idx < len(command_tokens):
+            next_token = command_tokens[idx]
+            if not _is_option_token(next_token):
+                idx += 1
+
+    return None
+
+
+def _wrapper_child_start_index(command_tokens: list[str]) -> int | None:
+    if len(_help_target_tokens(command_tokens)) > 1:
+        return None
+    return _first_positional_index(command_tokens)
+
+
 def _is_env_assignment_token(token: str) -> bool:
     if "=" not in token:
         return False
@@ -2383,6 +2386,142 @@ def _extract_inline_env_assignments(command_tokens: list[str]) -> tuple[list[str
     return remaining, env_overrides
 
 
+def _extract_runtime_unsupported_options(stdout: str, stderr: str) -> list[str]:
+    text = f"{stderr}\n{stdout}"
+    patterns = [
+        r"option\s+['\"]?(--?[A-Za-z0-9][A-Za-z0-9-]*)['\"]?\s+is\s+not\s+supported",
+        r"(?:unknown|unrecognized|invalid)\s+(?:command\s+line\s+)?option\s+['\"]?(--?[A-Za-z0-9][A-Za-z0-9-]*)['\"]?",
+        r"option\s+['\"]?(--?[A-Za-z0-9][A-Za-z0-9-]*)['\"]?\s+(?:not\s+recognized|unrecognized|unknown|invalid)",
+        r"unrecognized\s+argument[s]?:\s+(--?[A-Za-z0-9][A-Za-z0-9-]*)",
+    ]
+    matches: list[str] = []
+    for pattern in patterns:
+        for option_name in re.findall(pattern, text, flags=re.IGNORECASE):
+            normalized = str(option_name).strip()
+            if normalized and normalized not in matches:
+                matches.append(normalized)
+    return matches
+
+
+def _strip_option_from_tokens(tokens: list[str], option_name: str) -> tuple[list[str], bool]:
+    stripped: list[str] = []
+    idx = 0
+    removed = False
+    while idx < len(tokens):
+        token = tokens[idx]
+        if not removed and token == option_name:
+            removed = True
+            idx += 1
+            while idx < len(tokens) and not _is_option_token(tokens[idx]):
+                idx += 1
+            continue
+        stripped.append(token)
+        idx += 1
+    return stripped, removed
+
+
+def _candidate_actions_without_unsupported_options(
+    base_command: list[str],
+    actions: list[dict[str, Any]],
+    unsupported_options: list[str],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    updated_actions = [dict(action) for action in actions]
+    removed_options: list[str] = []
+    for option_name in unsupported_options:
+        for idx, action in enumerate(updated_actions):
+            config_type = str(action.get("config_type", "")).strip().lower()
+            if config_type not in {"command", "command_prefix", "numactl"}:
+                continue
+            tokens = _to_token_list(action.get("new_value"))
+            if not tokens or option_name not in tokens:
+                continue
+
+            if config_type == "command":
+                base_child_start = _wrapper_child_start_index(base_command)
+                candidate_child_start = _wrapper_child_start_index(tokens)
+                removed = False
+                new_tokens = list(tokens)
+                if base_child_start is not None and candidate_child_start is not None:
+                    wrapper_tokens = tokens[:candidate_child_start]
+                    child_tokens = tokens[candidate_child_start:]
+                    if option_name in wrapper_tokens:
+                        new_wrapper, removed = _strip_option_from_tokens(
+                            wrapper_tokens, option_name
+                        )
+                        new_tokens = new_wrapper + child_tokens
+                    elif option_name in child_tokens:
+                        new_child, removed = _strip_option_from_tokens(child_tokens, option_name)
+                        new_tokens = wrapper_tokens + new_child
+                else:
+                    new_tokens, removed = _strip_option_from_tokens(tokens, option_name)
+            else:
+                new_tokens, removed = _strip_option_from_tokens(tokens, option_name)
+
+            if not removed:
+                continue
+            removed_options.append(option_name)
+            if not new_tokens or (config_type == "numactl" and new_tokens == ["numactl"]):
+                updated_actions.pop(idx)
+            else:
+                action["new_value"] = new_tokens
+            break
+    return updated_actions, removed_options
+
+
+def _retry_spawn_candidate_without_unsupported_options(
+    base_command: list[str],
+    actions: list[dict[str, Any]],
+    *,
+    base_env_overrides: dict[str, str] | None,
+    unsupported_options: list[str],
+) -> tuple[dict[str, Any] | None, list[str]]:
+    if not unsupported_options:
+        return None, []
+
+    baseline_options, _ = _parse_cli_command_signature(base_command)
+    retryable_options = [option for option in unsupported_options if option not in baseline_options]
+    if not retryable_options:
+        return None, []
+
+    retry_actions, removed_options = _candidate_actions_without_unsupported_options(
+        base_command,
+        actions,
+        retryable_options,
+    )
+    if not removed_options:
+        return None, []
+
+    tuned_cmd, env_overrides, applied_actions, skipped_actions = _build_spawn_execution_plan(
+        base_command,
+        retry_actions,
+        base_env_overrides=base_env_overrides,
+    )
+    if not tuned_cmd:
+        return None, removed_options
+
+    return (
+        {
+            "cmd": tuned_cmd,
+            "env_overrides": env_overrides,
+            "label": "; ".join(applied_actions) if applied_actions else "(retry)",
+            "skipped_actions": skipped_actions,
+            "actions": retry_actions,
+        },
+        removed_options,
+    )
+
+
+def _help_probe_commands(help_target: tuple[str, ...]) -> list[list[str]]:
+    if not help_target:
+        return []
+
+    commands: list[list[str]] = []
+    if len(help_target) == 1:
+        commands.append([*help_target, "--help", "all"])
+    commands.extend([[*help_target, "--help"], [*help_target, "-h"]])
+    return commands
+
+
 def _discover_supported_cli_options(help_target: tuple[str, ...]) -> set[str] | None:
     cached = _SPAWN_HELP_OPTION_CACHE.get(help_target)
     if help_target in _SPAWN_HELP_OPTION_CACHE:
@@ -2391,10 +2530,12 @@ def _discover_supported_cli_options(help_target: tuple[str, ...]) -> set[str] | 
     if not help_target:
         return None
 
-    for help_flag in ("--help", "-h"):
+    discovered_options: set[str] = set()
+
+    for help_command in _help_probe_commands(help_target):
         try:
             completed = subprocess.run(
-                [*help_target, help_flag],
+                help_command,
                 capture_output=True,
                 text=True,
                 timeout=3,
@@ -2413,14 +2554,20 @@ def _discover_supported_cli_options(help_target: tuple[str, ...]) -> set[str] | 
         )
         options = set(matches)
         if options:
-            _SPAWN_HELP_OPTION_CACHE[help_target] = options
-            return options
+            discovered_options.update(options)
+
+    if discovered_options:
+        _SPAWN_HELP_OPTION_CACHE[help_target] = discovered_options
+        return discovered_options
 
     _SPAWN_HELP_OPTION_CACHE[help_target] = None
     return None
 
 
-def _validate_cli_options_against_help(command_tokens: list[str]) -> list[str]:
+def _validate_cli_options_against_help(
+    command_tokens: list[str],
+    baseline_command_tokens: list[str] | None = None,
+) -> list[str]:
     if not command_tokens:
         return ["candidate command was empty"]
 
@@ -2432,15 +2579,41 @@ def _validate_cli_options_against_help(command_tokens: list[str]) -> list[str]:
         return []
 
     candidate_options, _ = _parse_cli_command_signature(command_tokens)
+    baseline_options, _ = (
+        _parse_cli_command_signature(baseline_command_tokens)
+        if baseline_command_tokens
+        else ({}, [])
+    )
     executable_name = Path(command_tokens[0]).name
 
     issues: list[str] = []
     for option_name in sorted(candidate_options.keys()):
+        if option_name in baseline_options:
+            continue
         if option_name not in supported_options:
             issues.append(
                 f"option '{option_name}' is not supported by executable '{executable_name}'"
             )
 
+    return issues
+
+
+def _validate_wrapper_command_options(
+    base_command: list[str],
+    candidate_command: list[str],
+) -> list[str]:
+    base_child_start = _wrapper_child_start_index(base_command)
+    candidate_child_start = _wrapper_child_start_index(candidate_command)
+    if base_child_start is None or candidate_child_start is None:
+        return _validate_cli_options_against_help(candidate_command, base_command)
+
+    base_wrapper = base_command[:base_child_start]
+    base_child = base_command[base_child_start:]
+    candidate_wrapper = candidate_command[:candidate_child_start]
+    candidate_child = candidate_command[candidate_child_start:]
+
+    issues = _validate_cli_options_against_help(candidate_wrapper, base_wrapper)
+    issues.extend(_validate_cli_options_against_help(candidate_child, base_child))
     return issues
 
 
@@ -2518,7 +2691,7 @@ def _validate_spawn_command_rewrite(
     if not base_command or not candidate_command:
         return ["command rewrite validation received an empty command"]
 
-    issues = _validate_cli_options_against_help(candidate_command)
+    issues: list[str] = []
 
     executable_name = Path(base_command[0]).name
     if executable_name == "llama-bench":
@@ -2632,6 +2805,51 @@ def _parse_spawn_actions(response: str) -> dict[str, Any]:
     }
 
 
+def _format_spawn_action_preview(action: dict[str, Any]) -> str:
+    config_type = str(action.get("config_type", "")).strip().lower()
+    parameter = str(action.get("parameter", "")).strip()
+    new_value = action.get("new_value")
+
+    if config_type == "env_var":
+        value = "" if new_value is None else str(new_value).strip()
+        if parameter and value:
+            return f"{parameter}={value}"
+        if parameter:
+            return parameter
+        return value
+
+    tokens = _to_token_list(new_value)
+    if config_type == "numactl" and tokens and tokens[0] == "numactl":
+        tokens = tokens[1:]
+    token_display = " ".join(tokens)
+    fallback = "" if new_value is None else str(new_value).strip()
+    value_display = token_display or fallback
+
+    if config_type == "command":
+        return value_display
+    if config_type == "numactl":
+        return f"numactl {value_display}".strip()
+    if config_type == "command_prefix":
+        return f"prefix {value_display}".strip()
+    if parameter and value_display:
+        return f"{parameter}={value_display}"
+    return value_display or parameter or config_type
+
+
+def _recommendation_next_action_display(actions: list[dict[str, Any]]) -> str:
+    if not actions:
+        return ""
+
+    preview = _format_spawn_action_preview(actions[0]).strip()
+    if not preview:
+        return ""
+
+    remaining = len(actions) - 1
+    if remaining > 0:
+        return f"{preview} (+{remaining} more)"
+    return preview
+
+
 def _build_spawn_execution_plan(
     base_command: list[str],
     actions: list[dict[str, Any]],
@@ -2670,21 +2888,28 @@ def _build_spawn_execution_plan(
             if command_replaced:
                 skipped.append(f"action[{idx}] additional command rewrite skipped")
                 continue
-            if Path(tokens[0]).name != Path(base_command[0]).name:
+
+            normalized_tokens, inline_env_overrides = _extract_inline_env_assignments(tokens)
+            if not normalized_tokens:
+                skipped.append(f"action[{idx}] command rewrite produced no executable tokens")
+                continue
+
+            if Path(normalized_tokens[0]).name != Path(base_command[0]).name:
                 skipped.append(
                     f"action[{idx}] command replacement must keep executable '{base_command[0]}'"
                 )
                 continue
 
-            rewrite_issues = _validate_spawn_command_rewrite(base_command, tokens)
+            rewrite_issues = _validate_spawn_command_rewrite(base_command, normalized_tokens)
             if rewrite_issues:
                 for issue in rewrite_issues:
                     skipped.append(f"action[{idx}] {issue}")
                 continue
 
-            command_tokens = tokens
+            command_tokens = normalized_tokens
+            env_overrides.update(inline_env_overrides)
             command_replaced = True
-            applied.append(f"command {' '.join(tokens)}")
+            applied.append(f"command {' '.join(normalized_tokens)}")
             continue
 
         if config_type == "numactl":
@@ -2772,6 +2997,7 @@ def _build_spawn_candidates(
                 "env_overrides": env_overrides,
                 "label": label,
                 "skipped_actions": skipped_actions,
+                "actions": [dict(action) for action in action_set],
             }
         )
         if len(candidates) >= max_candidates:
@@ -2916,10 +3142,227 @@ RESPOND WITH ONLY THE JSON OBJECT, NO EXPLANATION:"""
         try:
             parsed = json.loads(json_match.group())
             if isinstance(parsed, dict):
-                return parsed
+                return _normalize_metric_mapping(parsed)
         except json.JSONDecodeError:
             pass
     return {"no_metrics": True}
+
+
+def _normalize_metric_key(name: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "_", name.strip().lower())
+    return normalized.strip("_")
+
+
+def _normalize_metric_mapping(metrics: dict[str, Any]) -> dict[str, Any]:
+    normalized: dict[str, Any] = {}
+    for raw_key, value in metrics.items():
+        if raw_key in {"no_metrics", "error"}:
+            normalized[raw_key] = value
+            continue
+        normalized_key = _normalize_metric_key(str(raw_key))
+        if not normalized_key:
+            continue
+        normalized[normalized_key] = value
+    if metrics.get("no_metrics") and "no_metrics" not in normalized:
+        normalized["no_metrics"] = True
+    if "error" in metrics and "error" not in normalized:
+        normalized["error"] = metrics["error"]
+    return normalized
+
+
+def _infer_primary_objective_mode(metric_key: str) -> str | None:
+    maximize_tokens = (
+        "throughput",
+        "per_sec",
+        "ops",
+        "qps",
+        "rps",
+        "fps",
+        "bandwidth",
+        "speedup",
+        "accuracy",
+    )
+    minimize_tokens = (
+        "latency",
+        "time",
+        "duration",
+        "elapsed",
+        "wall",
+        "p50",
+        "p90",
+        "p95",
+        "p99",
+        "rss",
+        "memory",
+        "error",
+        "loss",
+    )
+    if any(token in metric_key for token in maximize_tokens):
+        return "maximize"
+    if any(token in metric_key for token in minimize_tokens):
+        return "minimize"
+    return None
+
+
+def _metric_intent_aliases(metric_key: str) -> set[str]:
+    aliases = {metric_key, metric_key.replace("_", " ")}
+    tokens = set(metric_key.split("_"))
+
+    is_time_metric = (
+        "elapsed" in tokens
+        or "duration" in tokens
+        or "runtime" in tokens
+        or "latency" in tokens
+        or {"wall", "time"}.issubset(tokens)
+        or ("time" in tokens and "per" not in tokens)
+    )
+    if is_time_metric:
+        aliases.update({"wall time", "elapsed time", "runtime", "time", "duration", "latency"})
+
+    is_throughput_metric = (
+        "throughput" in tokens
+        or "bandwidth" in tokens
+        or "qps" in tokens
+        or "rps" in tokens
+        or "fps" in tokens
+        or "speedup" in tokens
+        or metric_key.endswith("_per_sec")
+        or {"per", "sec"}.issubset(tokens)
+    )
+    if is_throughput_metric:
+        aliases.update({"throughput", "rate", "per second", "ops per second", "bandwidth"})
+    if "token" in tokens and is_throughput_metric:
+        aliases.update({"token throughput", "tokens per second"})
+    if "task" in tokens and is_throughput_metric:
+        aliases.update({"task throughput", "tasks per second"})
+    if "request" in tokens and is_throughput_metric:
+        aliases.update({"request throughput", "requests per second"})
+
+    if "memory" in tokens or "rss" in tokens:
+        aliases.update({"memory", "memory usage", "rss"})
+    if "accuracy" in tokens:
+        aliases.update({"accuracy"})
+    if "error" in tokens or "loss" in tokens:
+        aliases.update({"error", "error rate", "loss"})
+
+    return {alias for alias in aliases if alias}
+
+
+def _resolve_primary_objective_metric(
+    metrics: dict[str, Any],
+    primary_objective: str | None,
+) -> str | None:
+    if not primary_objective or metrics.get("no_metrics"):
+        return None
+
+    normalized_query = _normalize_metric_key(primary_objective)
+    if not normalized_query:
+        return None
+
+    numeric_metric_keys = [
+        key
+        for key, value in metrics.items()
+        if key not in {"no_metrics", "error"}
+        and not isinstance(value, bool)
+        and isinstance(value, (int, float))
+    ]
+    if normalized_query in numeric_metric_keys:
+        return normalized_query
+
+    query_tokens = {token for token in normalized_query.split("_") if token}
+    best_key: str | None = None
+    best_score = 0.0
+
+    for metric_key in numeric_metric_keys:
+        normalized_metric_key = _normalize_metric_key(metric_key)
+        aliases = {
+            _normalize_metric_key(alias)
+            for alias in _metric_intent_aliases(normalized_metric_key)
+        }
+        aliases.add(normalized_metric_key)
+
+        exact_alias_match = normalized_query in aliases
+        alias_similarity = max(
+            difflib.SequenceMatcher(None, normalized_query, alias).ratio() for alias in aliases
+        )
+        alias_tokens = {
+            token
+            for alias in aliases
+            for token in alias.split("_")
+            if token
+        }
+        token_overlap = 0.0
+        if query_tokens and alias_tokens:
+            token_overlap = len(query_tokens & alias_tokens) / len(query_tokens | alias_tokens)
+
+        score = alias_similarity + token_overlap
+        if exact_alias_match:
+            score += 1.0
+
+        if score > best_score:
+            best_key = normalized_metric_key
+            best_score = score
+
+    if best_key is None or best_score < 1.0:
+        return None
+    return best_key
+
+
+def _extract_primary_objective_value(
+    metrics: dict[str, Any],
+    primary_objective_metric: str | None,
+) -> float | None:
+    if not primary_objective_metric or metrics.get("no_metrics"):
+        return None
+    value = metrics.get(_normalize_metric_key(primary_objective_metric))
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def _compare_objective_values(
+    candidate_value: float,
+    reference_value: float,
+    objective_mode: str,
+) -> int:
+    tolerance = 1e-12
+    if objective_mode == "maximize":
+        if candidate_value > reference_value + tolerance:
+            return 1
+        if candidate_value < reference_value - tolerance:
+            return -1
+        return 0
+    if candidate_value < reference_value - tolerance:
+        return 1
+    if candidate_value > reference_value + tolerance:
+        return -1
+    return 0
+
+
+def _compute_objective_change_pct(
+    reference_value: float,
+    candidate_value: float,
+    objective_mode: str,
+) -> float:
+    if reference_value == 0:
+        return 0.0
+    if objective_mode == "maximize":
+        return ((candidate_value - reference_value) / abs(reference_value)) * 100
+    return ((reference_value - candidate_value) / abs(reference_value)) * 100
+
+
+def _objective_display_name(primary_objective: str | None) -> str:
+    if not primary_objective:
+        return "Primary Objective"
+    return primary_objective
+
+
+def _format_metric_value(value: float | None) -> str:
+    if value is None:
+        return "-"
+    return f"{value:.6g}"
 
 
 async def _run_live_profiling_pipeline(
@@ -2927,22 +3370,45 @@ async def _run_live_profiling_pipeline(
     command_parts: list[str],
     timeout: int,
     workdir: str | None = None,
+    memory_high: str | None = None,
     env_overrides: dict[str, str] | None = None,
     hypothesis_profiles: list[dict[str, Any]] | None = None,
+    live_output_callback: Callable[[str, str], None] | None = None,
 ) -> dict[str, Any]:
     started_at = time.monotonic()
     selected_hypothesis_profiles = hypothesis_profiles or []
     report_env_overrides = _collect_contract_report_env(selected_hypothesis_profiles)
     env = _build_spawn_profiling_env(env_overrides, report_env_overrides)
+    launch_command = _wrap_spawn_command_with_memory_high(command_parts, memory_high, workdir)
+    launch_cwd = None if memory_high else workdir
 
     proc = await asyncio.create_subprocess_exec(
-        *command_parts,
+        *launch_command,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        cwd=workdir,
+        cwd=launch_cwd,
         env=env,
     )
+
+    async def _drain_stream(stream_name: str, stream: asyncio.StreamReader | None) -> str:
+        if stream is None:
+            return ""
+        chunks: list[str] = []
+        while True:
+            line = await stream.readline()
+            if not line:
+                break
+            text = line.decode("utf-8", errors="replace")
+            chunks.append(text)
+            if live_output_callback is not None:
+                live_output_callback(stream_name, text)
+        return "".join(chunks)
+
+    stdout_task = asyncio.create_task(_drain_stream("stdout", proc.stdout))
+    stderr_task = asyncio.create_task(_drain_stream("stderr", proc.stderr))
+
     pid = proc.pid
+    prev_target_pid = getattr(agent.context, "target_pid", None)
     agent.context.target_pid = pid
 
     await asyncio.sleep(1.0)
@@ -3113,21 +3579,27 @@ async def _run_live_profiling_pipeline(
         except Exception as e:
             key_findings.append(f"dynamic status pipeline failed for pid {target_pid}: {e}")
 
+    timed_out = False
     try:
-        stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        rc = proc.returncode
-        stdout = stdout_b.decode("utf-8", errors="replace")
-        stderr = stderr_b.decode("utf-8", errors="replace")
+        await asyncio.wait_for(proc.wait(), timeout=timeout)
+        rc = proc.returncode if proc.returncode is not None else 0
     except asyncio.TimeoutError:
         proc.kill()
-        await proc.communicate()
+        try:
+            await proc.wait()
+        except ProcessLookupError:
+            pass
         rc = -1
-        stdout = ""
-        stderr = "Command timed out during profiling pipeline"
+        timed_out = True
 
-    wall = time.monotonic() - started_at
+    stdout = await stdout_task
+    stderr = await stderr_task
+    if timed_out:
+        timeout_message = "Command timed out during profiling pipeline"
+        stderr = f"{stderr}\n{timeout_message}".strip() if stderr else timeout_message
+
+    wall = float(timeout) if timed_out else (time.monotonic() - started_at)
     runtime_output = _summarize_spawn_runtime_output(stdout, stderr)
-
     workers = process_targets.get("workers", [])
     if workers:
         heavy_workers = ", ".join(
@@ -3200,26 +3672,33 @@ async def _run_live_profiling_pipeline(
         profiling_json["key_findings"] = key_findings
     profiling_text = json.dumps(profiling_json)
 
-    return {
+    result = {
         "pid": pid,
+        "launch_command": launch_command,
         "wall_time": wall,
         "stdout": stdout,
         "stderr": stderr,
         "returncode": rc,
+        "timed_out": timed_out,
         "profiling_text": profiling_text,
         "profiling_json": profiling_json,
         "tool_calls_used": agent_tool_calls,
     }
+    agent.context.target_pid = prev_target_pid
+    return result
 
 
 async def _run_spawn_tune_loop_async(
     agent: SysPilotAgent,
     command: str,
-    manuals: tuple[str, ...],
+    contracts: Sequence[str],
+    manual_hints: Sequence[str],
     max_iterations: int,
     timeout: int,
-    parse_output: bool = False,
+    primary_objective: str | None = None,
+    primary_objective_mode: str | None = None,
     workdir: str | None = None,
+    memory_high: str | None = None,
     sink: OutputSink | None = None,
     event_emitter: _TuneEmitter | None = None,
     structured_context_bundle: dict[str, object] | None = None,
@@ -3264,6 +3743,8 @@ async def _run_spawn_tune_loop_async(
     if inline_env_overrides:
         sink.print(f"[cyan]Detected inline environment baseline: {inline_env_overrides}[/cyan]")
 
+    loaded_contract_names = list(contracts)
+    manual_hint_list = list(manual_hints)
     loaded_manual_names = sorted(agent.context.loaded_manuals.keys())
 
     _emit_tune_event(
@@ -3273,34 +3754,40 @@ async def _run_spawn_tune_loop_async(
             "mode": "spawn",
             "command": command,
             "workdir": workdir or "",
+            "memory_high": memory_high or "",
             "max_iterations": max_iterations,
             "timeout_s": timeout,
+            "loaded_contracts": loaded_contract_names,
             "loaded_manuals": loaded_manual_names,
+            "manual_hints": manual_hint_list,
             "baseline_env_overrides": dict(inline_env_overrides),
             "startup_hypothesis_profile_count": len(initial_hypothesis_profiles or []),
+            "primary_objective_query": primary_objective or "",
+            "primary_objective_metric": "",
+            "primary_objective_mode": primary_objective_mode or "",
         },
     )
 
     sink.panel(
         f"[bold green]SysPilot Tuning Engine (Spawn Mode)[/bold green]\n"
         f"Command: {command}\n"
+        f"Primary objective: {primary_objective or '(wall_time only)'}"
+        f"{f' ({primary_objective_mode})' if primary_objective_mode else ''}\n"
         f"Workdir: {workdir or '(current)'}\n"
+        f"MemoryHigh: {memory_high or '(none)'}\n"
         f"Max Iterations: {max_iterations}\n"
         f"Timeout: {timeout}s\n"
-        f"Manuals: {len(agent.context.loaded_manuals)} loaded",
+        f"Contracts: {len(loaded_contract_names)} loaded\n"
+        f"Manual hints: {len(manual_hint_list)} provided",
         title="Starting",
     )
 
-    manual_content = (
+    contract_content = (
         json.dumps(structured_context_bundle, indent=2)
         if structured_context_bundle
-        else _build_spawn_manual_context(manuals)
+        else ""
     )
-    if not manual_content and manuals and agent.context.loaded_manuals:
-        for manual_name in manuals:
-            if manual_name in agent.context.loaded_manuals:
-                manual_content += f"\n\n### {manual_name} Manual (excerpt)\n"
-                manual_content += agent.context.loaded_manuals[manual_name][:3000]
+    manual_hint_content = _render_spawn_manual_hints(manual_hint_list)
 
     benchmark_deterministic = _is_env_flag_enabled("SYSPILOT_BENCH_DETERMINISTIC")
     if benchmark_deterministic:
@@ -3308,7 +3795,21 @@ async def _run_spawn_tune_loop_async(
             "[dim]Benchmark deterministic mode enabled: skipping agent tuning analysis.[/dim]"
         )
 
-    sink.print("\n[bold cyan]Round 0 Step 0: Initial Baseline Run[/bold cyan]")
+    def _plain_live_output_callback(stream_name: str, line: str) -> None:
+        text = line.rstrip("\r\n")
+        if not text:
+            return
+        escaped = rich_escape(text)
+        if stream_name == "stderr":
+            sink.print(f"  [dim]stderr:[/dim] {escaped}")
+            return
+        sink.print(f"  {escaped}")
+
+    startup_hypothesis_profiles = [
+        item for item in (initial_hypothesis_profiles or []) if isinstance(item, dict)
+    ]
+
+    sink.print("\n[bold cyan]Round 0 Step 0: Initial Baseline Run (profiled)[/bold cyan]")
     _emit_tune_event(
         event_emitter,
         "phase.started",
@@ -3316,15 +3817,28 @@ async def _run_spawn_tune_loop_async(
     )
     _emit_tune_event(
         event_emitter,
+        "profile.started",
+        {"mode": "spawn", "phase": "spawn.baseline", "run_label": "baseline"},
+    )
+    _emit_tune_event(
+        event_emitter,
         "exec.started",
         {"mode": "spawn", "phase": "spawn.baseline"},
     )
-    baseline_time, baseline_stdout, baseline_stderr, baseline_rc = _run_command(
+    baseline_artifacts = await _run_live_profiling_pipeline(
+        agent,
         cmd_parts,
         timeout,
         workdir=workdir,
+        memory_high=memory_high,
         env_overrides=inline_env_overrides,
+        hypothesis_profiles=startup_hypothesis_profiles,
+        live_output_callback=_plain_live_output_callback,
     )
+    baseline_time = baseline_artifacts["wall_time"]
+    baseline_stdout = baseline_artifacts.get("stdout", "")
+    baseline_stderr = baseline_artifacts.get("stderr", "")
+    baseline_rc = baseline_artifacts["returncode"]
     _emit_tune_event(
         event_emitter,
         "exec.finished",
@@ -3335,7 +3849,19 @@ async def _run_spawn_tune_loop_async(
             "wall_time_s": baseline_time,
         },
     )
-    baseline_status = "success" if baseline_rc == 0 else "failed"
+    _emit_profile_artifact_events(
+        event_emitter,
+        baseline_artifacts,
+        phase="spawn.baseline",
+    )
+    baseline_profiling_text, baseline_profiling_json, baseline_contract_validation = (
+        _print_profile_artifact_summary(sink, baseline_artifacts, prefix="Baseline profiled run")
+    )
+    baseline_timed_out = bool(baseline_artifacts.get("timed_out"))
+    if baseline_timed_out:
+        baseline_status = "timeout"
+    else:
+        baseline_status = "success" if baseline_rc == 0 else "failed"
     _emit_tune_event(
         event_emitter,
         "baseline.finished",
@@ -3345,10 +3871,11 @@ async def _run_spawn_tune_loop_async(
             "status": baseline_status,
             "returncode": baseline_rc,
             "wall_time_s": baseline_time,
+            "profiled_run": True,
             **_event_output_payload(baseline_stdout, baseline_stderr),
         },
     )
-    if baseline_rc != 0:
+    if baseline_rc != 0 and not baseline_timed_out:
         _emit_tune_event(
             event_emitter,
             "error",
@@ -3372,13 +3899,25 @@ async def _run_spawn_tune_loop_async(
         sink.print(f"[dim]stderr: {baseline_stderr[:500]}[/dim]")
         return
 
+    if baseline_timed_out:
+        _emit_tune_event(
+            event_emitter,
+            "warning.raised",
+            {
+                "mode": "spawn",
+                "phase": "spawn.baseline",
+                "message": "baseline run timed out; continuing with timeout as baseline",
+            },
+        )
+        sink.print("[yellow]Baseline run timed out; continuing with timeout as baseline[/yellow]")
+
     _emit_tune_event(
         event_emitter,
         "phase.finished",
         {
             "mode": "spawn",
             "phase": "spawn.baseline",
-            "status": "success",
+            "status": baseline_status,
             "wall_time_s": baseline_time,
             "cmd_diff": "baseline",
         },
@@ -3387,11 +3926,132 @@ async def _run_spawn_tune_loop_async(
     sink.print(f"  Wall time: {baseline_time:.2f}s")
     sink.print(f"  Output: {len(baseline_stdout)} bytes")
 
+    baseline_metrics: dict[str, Any] = {}
+    resolved_primary_objective_metric: str | None = None
+    baseline_objective_value: float | None = None
+    if primary_objective:
+        sink.print("  Parsing baseline output for primary objective...")
+        baseline_metrics = await _extract_metrics_from_output(
+            agent,
+            baseline_stdout,
+            f"baseline run without tuning actions; primary objective query: {primary_objective}",
+        )
+        resolved_primary_objective_metric = _resolve_primary_objective_metric(
+            baseline_metrics,
+            primary_objective,
+        )
+        if resolved_primary_objective_metric is None:
+            _emit_tune_event(
+                event_emitter,
+                "error",
+                {
+                    "mode": "spawn",
+                    "phase": "spawn.baseline",
+                    "message": (
+                        "baseline output did not resolve primary objective query "
+                        f"'{primary_objective}' to a numeric metric"
+                    ),
+                },
+            )
+            _emit_tune_event(
+                event_emitter,
+                "run.finished",
+                {
+                    "mode": "spawn",
+                    "status": "failed",
+                    "returncode": 1,
+                    "failure_reason": "missing_primary_objective",
+                },
+            )
+            sink.print(
+                "[red]Baseline output did not resolve primary objective query "
+                f"'{primary_objective}' to a numeric metric[/red]"
+            )
+            raise SystemExit(1)
+        primary_objective_mode = primary_objective_mode or _infer_primary_objective_mode(
+            resolved_primary_objective_metric
+        )
+        if primary_objective_mode is None:
+            _emit_tune_event(
+                event_emitter,
+                "error",
+                {
+                    "mode": "spawn",
+                    "phase": "spawn.baseline",
+                    "message": (
+                        "could not infer primary objective mode for resolved metric "
+                        f"'{resolved_primary_objective_metric}'"
+                    ),
+                },
+            )
+            _emit_tune_event(
+                event_emitter,
+                "run.finished",
+                {
+                    "mode": "spawn",
+                    "status": "failed",
+                    "returncode": 1,
+                    "failure_reason": "missing_primary_objective_mode",
+                },
+            )
+            sink.print(
+                "[red]Could not infer --primary-objective-mode after resolving "
+                f"'{primary_objective}' to '{resolved_primary_objective_metric}'. "
+                "Please specify --primary-objective-mode.[/red]"
+            )
+            raise SystemExit(1)
+        baseline_objective_value = _extract_primary_objective_value(
+            baseline_metrics,
+            resolved_primary_objective_metric,
+        )
+        if baseline_objective_value is None:
+            _emit_tune_event(
+                event_emitter,
+                "error",
+                {
+                    "mode": "spawn",
+                    "phase": "spawn.baseline",
+                    "message": (
+                        "baseline output missing numeric primary objective "
+                        f"'{primary_objective}'"
+                    ),
+                },
+            )
+            _emit_tune_event(
+                event_emitter,
+                "run.finished",
+                {
+                    "mode": "spawn",
+                    "status": "failed",
+                    "returncode": 1,
+                    "failure_reason": "missing_primary_objective",
+                },
+            )
+            sink.print(
+                "[red]Baseline output did not produce numeric primary objective "
+                f"'{primary_objective}'[/red]"
+            )
+            raise SystemExit(1)
+        sink.print(
+            "  Resolved primary objective metric: "
+            f"{resolved_primary_objective_metric} ({primary_objective_mode})"
+        )
+        sink.print(
+            f"  Baseline {_objective_display_name(primary_objective)}: "
+            f"{_format_metric_value(baseline_objective_value)}"
+        )
+
     current_command_parts = list(cmd_parts)
     current_env_overrides: dict[str, str] = dict(inline_env_overrides)
     current_time = baseline_time
     current_stdout = baseline_stdout
     current_stderr = baseline_stderr
+    current_profiling_text = baseline_profiling_text
+    current_profiling_json = baseline_profiling_json
+    current_contract_validation = baseline_contract_validation
+    current_profile_artifacts = dict(baseline_artifacts)
+    current_metrics = dict(baseline_metrics)
+    current_objective_value = baseline_objective_value
 
     best_time = baseline_time
     best_stdout = baseline_stdout
@@ -3399,6 +4059,12 @@ async def _run_spawn_tune_loop_async(
     best_label = "(none)"
     best_command_parts = list(cmd_parts)
     best_env_overrides: dict[str, str] = {}
+    best_profiling_text = baseline_profiling_text
+    best_profiling_json = baseline_profiling_json
+    best_contract_validation = baseline_contract_validation
+    best_profile_artifacts = dict(baseline_artifacts)
+    best_metrics = dict(baseline_metrics)
+    best_objective_value = baseline_objective_value
 
     seen_trials: set[tuple[tuple[str, ...], tuple[tuple[str, str], ...]]] = {
         _command_key(current_command_parts, current_env_overrides)
@@ -3408,9 +4074,6 @@ async def _run_spawn_tune_loop_async(
     convergence_patience = 2
     min_improvement_pct = 1.0
     active_hypothesis_refs: list[str] = []
-    startup_hypothesis_profiles = [
-        item for item in (initial_hypothesis_profiles or []) if isinstance(item, dict)
-    ]
 
     for iteration in range(1, max_iterations + 1):
         _emit_tune_event(
@@ -3422,149 +4085,17 @@ async def _run_spawn_tune_loop_async(
                 "iteration": iteration,
             },
         )
-        sink.print(f"\n[bold cyan]Round {iteration} Step 1: Iteration Profiling[/bold cyan]")
-        _emit_tune_event(
-            event_emitter,
-            "profile.started",
-            {
-                "mode": "spawn",
-                "phase": "spawn.profiling",
-                "iteration": iteration,
-            },
+        sink.print(f"\n[bold cyan]Round {iteration} Step 1: Agent Tuning Analysis[/bold cyan]")
+        profiling_text, profiling_json, contract_validation = _print_profile_artifact_summary(
+            sink,
+            current_profile_artifacts,
+            prefix="Current profiled run",
         )
-        _emit_tune_event(
-            event_emitter,
-            "exec.started",
-            {
-                "mode": "spawn",
-                "phase": "spawn.profiling",
-                "iteration": iteration,
-            },
-        )
-        if active_hypothesis_refs:
-            selected_hypothesis_profiles = _extract_hypothesis_profiles(
-                structured_context_bundle,
-                active_hypothesis_refs,
-            )
-        else:
-            selected_hypothesis_profiles = startup_hypothesis_profiles
-        profiling_artifacts = await _run_live_profiling_pipeline(
-            agent,
-            current_command_parts,
-            timeout,
-            workdir=workdir,
-            env_overrides=current_env_overrides,
-            hypothesis_profiles=selected_hypothesis_profiles,
-        )
-        _emit_tune_event(
-            event_emitter,
-            "exec.finished",
-            {
-                "mode": "spawn",
-                "phase": "spawn.profiling",
-                "iteration": iteration,
-                "returncode": profiling_artifacts["returncode"],
-                "wall_time_s": profiling_artifacts["wall_time"],
-            },
-        )
-
-        sink.print(f"  Profiling run PID: {profiling_artifacts['pid']}")
-        sink.print(f"  Profiling run wall time: {profiling_artifacts['wall_time']:.2f}s")
-        sink.print(f"  Agent tool calls used: {profiling_artifacts.get('tool_calls_used', 0)}")
-
-        profiling_text = profiling_artifacts.get("profiling_text", "")
-        profiling_json = profiling_artifacts.get("profiling_json", {})
-        profile_tools: list[str] = []
-        profile_json_payload: dict[str, Any] = {}
-        if isinstance(profiling_json, dict):
-            profile_json_payload = dict(profiling_json)
-            raw_tools = profiling_json.get("tools_used")
-            if isinstance(raw_tools, list):
-                profile_tools = [str(tool) for tool in raw_tools if str(tool).strip()]
-
-        _emit_tune_event(
-            event_emitter,
-            "profile.snapshot",
-            {
-                "mode": "spawn",
-                "iteration": iteration,
-                "profile_tools": profile_tools,
-                "profile_json": profile_json_payload,
-                "profile_summary": profiling_text,
-                "metrics": {
-                    "pid": profiling_artifacts["pid"],
-                    "wall_time_s": profiling_artifacts["wall_time"],
-                    "returncode": profiling_artifacts["returncode"],
-                    "tool_calls_used": profiling_artifacts.get("tool_calls_used", 0),
-                },
-            },
-        )
-        _emit_tune_event(
-            event_emitter,
-            "profile.finished",
-            {
-                "mode": "spawn",
-                "phase": "spawn.profiling",
-                "iteration": iteration,
-                "status": ("success" if profiling_artifacts["returncode"] == 0 else "failed"),
-                "returncode": profiling_artifacts["returncode"],
-                "wall_time_s": profiling_artifacts["wall_time"],
-                **_event_output_payload(
-                    profiling_artifacts.get("stdout", ""),
-                    profiling_artifacts.get("stderr", ""),
-                ),
-            },
-        )
-        if profiling_artifacts["returncode"] != 0:
-            sink.print(
-                f"  [yellow]Profiling command return code: {profiling_artifacts['returncode']}[/yellow]"
-            )
-
-        if profiling_json:
-            sink.print(f"  Refined profiling JSON: {profiling_json}")
-        else:
-            snippet = profiling_text[:500] + ("..." if len(profiling_text) > 500 else "")
-            sink.print(f"  Refined profiling summary: {snippet}")
-
-        target_pids = (
-            profiling_json.get("target_pids", []) if isinstance(profiling_json, dict) else []
-        )
-        primary_pid = (
-            profiling_json.get("primary_pid") if isinstance(profiling_json, dict) else None
-        )
-        if target_pids:
-            sink.print(f"  Profiling targets: {target_pids} (primary={primary_pid})")
-
-        contract_validation = (
-            profiling_json.get("contract_hypothesis_validation", {})
-            if isinstance(profiling_json, dict)
-            else {}
-        )
-        if isinstance(contract_validation, dict) and contract_validation.get("profiles"):
-            profiles = contract_validation.get("profiles", [])
-            sink.print(f"  Contract-guided validation profiles: {len(profiles)}")
-            if isinstance(profiles, list):
-                for profile in profiles[:3]:
-                    if not isinstance(profile, dict):
-                        continue
-                    observed = 0
-                    signal_results = profile.get("signal_results", [])
-                    if isinstance(signal_results, list):
-                        observed = sum(
-                            1
-                            for item in signal_results
-                            if isinstance(item, dict) and bool(item.get("observed"))
-                        )
-                    total = len(signal_results) if isinstance(signal_results, list) else 0
-                    sink.print(
-                        f"    - {profile.get('hypothesis_id')}: observed {observed}/{total} signal(s)"
-                    )
 
         history_text = "\n".join(iteration_summaries[-6:]) if iteration_summaries else "(none)"
         tried_commands = [list(parts) for parts, _ in list(seen_trials)[-12:]]
 
-        sink.print(f"\n[bold cyan]Round {iteration} Step 2: Agent Tuning Analysis[/bold cyan]")
-        prompt = f"""Analyze this spawn-mode workload and propose the next manual-driven optimization actions.
+        prompt = f"""Analyze this spawn-mode workload and propose the next optimization actions.
 
 ## Current Command
 {" ".join(current_command_parts)}
@@ -3572,8 +4103,17 @@ async def _run_spawn_tune_loop_async(
 ## Current Environment Overrides
 {json.dumps(current_env_overrides, indent=2, sort_keys=True) if current_env_overrides else "(none)"}
 
+## Spawn MemoryHigh Limit
+{memory_high or "(none)"}
+
 ## Current Wall Time
 {current_time:.2f}s
+
+## Current Primary Objective
+{primary_objective or '(not configured)'}
+
+## Current Primary Objective Value
+{_format_metric_value(current_objective_value)}
 
 ## Current Program Output (excerpt)
 {current_stdout[:2500] if current_stdout else "(no stdout)"}
@@ -3590,14 +4130,17 @@ async def _run_spawn_tune_loop_async(
 ## Contract Hypothesis Validation
 {json.dumps(contract_validation, indent=2) if contract_validation else "(No contract-guided validation findings)"}
 
-## Loaded Manual Evidence
-{manual_content if manual_content else "(No manual content provided)"}
+## Loaded Contract Context
+{contract_content if contract_content else "(No contract context provided)"}
+
+## Application Manual Hints
+{manual_hint_content if manual_hint_content else "(No application manual hints provided)"}
 
 ## Rules
-- Use only profiling evidence and loaded manuals.
-- Loaded manual evidence may be a structured JSON context bundle instead of raw markdown excerpts; use the structured bundle first when present.
+- Use only profiling evidence, loaded contract context, and application manual hints.
+- Loaded contract context may be a structured JSON context bundle; use the structured bundle first when present.
 - Contract hypothesis validation, when present, is runtime-generated structured evidence. Prefer it over inferring raw DSL semantics yourself.
-- Re-profile is performed each iteration; propose next-step actions for this iteration.
+- The current accepted run was already profiled during execution, and candidate runs in this iteration will also be profiled during execution.
 - Avoid recommending exact commands already tried.
 - Keep workload-defining arguments fixed (model/input/token counts/repetitions/output mode) so comparisons stay fair.
 - Recommend only options that are valid for the target executable.
@@ -3689,20 +4232,26 @@ async def _run_spawn_tune_loop_async(
                 sink.print(f"    - {item}")
 
         summary = recommendation["summary"] or "No actionable tuning recommendation returned."
+        next_action_display = _recommendation_next_action_display(recommendation["actions"])
+        recommendation_payload: dict[str, Any] = {
+            "mode": "spawn",
+            "iteration": iteration,
+            "wall_time_s": analysis_wall_time_s,
+            "summary": summary,
+            "manual_citation": recommendation["manual_citation"],
+            "evidence": recommendation["evidence"][:5],
+            "action_count": len(recommendation["actions"]),
+        }
+        if next_action_display:
+            recommendation_payload["next_action"] = next_action_display
         _emit_tune_event(
             event_emitter,
             "recommendation.ready",
-            {
-                "mode": "spawn",
-                "iteration": iteration,
-                "wall_time_s": analysis_wall_time_s,
-                "summary": summary,
-                "manual_citation": recommendation["manual_citation"],
-                "evidence": recommendation["evidence"][:5],
-                "action_count": len(recommendation["actions"]),
-            },
+            recommendation_payload,
         )
         sink.print(f"  Decision summary: {summary}")
+        if next_action_display:
+            sink.print(f"  Next action: {next_action_display}")
         if recommendation["manual_citation"]:
             sink.print(f"  Manual citation: {recommendation['manual_citation']}")
         if recommendation["evidence"]:
@@ -3711,6 +4260,14 @@ async def _run_spawn_tune_loop_async(
         active_hypothesis_refs = recommendation.get("hypothesis_refs", [])
         if active_hypothesis_refs:
             sink.print(f"  Next hypothesis focus: {active_hypothesis_refs}")
+
+        if active_hypothesis_refs:
+            candidate_hypothesis_profiles = _extract_hypothesis_profiles(
+                structured_context_bundle,
+                active_hypothesis_refs,
+            )
+        else:
+            candidate_hypothesis_profiles = startup_hypothesis_profiles
 
         actions = recommendation["actions"]
         if not actions:
@@ -3778,7 +4335,7 @@ async def _run_spawn_tune_loop_async(
             continue
 
         sink.print(
-            f"\n[bold cyan]Round {iteration} Step 3: Candidate Search ({len(candidate_plans)} plan(s), max {max_iterations})[/bold cyan]"
+            f"\n[bold cyan]Round {iteration} Step 2: Candidate Search ({len(candidate_plans)} profiled run(s), max {max_iterations})[/bold cyan]"
         )
 
         iteration_best_time = current_time
@@ -3787,16 +4344,23 @@ async def _run_spawn_tune_loop_async(
         iteration_best_label = "(none)"
         iteration_best_cmd = list(current_command_parts)
         iteration_best_env = dict(current_env_overrides)
+        iteration_best_profiling_text = current_profiling_text
+        iteration_best_profiling_json = current_profiling_json
+        iteration_best_contract_validation = current_contract_validation
+        iteration_best_profile_artifacts = dict(current_profile_artifacts)
+        iteration_best_metrics = dict(current_metrics)
+        iteration_best_objective_value = current_objective_value
         successful_trials = 0
         non_improving_trials = 0
 
         for idx, candidate in enumerate(candidate_plans, start=1):
-            trial_cmd = candidate["cmd"]
-            trial_env = candidate["env_overrides"]
-            trial_label = candidate["label"]
-            skipped_execution_actions = candidate["skipped_actions"]
+            trial_plan = candidate
+            trial_cmd = trial_plan["cmd"]
+            trial_env = trial_plan["env_overrides"]
+            trial_label = trial_plan["label"]
+            skipped_execution_actions = trial_plan["skipped_actions"]
+            trial_actions = trial_plan.get("actions", [])
 
-            seen_trials.add(_command_key(trial_cmd, trial_env))
             _emit_tune_event(
                 event_emitter,
                 "progress.update",
@@ -3810,60 +4374,120 @@ async def _run_spawn_tune_loop_async(
                 },
             )
 
-            sink.print(f"  Trial {idx}/{len(candidate_plans)}: {trial_label}")
-            sink.print(f"    Running: {' '.join(trial_cmd)}")
-            if trial_env:
-                sink.print(f"    Environment overrides: {trial_env}")
-            if skipped_execution_actions:
-                for item in skipped_execution_actions:
-                    sink.print(f"    Skipped: {item}")
+            while True:
+                seen_trials.add(_command_key(trial_cmd, trial_env))
+                sink.print(f"  Trial {idx}/{len(candidate_plans)}: {trial_label}")
+                sink.print(f"    Running: {' '.join(trial_cmd)}")
+                if trial_env:
+                    sink.print(f"    Environment overrides: {trial_env}")
+                if skipped_execution_actions:
+                    for item in skipped_execution_actions:
+                        sink.print(f"    Skipped: {item}")
 
-            _emit_tune_event(
-                event_emitter,
-                "exec.started",
-                {
-                    "mode": "spawn",
-                    "phase": "spawn.candidate",
-                    "iteration": iteration,
-                    "candidate_id": idx,
-                    "label": trial_label,
-                },
-            )
-            trial_time, trial_stdout, trial_stderr, trial_rc = _run_command(
-                trial_cmd,
-                timeout,
-                workdir=workdir,
-                env_overrides=trial_env,
-            )
-            _emit_tune_event(
-                event_emitter,
-                "exec.finished",
-                {
-                    "mode": "spawn",
-                    "phase": "spawn.candidate",
-                    "iteration": iteration,
-                    "candidate_id": idx,
-                    "label": trial_label,
-                    "returncode": trial_rc,
-                    "wall_time_s": trial_time,
-                },
-            )
-            _emit_tune_event(
-                event_emitter,
-                "progress.finished",
-                {
-                    "mode": "spawn",
-                    "phase": "spawn.candidate_search",
-                    "iteration": iteration,
-                    "current_trial": idx,
-                    "total_trials": len(candidate_plans),
-                    "candidate_id": idx,
-                    "candidate_label": trial_label,
-                    "returncode": trial_rc,
-                    "wall_time_s": trial_time,
-                    **_event_output_payload(trial_stdout, trial_stderr),
-                },
-            )
+                _emit_tune_event(
+                    event_emitter,
+                    "exec.started",
+                    {
+                        "mode": "spawn",
+                        "phase": "spawn.candidate",
+                        "iteration": iteration,
+                        "candidate_id": idx,
+                        "label": trial_label,
+                    },
+                )
+                _emit_tune_event(
+                    event_emitter,
+                    "profile.started",
+                    {
+                        "mode": "spawn",
+                        "phase": "spawn.candidate",
+                        "iteration": iteration,
+                        "candidate_id": idx,
+                        "candidate_label": trial_label,
+                        "run_label": trial_label,
+                    },
+                )
+                trial_artifacts = await _run_live_profiling_pipeline(
+                    agent,
+                    trial_cmd,
+                    timeout,
+                    workdir=workdir,
+                    memory_high=memory_high,
+                    env_overrides=trial_env,
+                    hypothesis_profiles=candidate_hypothesis_profiles,
+                    live_output_callback=_plain_live_output_callback,
+                )
+                trial_time = trial_artifacts["wall_time"]
+                trial_stdout = trial_artifacts.get("stdout", "")
+                trial_stderr = trial_artifacts.get("stderr", "")
+                trial_rc = trial_artifacts["returncode"]
+                _emit_tune_event(
+                    event_emitter,
+                    "exec.finished",
+                    {
+                        "mode": "spawn",
+                        "phase": "spawn.candidate",
+                        "iteration": iteration,
+                        "candidate_id": idx,
+                        "label": trial_label,
+                        "returncode": trial_rc,
+                        "wall_time_s": trial_time,
+                    },
+                )
+                _emit_profile_artifact_events(
+                    event_emitter,
+                    trial_artifacts,
+                    phase="spawn.candidate",
+                    iteration=iteration,
+                    candidate_id=idx,
+                    candidate_label=trial_label,
+                )
+                _emit_tune_event(
+                    event_emitter,
+                    "progress.finished",
+                    {
+                        "mode": "spawn",
+                        "phase": "spawn.candidate_search",
+                        "iteration": iteration,
+                        "current_trial": idx,
+                        "total_trials": len(candidate_plans),
+                        "candidate_id": idx,
+                        "candidate_label": trial_label,
+                        "returncode": trial_rc,
+                        "wall_time_s": trial_time,
+                        **_event_output_payload(trial_stdout, trial_stderr),
+                    },
+                )
+
+                if trial_rc == 0:
+                    break
+
+                retry_plan, removed_options = _retry_spawn_candidate_without_unsupported_options(
+                    current_command_parts,
+                    cast(list[dict[str, Any]], trial_actions),
+                    base_env_overrides=current_env_overrides,
+                    unsupported_options=_extract_runtime_unsupported_options(
+                        trial_stdout,
+                        trial_stderr,
+                    ),
+                )
+                if not retry_plan:
+                    break
+
+                retry_key = _command_key(retry_plan["cmd"], retry_plan["env_overrides"])
+                if retry_key in seen_trials:
+                    break
+
+                sink.print(
+                    "    [yellow]Retrying without unsupported option(s): "
+                    f"{', '.join(removed_options)}[/yellow]"
+                )
+                trial_plan = retry_plan
+                trial_cmd = retry_plan["cmd"]
+                trial_env = retry_plan["env_overrides"]
+                trial_label = retry_plan["label"]
+                skipped_execution_actions = retry_plan["skipped_actions"]
+                trial_actions = retry_plan.get("actions", [])
 
             if trial_rc != 0:
                 _emit_tune_event(
@@ -3888,10 +4512,76 @@ async def _run_spawn_tune_loop_async(
                     break
                 continue
 
-            successful_trials += 1
+            trial_metrics: dict[str, Any] = {}
+            trial_objective_value: float | None = None
             current_change_pct = (
                 ((current_time - trial_time) / current_time) * 100 if current_time > 0 else 0
             )
+            current_change_label = "Wall time"
+            current_change_value = f"{trial_time:.2f}s"
+            trial_is_better_than_iteration_best = trial_time < iteration_best_time
+
+            if primary_objective and resolved_primary_objective_metric:
+                trial_metrics = await _extract_metrics_from_output(
+                    agent,
+                    trial_stdout,
+                    f"candidate run with actions: {trial_label}; primary objective query: {primary_objective}",
+                )
+                trial_objective_value = _extract_primary_objective_value(
+                    trial_metrics,
+                    resolved_primary_objective_metric,
+                )
+                if trial_objective_value is None:
+                    _emit_tune_event(
+                        event_emitter,
+                        "candidate.evaluated",
+                        {
+                            "mode": "spawn",
+                            "iteration": iteration,
+                            "candidate_id": idx,
+                            "label": trial_label,
+                            "verdict": "missing_primary_objective",
+                            "wall_time_s": trial_time,
+                            "cmd_diff": trial_label,
+                            "primary_objective_query": primary_objective,
+                            "primary_objective_metric": resolved_primary_objective_metric,
+                            "primary_objective_mode": primary_objective_mode or "",
+                        },
+                    )
+                    sink.print(
+                        "    [yellow]Trial missing numeric primary objective "
+                        f"'{resolved_primary_objective_metric}' for query '{primary_objective}'; rejected[/yellow]"
+                    )
+                    non_improving_trials += 1
+                    if non_improving_trials >= convergence_patience and successful_trials > 0:
+                        sink.print("  Candidate search converged after non-improving trials")
+                        break
+                    continue
+
+                assert primary_objective_mode is not None
+                iteration_best_reference_value = (
+                    cast(float, iteration_best_objective_value)
+                    if iteration_best_objective_value is not None
+                    else cast(float, current_objective_value)
+                )
+                best_order = _compare_objective_values(
+                    trial_objective_value,
+                    iteration_best_reference_value,
+                    primary_objective_mode,
+                )
+                current_change_pct = _compute_objective_change_pct(
+                    cast(float, current_objective_value),
+                    trial_objective_value,
+                    primary_objective_mode,
+                )
+                current_change_label = _objective_display_name(primary_objective)
+                current_change_value = _format_metric_value(trial_objective_value)
+                trial_is_better_than_iteration_best = best_order > 0 or (
+                    best_order == 0 and trial_time < iteration_best_time
+                )
+
+            successful_trials += 1
+
             _emit_tune_event(
                 event_emitter,
                 "candidate.evaluated",
@@ -3900,21 +4590,50 @@ async def _run_spawn_tune_loop_async(
                     "iteration": iteration,
                     "candidate_id": idx,
                     "label": trial_label,
-                    "verdict": "improved" if trial_time < iteration_best_time else "not_improved",
+                    "verdict": (
+                        "improved" if trial_is_better_than_iteration_best else "not_improved"
+                    ),
                     "wall_time_s": trial_time,
                     "change_pct_vs_current": current_change_pct,
                     "cmd_diff": trial_label,
+                    "primary_objective_query": primary_objective or "",
+                    "primary_objective_metric": resolved_primary_objective_metric or "",
+                    "primary_objective_mode": primary_objective_mode or "",
+                    "primary_objective_value": trial_objective_value,
                 },
             )
-            sink.print(f"    Wall time: {trial_time:.2f}s ({current_change_pct:+.1f}% vs current)")
+            sink.print(
+                f"    {current_change_label}: {current_change_value} ({current_change_pct:+.1f}% vs current)"
+            )
+            if primary_objective and resolved_primary_objective_metric:
+                wall_time_change_pct = (
+                    ((current_time - trial_time) / current_time) * 100 if current_time > 0 else 0
+                )
+                sink.print(
+                    f"    Wall time: {trial_time:.2f}s ({wall_time_change_pct:+.1f}% vs current)"
+                )
 
-            if trial_time < iteration_best_time:
+            if trial_is_better_than_iteration_best:
                 iteration_best_time = trial_time
                 iteration_best_stdout = trial_stdout
                 iteration_best_stderr = trial_stderr
                 iteration_best_label = trial_label
                 iteration_best_cmd = trial_cmd
                 iteration_best_env = trial_env
+                iteration_best_profiling_text = str(trial_artifacts.get("profiling_text", ""))
+                trial_profiling_json = trial_artifacts.get("profiling_json", {})
+                iteration_best_profiling_json = (
+                    trial_profiling_json if isinstance(trial_profiling_json, dict) else {}
+                )
+                trial_contract_validation = iteration_best_profiling_json.get(
+                    "contract_hypothesis_validation", {}
+                )
+                iteration_best_contract_validation = (
+                    trial_contract_validation if isinstance(trial_contract_validation, dict) else {}
+                )
+                iteration_best_profile_artifacts = dict(trial_artifacts)
+                iteration_best_metrics = dict(trial_metrics)
+                iteration_best_objective_value = trial_objective_value
                 if current_change_pct >= min_improvement_pct:
                     non_improving_trials = 0
                 else:
@@ -3943,29 +4662,75 @@ async def _run_spawn_tune_loop_async(
                 break
             continue
 
-        if iteration_best_time < current_time:
-            improvement_pct = (
-                ((current_time - iteration_best_time) / current_time) * 100
-                if current_time > 0
-                else 0
-            )
+        improvement_pct = (
+            ((current_time - iteration_best_time) / current_time) * 100 if current_time > 0 else 0
+        )
+        iteration_improved = iteration_best_time < current_time
+        if primary_objective and primary_objective_mode:
+            if iteration_best_objective_value is not None and current_objective_value is not None:
+                improvement_pct = _compute_objective_change_pct(
+                    cast(float, current_objective_value),
+                    cast(float, iteration_best_objective_value),
+                    primary_objective_mode,
+                )
+                objective_order = _compare_objective_values(
+                    cast(float, iteration_best_objective_value),
+                    cast(float, current_objective_value),
+                    primary_objective_mode,
+                )
+                iteration_improved = objective_order > 0 or (
+                    objective_order == 0 and iteration_best_time < current_time
+                )
+
+        if iteration_improved:
             current_time = iteration_best_time
             current_stdout = iteration_best_stdout
             current_stderr = iteration_best_stderr
             current_command_parts = list(iteration_best_cmd)
             current_env_overrides = dict(iteration_best_env)
+            current_profiling_text = iteration_best_profiling_text
+            current_profiling_json = iteration_best_profiling_json
+            current_contract_validation = iteration_best_contract_validation
+            current_profile_artifacts = dict(iteration_best_profile_artifacts)
+            current_metrics = dict(iteration_best_metrics)
+            current_objective_value = iteration_best_objective_value
             sink.print(f"  Accepted candidate: {iteration_best_label}")
-            sink.print(
-                f"  New current wall time: {current_time:.2f}s ({improvement_pct:+.1f}% vs previous)"
-            )
+            if primary_objective and current_objective_value is not None:
+                sink.print(
+                    f"  New current {_objective_display_name(primary_objective)}: "
+                    f"{_format_metric_value(current_objective_value)} ({improvement_pct:+.1f}% vs previous)"
+                )
+                sink.print(f"  Current wall time: {current_time:.2f}s")
+            else:
+                sink.print(
+                    f"  New current wall time: {current_time:.2f}s ({improvement_pct:+.1f}% vs previous)"
+                )
 
-            if current_time < best_time:
+            best_candidate_wins = current_time < best_time
+            if primary_objective and primary_objective_mode:
+                if best_objective_value is not None and current_objective_value is not None:
+                    best_order = _compare_objective_values(
+                        cast(float, current_objective_value),
+                        cast(float, best_objective_value),
+                        primary_objective_mode,
+                    )
+                    best_candidate_wins = best_order > 0 or (
+                        best_order == 0 and current_time < best_time
+                    )
+
+            if best_candidate_wins:
                 best_time = current_time
                 best_stdout = current_stdout
                 best_stderr = current_stderr
                 best_label = iteration_best_label
                 best_command_parts = list(current_command_parts)
                 best_env_overrides = dict(current_env_overrides)
+                best_profiling_text = current_profiling_text
+                best_profiling_json = current_profiling_json
+                best_contract_validation = current_contract_validation
+                best_profile_artifacts = dict(current_profile_artifacts)
+                best_metrics = dict(current_metrics)
+                best_objective_value = current_objective_value
 
             if improvement_pct >= min_improvement_pct:
                 stagnation_iterations = 0
@@ -3997,7 +4762,10 @@ async def _run_spawn_tune_loop_async(
             )
 
         iteration_summaries.append(
-            f"iter {iteration}: cmd={' '.join(current_command_parts)} wall={current_time:.2f}s"
+            f"iter {iteration}: cmd={' '.join(current_command_parts)} "
+            f"{primary_objective + '=' if primary_objective else ''}"
+            f"{_format_metric_value(current_objective_value) if primary_objective else ''} "
+            f"wall={current_time:.2f}s"
         )
 
         if stagnation_iterations >= convergence_patience:
@@ -4026,32 +4794,29 @@ async def _run_spawn_tune_loop_async(
         if best_env_overrides:
             sink.print(f"  Best environment overrides: {best_env_overrides}")
 
-    baseline_metrics: dict[str, Any] = {}
-    tuned_metrics: dict[str, Any] = {}
+    tuned_metrics: dict[str, Any] = dict(best_metrics)
+    tuned_objective_value = best_objective_value
 
-    if parse_output:
-        sink.print("\n[bold cyan]Round final: Extracting Metrics from Output[/bold cyan]")
-        sink.print("  Parsing baseline output...")
-        baseline_metrics = await _extract_metrics_from_output(
-            agent,
-            baseline_stdout,
-            "baseline run without tuning actions",
-        )
+    if primary_objective and resolved_primary_objective_metric:
+        sink.print("\n[bold cyan]Round final: Reusing Parsed Metrics[/bold cyan]")
         sink.print(f"  Baseline metrics: {baseline_metrics}")
-
-        sink.print("  Parsing tuned output...")
-        tuned_metrics = await _extract_metrics_from_output(
-            agent,
-            tuned_stdout,
-            f"tuned run with actions: {action_label}",
-        )
         sink.print(f"  Tuned metrics: {tuned_metrics}")
 
-    sink.print("\n[bold cyan]Round final Step 4: Results Comparison[/bold cyan]")
+    sink.print("\n[bold cyan]Round final Step 3: Results Comparison[/bold cyan]")
 
     speedup = baseline_time / tuned_time if tuned_time > 0 else 0
-    improvement_pct = (
+    wall_time_improvement_pct = (
         ((baseline_time - tuned_time) / baseline_time) * 100 if baseline_time > 0 else 0
+    )
+    primary_improvement_pct: float | None = None
+    if primary_objective and baseline_objective_value is not None and tuned_objective_value is not None:
+        primary_improvement_pct = _compute_objective_change_pct(
+            baseline_objective_value,
+            tuned_objective_value,
+            cast(str, primary_objective_mode),
+        )
+    reported_improvement_pct = (
+        primary_improvement_pct if primary_improvement_pct is not None else wall_time_improvement_pct
     )
     _emit_tune_event(
         event_emitter,
@@ -4060,26 +4825,51 @@ async def _run_spawn_tune_loop_async(
             "mode": "spawn",
             "baseline_time_s": baseline_time,
             "tuned_time_s": tuned_time,
-            "improvement_pct": improvement_pct,
+            "improvement_pct": reported_improvement_pct,
             "speedup": speedup,
             "action_label": action_label,
+            "primary_objective_query": primary_objective or "",
+            "primary_objective_metric": resolved_primary_objective_metric or "",
+            "primary_objective_mode": primary_objective_mode or "",
+            "baseline_primary_objective": baseline_objective_value,
+            "tuned_primary_objective": tuned_objective_value,
+            "wall_time_improvement_pct": wall_time_improvement_pct,
+            "primary_objective_improvement_pct": primary_improvement_pct,
         },
     )
 
-    table_rows: list[list[str]] = [
+    wall_time_change = f"{wall_time_improvement_pct:+.1f}%"
+    if wall_time_improvement_pct > 0 and speedup > 0:
+        wall_time_change = f"{speedup:.2f}x speed up ({wall_time_improvement_pct:+.1f}%)"
+
+    table_rows: list[list[str]] = []
+
+    if primary_objective and baseline_objective_value is not None and tuned_objective_value is not None:
+        table_rows.append(
+            [
+                _objective_display_name(primary_objective),
+                _format_metric_value(baseline_objective_value),
+                _format_metric_value(tuned_objective_value),
+                f"{cast(float, primary_improvement_pct):+.1f}%",
+            ]
+        )
+
+    table_rows.append(
         [
             "Wall Time",
             f"{baseline_time:.2f}s",
             f"{tuned_time:.2f}s",
-            f"{improvement_pct:+.1f}% ({speedup:.2f}x)",
+            wall_time_change,
         ]
-    ]
+    )
 
-    if parse_output and baseline_metrics and tuned_metrics:
+    if primary_objective and baseline_metrics and tuned_metrics:
         if not baseline_metrics.get("no_metrics") and not tuned_metrics.get("no_metrics"):
             all_keys = set(baseline_metrics.keys()) | set(tuned_metrics.keys())
             for key in sorted(all_keys):
-                if key in ("no_metrics",):
+                if key in ("no_metrics", "error"):
+                    continue
+                if resolved_primary_objective_metric and key == resolved_primary_objective_metric:
                     continue
                 base_val = baseline_metrics.get(key)
                 tuned_val = tuned_metrics.get(key)
@@ -4089,7 +4879,15 @@ async def _run_spawn_tune_loop_async(
                     and isinstance(tuned_val, (int, float))
                     and base_val != 0
                 ):
-                    change_pct = ((tuned_val - base_val) / abs(base_val)) * 100
+                    metric_mode = _infer_primary_objective_mode(key)
+                    if metric_mode is None:
+                        change_pct = ((tuned_val - base_val) / abs(base_val)) * 100
+                    else:
+                        change_pct = _compute_objective_change_pct(
+                            float(base_val),
+                            float(tuned_val),
+                            metric_mode,
+                        )
                     change_str = f"{change_pct:+.1f}%"
                 else:
                     change_str = ""
@@ -4113,16 +4911,29 @@ async def _run_spawn_tune_loop_async(
         rows=table_rows,
     )
 
-    if improvement_pct > 5:
-        sink.print(
-            f"\n[bold green]✓ Success! {improvement_pct:.1f}% improvement with actions: {action_label}[/bold green]"
-        )
+    if reported_improvement_pct > 5:
+        if primary_improvement_pct is not None:
+            sink.print(
+                f"\n[bold green]✓ Success! {_objective_display_name(primary_objective)} improved by "
+                f"{primary_improvement_pct:.1f}% with actions: {action_label}[/bold green]"
+            )
+        else:
+            sink.print(
+                f"\n[bold green]✓ Success! {speedup:.2f}x speed up ({reported_improvement_pct:.1f}% improvement) with actions: {action_label}[/bold green]"
+            )
         run_status = "improved"
-    elif improvement_pct > 0:
-        sink.print(f"\n[yellow]Modest improvement ({improvement_pct:.1f}%)[/yellow]")
+    elif reported_improvement_pct > 0:
+        if primary_improvement_pct is not None:
+            sink.print(
+                f"\n[yellow]Modest primary-objective improvement ({primary_improvement_pct:.1f}%)[/yellow]"
+            )
+        else:
+            sink.print(
+                f"\n[yellow]Modest improvement ({speedup:.2f}x speed up, {reported_improvement_pct:.1f}%)[/yellow]"
+            )
         run_status = "modest_improvement"
     else:
-        sink.print(f"\n[red]No improvement or regression ({improvement_pct:.1f}%)[/red]")
+        sink.print(f"\n[red]No improvement or regression ({reported_improvement_pct:.1f}%)[/red]")
         run_status = "no_improvement"
 
     _emit_tune_event(
@@ -4133,8 +4944,11 @@ async def _run_spawn_tune_loop_async(
             "status": run_status,
             "baseline_time_s": baseline_time,
             "tuned_time_s": tuned_time,
-            "improvement_pct": improvement_pct,
+            "improvement_pct": reported_improvement_pct,
             "action_label": action_label,
+            "primary_objective_query": primary_objective or "",
+            "primary_objective_metric": resolved_primary_objective_metric or "",
+            "primary_objective_mode": primary_objective_mode or "",
         },
     )
 
@@ -4142,11 +4956,14 @@ async def _run_spawn_tune_loop_async(
 def _run_spawn_tune_loop(
     agent: SysPilotAgent,
     command: str,
-    manuals: tuple[str, ...],
+    contracts: Sequence[str],
+    manual_hints: Sequence[str],
     max_iterations: int,
     timeout: int,
-    parse_output: bool = False,
+    primary_objective: str | None = None,
+    primary_objective_mode: str | None = None,
     workdir: Path | None = None,
+    memory_high: str | None = None,
     sink: OutputSink | None = None,
     event_emitter: _TuneEmitter | None = None,
     structured_context_bundle: dict[str, object] | None = None,
@@ -4157,17 +4974,54 @@ def _run_spawn_tune_loop(
         _run_spawn_tune_loop_async(
             agent=agent,
             command=command,
-            manuals=manuals,
+            contracts=contracts,
+            manual_hints=manual_hints,
             max_iterations=max_iterations,
             timeout=timeout,
-            parse_output=parse_output,
+            primary_objective=primary_objective,
+            primary_objective_mode=primary_objective_mode,
             workdir=workdir_str,
+            memory_high=memory_high,
             sink=sink,
             event_emitter=event_emitter,
             structured_context_bundle=structured_context_bundle,
             initial_hypothesis_profiles=initial_hypothesis_profiles,
         )
     )
+
+
+def _wrap_spawn_command_with_memory_high(
+    command_parts: list[str],
+    memory_high: str | None,
+    workdir: str | None = None,
+) -> list[str]:
+    if memory_high is None:
+        return list(command_parts)
+    normalized_memory_high = memory_high.strip()
+    if not normalized_memory_high:
+        return list(command_parts)
+
+    if workdir:
+        shell_command = f"cd {shlex.quote(workdir)} && exec {shlex.join(command_parts)}"
+        return [
+            "systemd-run",
+            "--user",
+            "--scope",
+            "-p",
+            f"MemoryHigh={normalized_memory_high}",
+            "/bin/sh",
+            "-lc",
+            shell_command,
+        ]
+
+    return [
+        "systemd-run",
+        "--user",
+        "--scope",
+        "-p",
+        f"MemoryHigh={normalized_memory_high}",
+        *command_parts,
+    ]
 
 
 @cli.command()

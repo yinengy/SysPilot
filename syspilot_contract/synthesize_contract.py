@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from copy import deepcopy
 from typing import Any
 
 from pydantic import ValidationError
@@ -14,12 +13,13 @@ from syspilot_contract.schemas import (
     CONTROL_TYPES,
     ContractVerificationResult,
     EFFECT_KINDS,
+    EXPECTED_DIRECTIONS,
     HYPOTHESIS_KINDS,
     LibraryContract,
     PHASES,
     PREDICATE_KINDS,
-    PROBE_KINDS,
     RESOURCE_TYPES,
+    SIGNAL_ROLES,
     SCOPES,
     SHARE_MODES,
     SourceArtifact,
@@ -28,99 +28,10 @@ from syspilot_manual.llm_client import ManualLLMProtocol
 from syspilot_manual.schemas import EvidenceItem
 
 
-def _clean_id_list(values: object) -> list[str]:
-    if not isinstance(values, list):
-        return []
-    return [str(value).strip() for value in values if str(value).strip()]
-
-
-def _normalize_condition(value: object) -> str | None:
-    if value is None:
-        return None
-    if isinstance(value, list):
-        parts = _clean_id_list(value)
-        return "; ".join(parts) if parts else None
-    text = str(value).strip()
-    return text or None
-
-
-def _sanitize_contract_payload(payload: object) -> dict[str, Any]:
+def _require_contract_object(payload: object) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("Contract synthesis returned a non-object payload")
-    sanitized = deepcopy(payload)
-
-    if "type" not in sanitized and "contract_type" in sanitized:
-        sanitized["type"] = sanitized.pop("contract_type")
-
-    for section in ("components", "uses", "assumptions", "controls", "signals", "recipes"):
-        raw_items = sanitized.get(section)
-        if not isinstance(raw_items, list):
-            continue
-        normalized_items: list[object] = []
-        for item in raw_items:
-            if not isinstance(item, dict):
-                normalized_items.append(item)
-                continue
-            filtered_item = dict(item)
-            if "evidence" not in filtered_item and "source_refs" in filtered_item:
-                filtered_item["evidence"] = _clean_id_list(filtered_item.pop("source_refs"))
-            if "when" in filtered_item:
-                filtered_item["when"] = _normalize_condition(filtered_item.get("when"))
-            if section == "signals":
-                probe = filtered_item.get("probe")
-                if not isinstance(probe, dict):
-                    probe = {}
-                if "name" not in probe and "target" in probe:
-                    probe["name"] = probe.pop("target")
-                if not probe.get("name") and filtered_item.get("tool"):
-                    probe["name"] = filtered_item.pop("tool")
-                filtered_item["probe"] = probe
-            if section == "recipes":
-                if "for" not in filtered_item and "hypothesis_kind" in filtered_item:
-                    filtered_item["for"] = filtered_item.pop("hypothesis_kind")
-                if "accept" not in filtered_item and "accept_if" in filtered_item:
-                    filtered_item["accept"] = filtered_item.pop("accept_if")
-                if "rollback" not in filtered_item and "rollback_if" in filtered_item:
-                    filtered_item["rollback"] = filtered_item.pop("rollback_if")
-            normalized_items.append(filtered_item)
-        sanitized[section] = normalized_items
-
-    raw_assumptions = sanitized.get("assumptions")
-    if isinstance(raw_assumptions, list):
-        for item in raw_assumptions:
-            if not isinstance(item, dict):
-                continue
-            predicate = item.get("predicate")
-            if not isinstance(predicate, dict):
-                continue
-            kind = str(predicate.get("kind", "")).strip()
-            if kind in {"total_at_most", "competitors_at_most"}:
-                item["predicate"] = {"kind": kind, "value": predicate.get("value")}
-            elif kind in {"exclusive", "not_nested", "placement_compatible"}:
-                item["predicate"] = {"kind": kind}
-
-    raw_controls = sanitized.get("controls")
-    if isinstance(raw_controls, list):
-        for item in raw_controls:
-            if not isinstance(item, dict):
-                continue
-            target = str(item.get("target", "")).strip()
-            if ".attrs." in target:
-                item["target"] = target.replace(".attrs.", ".")
-            effect = item.get("effect")
-            if not isinstance(effect, dict):
-                continue
-            kind = str(effect.get("kind", "")).strip()
-            if kind == "set":
-                item["effect"] = {"kind": "set", "value": effect.get("value", "input")}
-            elif kind == "partition":
-                filtered_effect: dict[str, Any] = {"kind": "partition"}
-                if effect.get("resource") is not None:
-                    filtered_effect["resource"] = effect.get("resource")
-                item["effect"] = filtered_effect
-            elif kind in {"increase", "decrease", "disable", "enable"}:
-                item["effect"] = {"kind": kind}
-    return sanitized
+    return dict(payload)
 
 
 def _selected_evidence_payload(evidence_items: list[EvidenceItem]) -> list[dict[str, object]]:
@@ -198,7 +109,7 @@ def _normalized_library_contract(
     contract_name: str,
     source_artifacts: list[SourceArtifact],
 ) -> tuple[LibraryContract | None, list[str], dict[str, Any]]:
-    sanitized = _sanitize_contract_payload(payload)
+    sanitized = _require_contract_object(payload)
     try:
         contract = LibraryContract.model_validate(sanitized)
     except ValidationError as exc:
@@ -276,7 +187,8 @@ async def synthesize_library_contract(
         "control_kind_vocab": list(CONTROL_KINDS),
         "control_type_vocab": list(CONTROL_TYPES),
         "effect_kind_vocab": list(EFFECT_KINDS),
-        "probe_kind_vocab": list(PROBE_KINDS),
+        "signal_role_vocab": list(SIGNAL_ROLES),
+        "expected_direction_when_mitigated_vocab": list(EXPECTED_DIRECTIONS),
         "hypothesis_kind_vocab": list(HYPOTHESIS_KINDS),
     }
     response_text = await llm_client.complete_prompt("synthesize_contract.txt", payload)

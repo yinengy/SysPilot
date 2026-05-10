@@ -22,11 +22,11 @@ The contract schema now prefers a **typed core** over free-form strings:
 
 - controls use canonical scalar/domain types such as `int`, `bool`, `enum`, `cpu_set`, and `numa_node_set`
 - demand bounds use host symbols like `host.visible_cpus` instead of prose such as “visible processors”
-- signals use structured probes (`probe.kind`, `probe.target`) instead of a free-form `tool` string
-- recipes reference `control_refs` and `signal` ids directly
+- signals use direct `virtual_probe` capability names plus strict `role` / `expected_direction_when_mitigated` enums instead of a free-form tool string or nested probe object
+- recipes reference control and signal ids directly through `diagnose`, `config_checks`, `outcomes`, `guardrails`, and labeled `actions`
 - composed conflicts use `candidate_control_refs`, `candidate_recipe_refs`, and signal/control refs instead of copied action prose
 
-Natural language is still allowed for fields that genuinely need it, such as explanatory `indicates` text and acceptance/rollback criteria.
+Natural language is still allowed for fields that genuinely need it, such as explanatory `indicates` text, action summaries, and diagnostic questions.
 
 ### Enforced LPCL checking
 
@@ -92,10 +92,9 @@ Current implementation-specific contract-source examples:
 - A composed contract like `contracts/openmp_openblas_composed/contract.yaml` can now be passed directly as a runtime knowledge input; SysPilot resolves `selected_contracts` plus hypothesis refs back into concrete controls, signals, recipes, assumptions, and shared-resource facts before building the agent context bundle.
 - Composed contracts may now include multiple instances of the same library contract. SysPilot writes deterministic `contract_instances` metadata and uses instance-qualified refs like `openmp_1.*` and `openmp_2.*` so duplicate libraries remain distinguishable at both compose time and runtime query time.
 - Spawn-mode tuning now derives `hypothesis_profiles` from composed contract conflicts, enables report-style controls for those profiles, and runs contract-guided validation scripts during the profiling phase so each round can feed structured hypothesis evidence back into the next tuning decision.
-- When structured contract context is available, tune no longer needs matching raw library manuals to be present.
-- If no contract artifact exists, spawn mode falls back to the structured manual bundle when `manual/<name>/manual.json` exists.
-- If neither structured contract nor structured manual artifacts exist, spawn mode falls back to the current markdown-excerpt behavior.
-- Attach/monitor/analyze flows remain compatible with markdown-only manuals.
+- Spawn-mode tune now keeps library contracts and application manuals orthogonal: `--contract` loads contract context, while `--manual` passes free-form application hints directly into the tuning prompt.
+- Contract-guided hypothesis synthesis is driven only by loaded contracts, not by application manual hints.
+- Manual-file loading remains available through agent APIs and manual-related helper commands, while spawn-mode tune uses `--manual` only for free-form application hints.
 - Long-running `extract-evidence` runs now report progress + ETA, checkpoint successful chunk results, and resume from remaining chunks after interruption.
 - `synthesize-manual` and `compose-manuals` now report phase progress + ETA and fail fast on bounded LLM timeouts instead of hanging indefinitely.
 
@@ -129,14 +128,8 @@ Each manual (`.md` file) should contain:
 # List available manuals
 syspilot manuals
 
-# Monitor with manual loaded
-syspilot monitor --pid 1234 --manual numactl --manual pytorch
-
-# Analyze with manual loaded
-syspilot analyze 1234 --manual numactl
-
-# Spawn-mode tuning with working directory + manual policy
-syspilot tune --command "./parallel_vlc ../config/transformer.json 0-11 12-23" --workdir /home/yyan/vlc/examples/Torch/build --manual vlcs --parse-output
+# Spawn-mode tuning with working directory + contract context + app hint
+syspilot tune --command "./parallel_vlc ../config/transformer.json 0-11 12-23" --workdir /home/yyan/vlc/examples/Torch/build --contract vlcs --manual "manager process spawns workers after warmup"
 
 # Ingest docs into chunked manual-source artifacts
 syspilot ingest --library openmp --docs examples/manual_mvp/openmp.md
@@ -218,12 +211,6 @@ agent.load_manuals(["numactl", "pytorch"])
 
 # Check loaded manuals
 print(agent.context.loaded_manuals.keys())
-```
-
-### Example: Manual Loading Demo
-
-```bash
-python3 examples/manual_loading_demo.py
 ```
 
 ## Available Manuals
@@ -340,11 +327,21 @@ Is condition true?
 
 ### How Manuals Are Loaded
 
+Programmatic/manual-loading flows still use manual-file loading:
+
 1. User specifies `--manual <name>` or calls `agent.load_manual()`
 2. Agent reads `manual/<name>.md`
 3. Content stored in `agent.context.loaded_manuals[name]`
 4. System prompt rebuilt with manual sections appended
 5. Agent references manual content in responses
+
+Spawn-mode tune is separate and is the only CLI tuning workflow:
+
+1. User specifies `--contract <name>` for library contracts and/or `--manual <hint>` for application hints
+2. Contract names are resolved into structured contract context bundles
+3. Application manual hints are kept as free-form natural language and appended directly to the tuning prompt
+4. Only contracts drive startup hypothesis synthesis and contract-guided profiling
+5. UI/event output reports contracts and manual hints separately
 
 ### System Prompt Structure
 
@@ -368,13 +365,13 @@ You have access to the following technical manuals for tuning:
 - Agent uses summaries, not full content, in tool calls
 - Future: Auto-discovery will load manuals dynamically
 
-### Spawn-Mode Manual Policy Loop
+### Spawn-Mode Contract + Manual-Hint Policy Loop
 
-In spawn mode, manuals are used as policy constraints each iteration:
+In spawn mode, contracts provide library policy and hypotheses, while manual hints provide application context:
 
 1. Run current configuration and collect profiling evidence
-2. Re-profile process tree (parent + heavy worker children)
-3. Ask agent for structured manual-cited actions (`summary`, `manual_citation`, `evidence`, `actions`)
+2. Re-profile process tree (parent + heavy worker children), optionally with contract-guided hypothesis validation
+3. Ask agent for structured actions using profiling evidence, loaded contract context, and application manual hints (`summary`, `manual_citation`, `evidence`, `actions`)
 4. Execute bounded candidate search
 5. Keep best-so-far config and stop by convergence or max iterations
 
@@ -426,9 +423,6 @@ print('Available:', agent.list_available_manuals())
 print('Load numactl:', agent.load_manual('numactl'))
 print('Loaded:', list(agent.context.loaded_manuals.keys()))
 "
-
-# Run demo
-python3 examples/manual_loading_demo.py
 
 # Test CLI
 syspilot manuals

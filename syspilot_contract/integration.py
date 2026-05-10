@@ -103,19 +103,14 @@ def load_contract_yaml(path: Path) -> AnyContract:
 def resolve_library_contract_inputs(
     contract_refs: list[str],
     contract_root: Path,
-    *,
-    allow_migration: bool = False,
 ) -> list[LibraryContract]:
     contracts: list[LibraryContract] = []
     for contract_ref in contract_refs:
         candidate = Path(contract_ref).expanduser()
         loaded = (
-            load_contract(candidate, allow_migration=allow_migration)
+            load_contract(candidate)
             if candidate.exists()
-            else load_contract(
-                runtime_contract_dir(contract_root, contract_ref) / "contract.yaml",
-                allow_migration=allow_migration,
-            )
+            else load_contract(runtime_contract_dir(contract_root, contract_ref) / "contract.yaml")
         )
         if not isinstance(loaded, LibraryContract):
             raise TypeError(f"Expected library contract for {contract_ref}")
@@ -208,17 +203,12 @@ def compose_and_write_contract(
     artifact_root: Path,
     *,
     contract_root: Path | None = None,
-    allow_migration: bool = False,
     include_evidence: bool = False,
     progress_callback: Callable[[ContractCompositionProgress], None] | None = None,
 ) -> ComposedContract:
     contract_root = contract_root or default_contract_root()
     started_at = time.monotonic()
-    library_contracts = resolve_library_contract_inputs(
-        contract_refs,
-        contract_root,
-        allow_migration=allow_migration,
-    )
+    library_contracts = resolve_library_contract_inputs(contract_refs, contract_root)
     if progress_callback is not None:
         progress_callback(
             ContractCompositionProgress(

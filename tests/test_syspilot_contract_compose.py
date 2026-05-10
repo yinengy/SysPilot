@@ -59,7 +59,8 @@ def _compute_contract(
                     "kind": "env",
                     "type": "int",
                     "target": f"{signal_prefix}_threads.workers",
-                    "effect": {"kind": "set", "value": "input"},
+                    "effect": {"kind": "set", "value": "input", "direction": "unknown"},
+                    "interacts_with": [f"{signal_prefix}_thread_count"],
                     "evidence": [f"{signal_prefix}_doc:chunk_001"],
                 }
             ],
@@ -67,17 +68,21 @@ def _compute_contract(
                 {
                     "id": f"{signal_prefix}_thread_count",
                     "target": f"{signal_prefix}_threads.workers",
+                    "role": "config_check",
                     "metric": "active_thread_count",
                     "indicates": "effective_worker_count",
-                    "probe": {"kind": "api", "name": control_name.lower().replace("-", "_")},
+                    "virtual_probe": "process.cpu.thread_count",
+                    "expected_direction_when_mitigated": "unknown",
                     "evidence": [f"{signal_prefix}_doc:chunk_001"],
                 },
                 {
                     "id": f"{signal_prefix}_ctx_switch_rate",
                     "target": "cpu.compute",
+                    "role": "resource_signal",
                     "metric": "os.context_switch_rate",
                     "indicates": "oversubscription",
-                    "probe": {"kind": "perf", "name": "perf_stat"},
+                    "virtual_probe": "benchmark.context_switch_rate",
+                    "expected_direction_when_mitigated": "decrease",
                     "evidence": [f"{signal_prefix}_doc:chunk_001"],
                 },
             ],
@@ -89,9 +94,32 @@ def _compute_contract(
                         f"{signal_prefix}_thread_count",
                         f"{signal_prefix}_ctx_switch_rate",
                     ],
-                    "actions": [f"set {control_name} to 1"],
-                    "accept": "effective_worker_count == 1 and throughput_not_worse",
-                    "rollback": "throughput_worse",
+                    "diagnose": [
+                        {
+                            "label": "confirm_worker_and_contention_signals",
+                            "signals": [
+                                f"{signal_prefix}_thread_count",
+                                f"{signal_prefix}_ctx_switch_rate",
+                            ],
+                        }
+                    ],
+                    "config_checks": [f"{signal_prefix}_thread_count"],
+                    "outcomes": ["throughput_not_worse"],
+                    "guardrails": [f"{signal_prefix}_ctx_switch_rate"],
+                    "actions": [
+                        {
+                            "label": f"set_{signal_prefix}_threads_low",
+                            "summary": f"set {control_name} to 1",
+                            "control": f"{signal_prefix}_threads_control",
+                            "effect": "set",
+                            "expected_changes": [
+                                {
+                                    "signal": f"{signal_prefix}_ctx_switch_rate",
+                                    "expected_direction_when_mitigated": "decrease",
+                                }
+                            ],
+                        }
+                    ],
                     "evidence": [f"{signal_prefix}_doc:chunk_001"],
                 }
             ],
@@ -141,7 +169,7 @@ def _placement_contract(name: str, bind_name: str, places_name: str) -> LibraryC
                     "kind": "env",
                     "type": "enum",
                     "target": f"{prefix}_cpu_placement",
-                    "effect": {"kind": "set", "value": "input"},
+                    "effect": {"kind": "set", "value": "input", "direction": "unknown"},
                     "evidence": [f"{prefix}_doc:chunk_001"],
                 },
                 {
@@ -150,7 +178,7 @@ def _placement_contract(name: str, bind_name: str, places_name: str) -> LibraryC
                     "kind": "env",
                     "type": "string",
                     "target": f"{prefix}_cpu_placement",
-                    "effect": {"kind": "set", "value": "input"},
+                    "effect": {"kind": "set", "value": "input", "direction": "unknown"},
                     "evidence": [f"{prefix}_doc:chunk_001"],
                 },
             ],
@@ -158,9 +186,11 @@ def _placement_contract(name: str, bind_name: str, places_name: str) -> LibraryC
                 {
                     "id": f"{prefix}_placement_signal",
                     "target": "cpu.placement",
+                    "role": "subcomponent_signal",
                     "metric": "thread_placement",
                     "indicates": "placement_state",
-                    "probe": {"kind": "log", "name": "OMP_DISPLAY_AFFINITY"},
+                    "virtual_probe": "runtime.config.startup_properties",
+                    "expected_direction_when_mitigated": "unknown",
                     "evidence": [f"{prefix}_doc:chunk_001"],
                 }
             ],
@@ -169,9 +199,21 @@ def _placement_contract(name: str, bind_name: str, places_name: str) -> LibraryC
                     "id": f"{prefix}_placement_recipe",
                     "for": "cpu_placement_conflict",
                     "collect": [f"{prefix}_placement_signal"],
-                    "actions": [f"compare placement with {bind_name} and {places_name}"],
-                    "accept": "placement_matches_intent",
-                    "rollback": "placement_conflicts",
+                    "diagnose": [
+                        {
+                            "label": "compare_effective_placement",
+                            "signals": [f"{prefix}_placement_signal"],
+                        }
+                    ],
+                    "config_checks": [f"{prefix}_placement_signal"],
+                    "outcomes": ["placement_matches_intent"],
+                    "guardrails": ["placement_conflicts"],
+                    "actions": [
+                        {
+                            "label": f"compare_{prefix}_placement_controls",
+                            "summary": f"compare placement with {bind_name} and {places_name}",
+                        }
+                    ],
                     "evidence": [f"{prefix}_doc:chunk_001"],
                 }
             ],
@@ -314,3 +356,32 @@ def test_query_api_filters_uses_controls_signals_by_resource(tmp_path: Path) -> 
     assert len(cpu_compute_signals) == 2
     assert len(cpu_placement_uses) == 1
     assert len(cpu_placement_signals) == 1
+
+
+def test_kafka_rocksdb_context_exposes_actionable_memory_hypothesis() -> None:
+    store = ContractStore(Path(__file__).resolve().parents[1] / "contracts")
+
+    context = store.build_agent_context(
+        ["kafka_streams_rocksdb_contention"],
+        goal="reduce memory pressure",
+        symptom="memory.events.high keeps rising",
+        max_items_per_section=6,
+    )
+
+    hypotheses = cast(list[dict[str, object]], context["likely_hypotheses"])
+    assert hypotheses
+    memory_hypothesis = hypotheses[0]
+    assert memory_hypothesis["kind"] == "host_memory_capacity_pressure"
+    assert memory_hypothesis["resource"] == "mem.capacity"
+    assert memory_hypothesis["resource_ledger"]
+    assert memory_hypothesis["signals_to_collect"]
+    assert memory_hypothesis["probe_requirements"]
+    assert memory_hypothesis["expected_signal_changes"]
+    assert memory_hypothesis["guardrails"]
+    assert memory_hypothesis["search_space_hints"]
+    explanation = str(memory_hypothesis["explanation"])
+    assert "share resource claims" in explanation
+
+    signals_to_collect = cast(list[dict[str, object]], memory_hypothesis["signals_to_collect"])
+    assert any(item.get("role") == "config_check" for item in signals_to_collect)
+    assert any(item.get("virtual_probe") == "cgroup.memory.events.high" for item in signals_to_collect)

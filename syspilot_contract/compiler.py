@@ -26,8 +26,7 @@ SAFE_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
 
 DEMAND_KEY_ORDER = ("dimension", "min", "max", "value", "source")
 PREDICATE_KEY_ORDER = ("kind",)
-EFFECT_KEY_ORDER = ("kind",)
-PROBE_KEY_ORDER = ("kind", "name")
+EFFECT_KEY_ORDER = ("kind", "direction", "formula", "value", "resource")
 
 
 def _quote_string(value: str) -> str:
@@ -176,6 +175,8 @@ def _compile_control(item: Control, *, include_evidence: bool) -> list[str]:
     lines = [f"  control {item.id} : {item.kind}<{item.type}> {{"]
     _emit_scalar_assignment(lines, "name", item.name, indent="    ")
     _emit_scalar_assignment(lines, "target", item.target, indent="    ")
+    if item.interacts_with:
+        _emit_list_assignment(lines, "interacts_with", item.interacts_with, indent="    ")
     _emit_named_block(
         lines,
         "effect",
@@ -194,14 +195,15 @@ def _compile_signal(item: Any, *, include_evidence: bool) -> list[str]:
     _require_safe_identifier(item.id, f"signal id {item.id}")
     lines = [f"  signal {item.id} {{"]
     _emit_scalar_assignment(lines, "target", item.target, indent="    ")
+    _emit_scalar_assignment(lines, "role", item.role, indent="    ")
     _emit_scalar_assignment(lines, "metric", item.metric, indent="    ")
     _emit_scalar_assignment(lines, "indicates", item.indicates, indent="    ")
-    _emit_named_block(
+    _emit_scalar_assignment(lines, "virtual_probe", item.virtual_probe, indent="    ")
+    _emit_scalar_assignment(
         lines,
-        "probe",
-        item.probe.model_dump(mode="json"),
+        "expected_direction_when_mitigated",
+        item.expected_direction_when_mitigated,
         indent="    ",
-        preferred_keys=PROBE_KEY_ORDER,
     )
     if item.when is not None:
         _emit_scalar_assignment(lines, "when", item.when, indent="    ")
@@ -216,9 +218,37 @@ def _compile_recipe(item: Any, *, include_evidence: bool) -> list[str]:
     lines = [f"  recipe {item.id} {{"]
     _emit_scalar_assignment(lines, "for", item.hypothesis_kind, indent="    ")
     _emit_list_assignment(lines, "collect", item.collect, indent="    ")
-    _emit_list_assignment(lines, "actions", item.actions, indent="    ")
-    _emit_scalar_assignment(lines, "accept", item.accept, indent="    ")
-    _emit_scalar_assignment(lines, "rollback", item.rollback, indent="    ")
+    for diagnose in item.diagnose:
+        _emit_named_block(
+            lines,
+            "diagnose",
+            diagnose.model_dump(mode="json", exclude_none=True),
+            indent="    ",
+        )
+    _emit_list_assignment(lines, "config_checks", item.config_checks, indent="    ")
+    _emit_list_assignment(lines, "outcomes", item.outcomes, indent="    ")
+    _emit_list_assignment(lines, "guardrails", item.guardrails, indent="    ")
+    if item.search_space_hints:
+        _emit_list_assignment(lines, "search_space_hints", item.search_space_hints, indent="    ")
+    _emit_list_assignment(lines, "actions", [action.label for action in item.actions], indent="    ")
+    for action in item.actions:
+        lines.append("    action {")
+        _emit_scalar_assignment(lines, "label", action.label, indent="      ")
+        _emit_scalar_assignment(lines, "summary", action.summary, indent="      ")
+        if action.control is not None:
+            _emit_scalar_assignment(lines, "control", action.control, indent="      ")
+        if action.effect is not None:
+            _emit_scalar_assignment(lines, "effect", action.effect, indent="      ")
+        if action.value is not None:
+            _emit_scalar_assignment(lines, "value", action.value, indent="      ")
+        for change in action.expected_changes:
+            _emit_named_block(
+                lines,
+                "expected_change",
+                change.model_dump(mode="json", exclude_none=True),
+                indent="      ",
+            )
+        lines.append("    }")
     if item.when is not None:
         _emit_scalar_assignment(lines, "when", item.when, indent="    ")
     _emit_evidence(lines, item.evidence, indent="    ", include_evidence=include_evidence)
@@ -371,7 +401,7 @@ def compile_lpcl(contract: AnyContract, *, include_evidence: bool = False) -> st
 
 def compile_lpcl_from_yaml_text(yaml_text: str, *, include_evidence: bool = False) -> str:
     payload = parse_contract_yaml(yaml_text)
-    contract = validate_contract_payload(payload, allow_migration=False)
+    contract = validate_contract_payload(payload)
     return compile_lpcl(contract, include_evidence=include_evidence)
 
 

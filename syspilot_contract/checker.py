@@ -5,8 +5,6 @@ from pathlib import Path
 
 import yaml
 from pydantic import ValidationError
-
-from syspilot_contract.migration import migrate_contract_payload
 from syspilot_contract.schemas import (
     AnyContract,
     ComposedContract,
@@ -68,29 +66,26 @@ def parse_contract_yaml(text: str) -> object:
     return payload
 
 
-def _normalized_payload(payload: object, *, allow_migration: bool = True) -> dict[str, object]:
+def _normalized_payload(payload: object) -> dict[str, object]:
     if not isinstance(payload, dict):
         raise ValueError("contract document must be a mapping")
-    normalized = migrate_contract_payload(payload) if allow_migration else dict(payload)
+    normalized = dict(payload)
     contract_type = normalized.get("type")
     if contract_type not in {"library", "composed"}:
         raise ValueError(f"Unknown contract type {contract_type}")
     return normalized
 
 
-def validate_contract_payload(payload: object, *, allow_migration: bool = True) -> AnyContract:
-    normalized = _normalized_payload(payload, allow_migration=allow_migration)
+def validate_contract_payload(payload: object) -> AnyContract:
+    normalized = _normalized_payload(payload)
     contract_type = normalized.get("type")
     if contract_type == "composed":
         return ComposedContract.model_validate(normalized)
     return LibraryContract.model_validate(normalized)
 
 
-def load_contract(path: Path, *, allow_migration: bool = True) -> AnyContract:
-    return validate_contract_payload(
-        parse_contract_yaml(path.read_text(encoding="utf-8")),
-        allow_migration=allow_migration,
-    )
+def load_contract(path: Path) -> AnyContract:
+    return validate_contract_payload(parse_contract_yaml(path.read_text(encoding="utf-8")))
 
 
 def dump_contract_yaml(contract: AnyContract) -> str:
@@ -209,12 +204,10 @@ def check_contract(contract: AnyContract) -> ContractCheckResult:
 
 def validate_contract_text(
     text: str,
-    *,
-    allow_migration: bool = True,
 ) -> tuple[AnyContract | None, ContractCheckResult]:
     try:
         payload = parse_contract_yaml(text)
-        contract = validate_contract_payload(payload, allow_migration=allow_migration)
+        contract = validate_contract_payload(payload)
     except ValidationError as exc:
         return None, ContractCheckResult(valid=False, issues=_issues_from_validation_error(exc))
     except (ValueError, yaml.YAMLError) as exc:
@@ -225,10 +218,8 @@ def validate_contract_text(
 
 def validate_contract_file(
     path: Path,
-    *,
-    allow_migration: bool = True,
 ) -> tuple[AnyContract | None, ContractCheckResult]:
-    return validate_contract_text(path.read_text(encoding="utf-8"), allow_migration=allow_migration)
+    return validate_contract_text(path.read_text(encoding="utf-8"))
 
 
 def assert_valid_contract(contract: AnyContract) -> AnyContract:

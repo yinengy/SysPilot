@@ -5,7 +5,7 @@ Example: Basic usage of SysPilot agent.
 This example demonstrates how to:
 1. Create and configure a SysPilot agent
 2. Register custom tools
-3. Run a simple analysis on a target process
+3. Collect a local profile snapshot that can inform spawn-mode tuning
 """
 
 import asyncio
@@ -56,9 +56,8 @@ async def main() -> None:
     results = await manager.collect_all(config.target_pid)
     print(manager.summarize_results(results))
     
-    print("\nAnalyzing target process...")
-    analysis = await agent.analyze_target(pid=config.target_pid)
-    print(analysis)
+    print("\nSpawn-mode tuning is the supported workflow.")
+    print('Use `syspilot tune --command "..."` to run iterative benchmark tuning.')
 
 
 if __name__ == "__main__":

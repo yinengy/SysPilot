@@ -77,7 +77,6 @@ def test_plain_mode_emits_key_markers_for_spawn_flow() -> None:
                 "1",
                 "--timeout",
                 "1",
-                "--no-parse-output",
             ],
         )
 

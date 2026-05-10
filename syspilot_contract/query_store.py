@@ -66,6 +66,100 @@ def _control_activation_value(control: Control) -> Any | None:
     return None
 
 
+def resolve_virtual_probe(virtual_probe: str) -> dict[str, object]:
+    probe = str(virtual_probe).strip()
+    registry: dict[str, dict[str, object]] = {
+        "cgroup.memory.events.high": {
+            "availability": "available",
+            "collector": "runtime_report",
+            "requirements": ["memory.events.high in refined runtime maps or copied run artifacts"],
+        },
+        "process.memory.rss_peak": {
+            "availability": "available",
+            "collector": "memory",
+            "requirements": ["memory collector or refined runtime maps with process RSS/peak"],
+        },
+        "process.memory.rss": {
+            "availability": "available",
+            "collector": "memory",
+            "requirements": ["memory collector or refined runtime maps with process RSS"],
+        },
+        "process.cpu.thread_count": {
+            "availability": "available",
+            "collector": "cpu",
+            "requirements": ["cpu collector thread count or runtime thread report"],
+        },
+        "process.cpu.allowed_cpus": {
+            "availability": "available",
+            "collector": "runtime_report",
+            "requirements": ["Cpus_allowed_list in refined runtime maps"],
+        },
+        "runtime.config.startup_properties": {
+            "availability": "available",
+            "collector": "runtime_output",
+            "requirements": ["workload must emit effective startup/configuration lines"],
+        },
+        "runtime.config.startup_profile": {
+            "availability": "available",
+            "collector": "runtime_output",
+            "requirements": ["workload must emit applied startup profile lines"],
+        },
+        "filesystem.directory_size": {
+            "availability": "unavailable",
+            "collector": "unavailable",
+            "requirements": ["no built-in collector yet; requires future filesystem probe"],
+        },
+    }
+    if probe.startswith("benchmark."):
+        return {
+            "virtual_probe": probe,
+            "availability": "available",
+            "collector": "runtime_output",
+            "requirements": ["workload stdout/stderr must expose the benchmark metric"],
+        }
+    resolved = registry.get(probe)
+    if resolved is None:
+        return {
+            "virtual_probe": probe,
+            "availability": "unavailable",
+            "collector": "unavailable",
+            "requirements": ["no built-in resolver registered for this virtual probe yet"],
+        }
+    return {"virtual_probe": probe, **resolved}
+
+
+def _signal_payload(contract: LibraryContract, signal: Signal) -> dict[str, object]:
+    resources = _resources_for_target(contract, signal.target)
+    resolved_probe = resolve_virtual_probe(signal.virtual_probe)
+    text = (
+        f"{signal.metric} {signal.indicates} {signal.target} {signal.role} "
+        f"{signal.expected_direction_when_mitigated} {signal.virtual_probe} {' '.join(resources)}"
+    )
+    return {
+        "section": "signals",
+        "item_id": signal.id,
+        "title": signal.metric,
+        "text": text,
+        "keywords": [
+            signal.metric,
+            signal.indicates,
+            signal.target,
+            signal.role,
+            signal.expected_direction_when_mitigated,
+            signal.virtual_probe,
+        ],
+        "resource_domains": resources,
+        "evidence": signal.evidence,
+        "library": contract.contract,
+        "signal_ref": f"{contract.contract}.{signal.id}",
+        "virtual_probe": signal.virtual_probe,
+        "role": signal.role,
+        "expected_direction_when_mitigated": signal.expected_direction_when_mitigated,
+        "resolved_probe": resolved_probe,
+        "signal": signal.model_dump(mode="json"),
+    }
+
+
 class ContractStore:
     def __init__(self, root: Path) -> None:
         self.root = root
@@ -486,11 +580,16 @@ class ContractStore:
                 resolved_validation_signals = []
                 for ref in item.validation.collect:
                     contract, signal = self._require_signal_ref(ref, signal_ref_map)
+                    signal_payload = _signal_payload(contract, signal)
                     resolved_validation_signals.append(
                         {
                             "ref": ref,
                             "contract": contract.contract,
-                            "signal": signal.model_dump(mode="json"),
+                            "signal": signal_payload["signal"],
+                            "role": signal.role,
+                            "virtual_probe": signal.virtual_probe,
+                            "expected_direction_when_mitigated": signal.expected_direction_when_mitigated,
+                            "resolved_probe": signal_payload["resolved_probe"],
                         }
                     )
                 resolved_candidate_controls = []
@@ -517,22 +616,7 @@ class ContractStore:
                             "recipe": recipe.model_dump(mode="json", by_alias=True),
                         }
                     )
-
-                validation_probe_names = {
-                    str(entry[1].probe.name)
-                    for entry in [
-                        self._require_signal_ref(ref, signal_ref_map)
-                        for ref in item.validation.collect
-                    ]
-                }
-                report_controls = [
-                    control_entry
-                    for control_entry in resolved_candidate_controls
-                    if isinstance(control_entry.get("control"), dict)
-                    and control_entry["control"].get("kind") == "env"
-                    and control_entry["control"].get("name") in validation_probe_names
-                    and control_entry["control"].get("activation_value") is not None
-                ]
+                report_controls: list[dict[str, object]] = []
 
                 signal_titles = [
                     entry["signal"]["metric"]
@@ -549,6 +633,74 @@ class ContractStore:
                     for entry in resolved_candidate_recipes
                     if isinstance(entry.get("recipe"), dict)
                 ]
+                resource_ledger = [
+                    {
+                        "ref": entry["ref"],
+                        "contract": entry["contract"],
+                        "resource": cast(dict[str, object], entry["use"]).get("resource"),
+                        "phase": cast(dict[str, object], entry["use"]).get("phase"),
+                        "scope": cast(dict[str, object], entry["use"]).get("scope"),
+                        "share": cast(dict[str, object], entry["use"]).get("share"),
+                        "demand": cast(dict[str, object], entry["use"]).get("demand"),
+                    }
+                    for entry in resolved_uses
+                ]
+                hypothesis_signals_to_collect = [
+                    {
+                        "ref": entry["ref"],
+                        "contract": entry["contract"],
+                        "role": entry["role"],
+                        "virtual_probe": entry["virtual_probe"],
+                        "expected_direction_when_mitigated": entry[
+                            "expected_direction_when_mitigated"
+                        ],
+                        "probe_requirement": entry["resolved_probe"],
+                        "signal": entry["signal"],
+                    }
+                    for entry in resolved_validation_signals
+                ]
+                probe_requirements = list(
+                    {
+                        json_key: requirement
+                        for json_key, requirement in {
+                            str(entry["resolved_probe"]): entry["resolved_probe"]
+                            for entry in resolved_validation_signals
+                        }.items()
+                    }.values()
+                )
+                expected_signal_changes = []
+                guardrails = []
+                search_space_hints = []
+                diagnose_blocks = []
+                for entry in resolved_candidate_recipes:
+                    recipe = entry.get("recipe")
+                    if not isinstance(recipe, dict):
+                        continue
+                    for diagnose in recipe.get("diagnose", []):
+                        if isinstance(diagnose, dict):
+                            diagnose_blocks.append({"recipe_ref": entry["ref"], **diagnose})
+                    for action in recipe.get("actions", []):
+                        if not isinstance(action, dict):
+                            continue
+                        expected_signal_changes.extend(
+                            {
+                                "recipe_ref": entry["ref"],
+                                "action_label": action.get("label"),
+                                "action_summary": action.get("summary"),
+                                "control": action.get("control"),
+                                **change,
+                            }
+                            for change in action.get("expected_changes", [])
+                            if isinstance(change, dict)
+                        )
+                    guardrails.extend(str(item).strip() for item in recipe.get("guardrails", []) if str(item).strip())
+                    search_space_hints.extend(
+                        str(item).strip() for item in recipe.get("search_space_hints", []) if str(item).strip()
+                    )
+                explanation = (
+                    f"{item.kind} is suspected on {item.resource} during {item.phase} because "
+                    f"{', '.join(item.contracts)} share resource claims across {len(resource_ledger)} ledger entries."
+                )
                 text = (
                     f"{item.kind} {item.resource} {item.phase} components {' '.join(item.components)} "
                     f"signals {' '.join(signal_titles)} controls {' '.join(control_titles)} recipes {' '.join(recipe_titles)}"
@@ -567,6 +719,14 @@ class ContractStore:
                         "control_collisions": resolved_control_collisions,
                     },
                     "validation_signals": resolved_validation_signals,
+                    "signals_to_collect": hypothesis_signals_to_collect,
+                    "resource_ledger": resource_ledger,
+                    "probe_requirements": probe_requirements,
+                    "diagnose": diagnose_blocks,
+                    "expected_signal_changes": expected_signal_changes,
+                    "guardrails": guardrails,
+                    "search_space_hints": search_space_hints,
+                    "explanation": explanation,
                     "report_controls": report_controls,
                     "candidate_controls": resolved_candidate_controls,
                     "candidate_recipes": resolved_candidate_recipes,
@@ -597,21 +757,8 @@ class ContractStore:
         signals_to_collect: list[dict[str, object]] = []
         for contract in libraries:
             for signal in contract.signals:
-                resources = _resources_for_target(contract, signal.target)
-                text = f"{signal.metric} {signal.indicates} {signal.target} {signal.probe.kind} {signal.probe.name} {' '.join(resources)}"
-                payload: dict[str, object] = {
-                    "section": "signals",
-                    "item_id": signal.id,
-                    "title": signal.metric,
-                    "text": text,
-                    "keywords": [signal.metric, signal.indicates, signal.target, signal.probe.name],
-                    "resource_domains": resources,
-                    "evidence": signal.evidence,
-                    "library": contract.contract,
-                    "signal_ref": f"{contract.contract}.{signal.id}",
-                    "signal": signal.model_dump(mode="json"),
-                    "score": _score(text, terms),
-                }
+                payload = _signal_payload(contract, signal)
+                payload["score"] = _score(str(payload.get("text", "")), terms)
                 profile_first.append(payload)
                 signals_to_collect.append(payload)
 
@@ -622,7 +769,11 @@ class ContractStore:
                 resources = _resources_for_target(contract, control.target)
                 control_payload = control.model_dump(mode="json")
                 control_payload["activation_value"] = _control_activation_value(control)
-                text = f"{control.name} {control.kind} {control.type} target={control.target} effect={control.effect.kind} {' '.join(resources)}"
+                text = (
+                    f"{control.name} {control.kind} {control.type} target={control.target} "
+                    f"effect={control.effect.kind} direction={control.effect.direction or 'unknown'} "
+                    f"formula={control.effect.formula or 'none'} {' '.join(resources)}"
+                )
                 payload: dict[str, object] = {
                     "section": "controls",
                     "item_id": control.id,
@@ -649,13 +800,17 @@ class ContractStore:
         validation: list[dict[str, object]] = []
         for contract in libraries:
             for recipe in contract.recipes:
-                text = f"{recipe.hypothesis_kind} {' '.join(recipe.collect)} {' '.join(recipe.actions)}"
+                action_summaries = [action.summary for action in recipe.actions]
+                diagnose_labels = [item.label for item in recipe.diagnose]
+                text = (
+                    f"{recipe.hypothesis_kind} {' '.join(recipe.collect)} {' '.join(diagnose_labels)} {' '.join(action_summaries)}"
+                )
                 payload: dict[str, object] = {
                     "section": "recipes",
                     "item_id": recipe.id,
                     "title": recipe.hypothesis_kind,
                     "text": text,
-                    "keywords": recipe.collect + recipe.actions,
+                    "keywords": recipe.collect + diagnose_labels + action_summaries + recipe.guardrails + recipe.search_space_hints,
                     "evidence": recipe.evidence,
                     "library": contract.contract,
                     "recipe_ref": f"{contract.contract}.{recipe.id}",

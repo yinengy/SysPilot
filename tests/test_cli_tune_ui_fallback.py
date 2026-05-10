@@ -80,7 +80,6 @@ def test_default_ui_mode_non_tty_falls_back_to_plain() -> None:
                 "1",
                 "--timeout",
                 "1",
-                "--no-parse-output",
             ],
         )
 
@@ -118,7 +117,6 @@ def test_missing_tui_binary_falls_back_to_plain() -> None:
                 "1",
                 "--timeout",
                 "1",
-                "--no-parse-output",
             ],
         )
 
@@ -152,7 +150,6 @@ def test_plain_mode_never_attempts_tui_launch() -> None:
                 "1",
                 "--timeout",
                 "1",
-                "--no-parse-output",
             ],
         )
 
@@ -204,7 +201,6 @@ def test_sidecar_disconnect_mid_run_continues_and_prints_completion() -> None:
                 "1",
                 "--timeout",
                 "1",
-                "--no-parse-output",
             ],
         )
 

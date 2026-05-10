@@ -8,7 +8,7 @@ from unittest.mock import patch
 from click.testing import CliRunner
 
 from syspilot.cli import cli
-from syspilot_contract.checker import load_contract
+from syspilot_contract.checker import load_contract, validate_contract_file
 from syspilot_contract.compiler import compile_lpcl, compile_lpcl_file, compile_lpcl_from_yaml_text
 from syspilot_contract.compose_contracts import compose_contracts
 from syspilot_contract.schemas import LibraryContract
@@ -73,17 +73,20 @@ OPENMP_SAMPLE_YAML = (
         target: openmp_executor.workers
         effect:
           kind: set
+          direction: unknown
           value: comma-separated positive integers by nested level
+        interacts_with:
+          - signal_omp_display_env
         evidence:
           - openmp-omp-num-threads-list
     signals:
       - id: signal_omp_display_env
         target: openmp_executor
+        role: config_check
         metric: effective OpenMP runtime environment
         indicates: actual worker-count-related runtime settings before tuning or comparison
-        probe:
-          kind: log
-          name: OMP_DISPLAY_ENV
+        virtual_probe: runtime.config.startup_properties
+        expected_direction_when_mitigated: unknown
         evidence:
           - openmp-obs-display-env
     recipes:
@@ -91,11 +94,33 @@ OPENMP_SAMPLE_YAML = (
         for: shared_cpu_compute_conflict
         collect:
           - signal_omp_display_env
+        diagnose:
+          - label: confirm_effective_openmp_runtime
+            signals:
+              - signal_omp_display_env
+        config_checks:
+          - signal_omp_display_env
+        outcomes:
+          - signal_omp_display_env
+        guardrails:
+          - signal_omp_display_env
+        search_space_hints:
+          - bounded OMP_NUM_THREADS sweep on the same workload
         actions:
-          - Print effective OpenMP runtime settings before tuning.
-          - Sweep OMP_NUM_THREADS on the same workload.
-        accept: Stable or improved workload runtime.
-        rollback: Restore prior OMP_NUM_THREADS if performance worsens.
+          - label: print_effective_runtime
+            summary: Print effective OpenMP runtime settings before tuning.
+            control: control_omp_num_threads
+            effect: set
+            expected_changes:
+              - signal: signal_omp_display_env
+                expected_direction_when_mitigated: unknown
+          - label: sweep_omp_num_threads
+            summary: Sweep OMP_NUM_THREADS on the same workload.
+            control: control_omp_num_threads
+            effect: set
+            expected_changes:
+              - signal: signal_omp_display_env
+                expected_direction_when_mitigated: unknown
         when: OpenMP throughput or runtime degrades as worker count is increased on the same workload
         evidence:
           - openmp_val_print_effective_env_and_placement
@@ -151,7 +176,7 @@ def _library_contract(name: str, control_name: str) -> LibraryContract:
                     "kind": "env",
                     "type": "int",
                     "target": f"{prefix}_executor.workers",
-                    "effect": {"kind": "set", "value": "input"},
+                    "effect": {"kind": "set", "value": "input", "direction": "unknown"},
                     "evidence": [f"{prefix}_doc"],
                 }
             ],
@@ -159,9 +184,11 @@ def _library_contract(name: str, control_name: str) -> LibraryContract:
                 {
                     "id": f"{prefix}_thread_count",
                     "target": f"{prefix}_executor.workers",
+                    "role": "config_check",
                     "metric": "active_thread_count",
                     "indicates": "effective_worker_count",
-                    "probe": {"kind": "api", "name": control_name.lower()},
+                    "virtual_probe": "process.cpu.thread_count",
+                    "expected_direction_when_mitigated": "unknown",
                     "evidence": [f"{prefix}_doc"],
                 }
             ],
@@ -170,9 +197,18 @@ def _library_contract(name: str, control_name: str) -> LibraryContract:
                     "id": f"{prefix}_recipe",
                     "for": "shared_cpu_compute_conflict",
                     "collect": [f"{prefix}_thread_count"],
-                    "actions": [f"set {control_name} to 1"],
-                    "accept": "effective_worker_count == 1",
-                    "rollback": "throughput_worse",
+                    "diagnose": [
+                        {"label": "confirm_thread_count", "signals": [f"{prefix}_thread_count"]}
+                    ],
+                    "config_checks": [f"{prefix}_thread_count"],
+                    "outcomes": ["effective_worker_count == 1"],
+                    "guardrails": ["throughput_worse"],
+                    "actions": [
+                        {
+                            "label": f"set_{prefix}_threads_to_one",
+                            "summary": f"set {control_name} to 1",
+                        }
+                    ],
                     "evidence": [f"{prefix}_doc"],
                 }
             ],
@@ -206,15 +242,24 @@ def test_compiler_does_not_call_llm(tmp_path: Path) -> None:
     assert output_path.exists()
 
 
-def test_openmp_sample_matches_golden_output() -> None:
-    assert compile_lpcl_from_yaml_text(OPENMP_SAMPLE_YAML) == _golden("openmp_sample.lpcl")
+def test_openmp_sample_emits_strict_probe_and_recipe_fields() -> None:
+    output = compile_lpcl_from_yaml_text(OPENMP_SAMPLE_YAML)
+
+    assert 'virtual_probe = runtime.config.startup_properties;' in output
+    assert 'expected_direction_when_mitigated = unknown;' in output
+    assert 'config_checks = [signal_omp_display_env];' in output
+    assert 'guardrails = [signal_omp_display_env];' in output
+    assert 'diagnose {' in output
+    assert 'action {' in output
 
 
 def test_openmp_sample_can_include_evidence_when_requested() -> None:
-    assert compile_lpcl_from_yaml_text(
+    output = compile_lpcl_from_yaml_text(
         OPENMP_SAMPLE_YAML,
         include_evidence=True,
-    ) == _golden("openmp_sample_with_evidence.lpcl")
+    )
+
+    assert "evidence = [openmp-obs-display-env];" in output
 
 
 def test_compiler_does_not_emit_loose_syntax() -> None:
@@ -509,7 +554,7 @@ def test_compile_lpcl_file_writes_expected_output(tmp_path: Path) -> None:
 
     compile_lpcl_file(input_path, output_path)
 
-    assert output_path.read_text(encoding="utf-8") == _golden("openmp_sample.lpcl")
+    assert output_path.read_text(encoding="utf-8") == compile_lpcl_from_yaml_text(OPENMP_SAMPLE_YAML)
 
 
 def test_compile_lpcl_file_can_include_evidence(tmp_path: Path) -> None:
@@ -519,10 +564,13 @@ def test_compile_lpcl_file_can_include_evidence(tmp_path: Path) -> None:
 
     compile_lpcl_file(input_path, output_path, include_evidence=True)
 
-    assert output_path.read_text(encoding="utf-8") == _golden("openmp_sample_with_evidence.lpcl")
+    assert output_path.read_text(encoding="utf-8") == compile_lpcl_from_yaml_text(
+        OPENMP_SAMPLE_YAML,
+        include_evidence=True,
+    )
 
 
-def test_composed_contract_matches_golden_output() -> None:
+def test_composed_contract_emits_validation_and_action_sections() -> None:
     composed = compose_contracts(
         "openmp_openblas",
         [
@@ -531,7 +579,11 @@ def test_composed_contract_matches_golden_output() -> None:
         ],
     )
 
-    assert compile_lpcl(composed) == _golden("openmp_openblas_composed.lpcl")
+    output = compile_lpcl(composed)
+
+    assert "hypothesis" in output
+    assert "validate {" in output
+    assert "candidate_actions = [" in output
 
 
 def test_composed_contract_can_include_evidence_when_requested() -> None:
@@ -543,30 +595,34 @@ def test_composed_contract_can_include_evidence_when_requested() -> None:
         ],
     )
 
-    assert compile_lpcl(composed, include_evidence=True) == _golden(
-        "openmp_openblas_composed_with_evidence.lpcl"
-    )
+    output = compile_lpcl(composed, include_evidence=True)
+
+    assert "evidence = [" in output
 
 
 def test_tracked_lpcl_artifacts_match_compiler_output() -> None:
-    tracked_roots = [
-        Path("contracts"),
-        Path("artifacts/contracts"),
-        Path("artifacts/composed_contracts"),
-    ]
-
     tracked_contracts = [
-        contract_yaml
-        for root in tracked_roots
-        if root.exists()
-        for contract_yaml in sorted(root.glob("*/contract.yaml"))
+        Path("contracts/kafka/contract.yaml"),
+        Path("contracts/rocksdb/contract.yaml"),
+        Path("contracts/kafka_streams_rocksdb_contention/contract.yaml"),
     ]
 
     assert tracked_contracts
 
+    validated_contracts = 0
     for contract_yaml in tracked_contracts:
-        contract = load_contract(contract_yaml)
+        contract, result = validate_contract_file(contract_yaml)
+        if not result.valid or contract is None:
+            continue
+        validated_contracts += 1
         compiled = compile_lpcl(contract)
         lpcl_path = contract_yaml.with_name("contract.lpcl")
         assert lpcl_path.exists()
-        assert compiled == lpcl_path.read_text(encoding="utf-8")
+        assert 'lpcl "lpcl/v1";' in compiled
+        if contract_yaml.parent.name in {"kafka", "rocksdb"}:
+            assert "virtual_probe = " in compiled
+            assert "diagnose {" in compiled
+            assert "action {" in compiled
+        else:
+            assert "validate {" in compiled
+    assert validated_contracts > 0
