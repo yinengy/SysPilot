@@ -41,6 +41,11 @@ from syspilot.core.openai_auth import (
 from syspilot.profiling import ProfilingManager
 from syspilot.skills import SkillRegistry
 from syspilot.ui.events import is_critical_event
+from syspilot.toolbox_runtime import (
+    extract_declared_virtual_probes,
+    finish_toolbox_probe_sessions,
+    start_toolbox_probe_sessions,
+)
 from syspilot.skills.builtin import (
     DynamicScriptSkill,
     StraceAnalyzerSkill,
@@ -1666,6 +1671,29 @@ def _print_profile_artifact_summary(
     if target_pids:
         sink.print(f"  Profiling targets: {target_pids} (primary={primary_pid})")
 
+    cgroup_memory = profiling_json.get("cgroup_memory_evidence", {}) if profiling_json else {}
+    if isinstance(cgroup_memory, dict) and cgroup_memory.get("control_group"):
+        memory_events = (
+            cgroup_memory.get("memory_events", {})
+            if isinstance(cgroup_memory.get("memory_events"), dict)
+            else {}
+        )
+        sink.print(
+            "  Cgroup memory envelope: "
+            f"limit={_format_bytes_human(cast(int | None, cgroup_memory.get('effective_limit_bytes')))} "
+            f"current={_format_bytes_human(cast(int | None, cgroup_memory.get('current_bytes')))} "
+            f"peak={_format_bytes_human(cast(int | None, cgroup_memory.get('peak_bytes')))} "
+            f"headroom={_format_bytes_human(cast(int | None, cgroup_memory.get('min_headroom_bytes')))} "
+            f"status={cgroup_memory.get('status', 'unknown')}"
+        )
+        sink.print(
+            "  Cgroup memory signals: "
+            f"high={memory_events.get('high', 0)} "
+            f"max={memory_events.get('max', 0)} "
+            f"oom={memory_events.get('oom', 0)} "
+            f"oom_kill={memory_events.get('oom_kill', 0)}"
+        )
+
     contract_validation = (
         profiling_json.get("contract_hypothesis_validation", {}) if profiling_json else {}
     )
@@ -1913,6 +1941,7 @@ def _build_contract_hypothesis_validation_script(
             "runtime_output": profiling_json.get("runtime_output", {}),
             "refined_runtime_maps": profiling_json.get("refined_runtime_maps", {}),
             "collect_profile_data": profiling_json.get("collect_profile_data", {}),
+            "virtual_probe_results": profiling_json.get("virtual_probe_results", {}),
         },
         "combined_output": (stdout or "") + ("\n" + stderr if stderr else ""),
         "report_env": report_env,
@@ -1927,6 +1956,7 @@ def _build_contract_hypothesis_validation_script(
         "runtime_output = profiling.get('runtime_output', {}) if isinstance(profiling, dict) else {}\n"
         "refined_runtime_maps = profiling.get('refined_runtime_maps', {}) if isinstance(profiling, dict) else {}\n"
         "collect_profile_data = profiling.get('collect_profile_data', {}) if isinstance(profiling, dict) else {}\n"
+        "probe_results = profiling.get('virtual_probe_results', {}) if isinstance(profiling, dict) else {}\n"
         "cpu_collector = collect_profile_data.get('cpu', {}) if isinstance(collect_profile_data, dict) else {}\n"
         "cpu_data = cpu_collector.get('data', {}) if isinstance(cpu_collector, dict) else {}\n"
         "memory_collector = collect_profile_data.get('memory', {}) if isinstance(collect_profile_data, dict) else {}\n"
@@ -1963,53 +1993,17 @@ def _build_contract_hypothesis_validation_script(
         "        'excerpt': [],\n"
         "    }\n"
         "    lines = combined_output.splitlines()\n"
+        "    probe_result = probe_results.get(virtual_probe, {}) if isinstance(probe_results, dict) else {}\n"
+        "    if isinstance(probe_result, dict) and probe_result:\n"
+        "        result['observed'] = bool(probe_result.get('observed', False))\n"
+        "        result['source'] = str(probe_result.get('source', 'toolbox_script'))\n"
+        "        result['value'] = probe_result.get('value')\n"
+        "        excerpt = probe_result.get('excerpt', [])\n"
+        "        result['excerpt'] = excerpt[:8] if isinstance(excerpt, list) else []\n"
+        "        if result['observed'] or result['source'] in ('unavailable', 'probe_error', 'os_missing', 'runtime_output_missing'):\n"
+        "            return result\n"
         "    terms = [virtual_probe.lower(), str(signal.get('metric', '')).lower(), str(signal.get('indicates', '')).lower()]\n"
         "    searchable_terms = [term for term in terms if term]\n"
-        "    if virtual_probe in ('runtime.config.startup_properties', 'runtime.config.startup_profile'):\n"
-        "        matches = [line.strip() for line in lines if any(term in line.lower() for term in searchable_terms)]\n"
-        "        result['observed'] = bool(matches)\n"
-        "        result['source'] = 'runtime_output' if matches else 'runtime_output_missing'\n"
-        "        result['value'] = matches[:8] if matches else None\n"
-        "        result['excerpt'] = matches[:8]\n"
-        "        return result\n"
-        "    if virtual_probe == 'cgroup.memory.events.high':\n"
-        "        value = refined_runtime_maps.get('memory.events.high')\n"
-        "        if value is None:\n"
-        "            value = refined_runtime_maps.get('memory.events')\n"
-        "        result['observed'] = value is not None\n"
-        "        result['source'] = 'refined_runtime_maps' if value is not None else 'os_missing'\n"
-        "        result['value'] = value\n"
-        "        return result\n"
-        "    if virtual_probe == 'process.cpu.thread_count':\n"
-        "            value = runtime_output.get('threads_counted')\n"
-        "            if value is None:\n"
-        "                value = cpu_data.get('num_threads')\n"
-        "            result['observed'] = value is not None\n"
-        "            result['source'] = 'runtime_output.threads_counted' if runtime_output.get('threads_counted') is not None else ('collect_profile.cpu.num_threads' if cpu_data.get('num_threads') is not None else 'unsupported')\n"
-        "            result['value'] = value\n"
-        "            return result\n"
-        "    if virtual_probe == 'process.cpu.allowed_cpus':\n"
-        "            cpus_allowed = refined_runtime_maps.get('Cpus_allowed_list')\n"
-        "            value = _parse_cpu_list(cpus_allowed)\n"
-        "            result['observed'] = value is not None\n"
-        "            result['source'] = 'refined_runtime_maps.Cpus_allowed_list' if value is not None else 'unsupported'\n"
-        "            result['value'] = value\n"
-        "            return result\n"
-        "    if virtual_probe in ('process.memory.rss', 'process.memory.rss_peak'):\n"
-        "        value = refined_runtime_maps.get('process_rss')\n"
-        "        if value is None:\n"
-        "            value = memory_data.get('peak_memory_mb') or memory_data.get('rss_mb')\n"
-        "        result['observed'] = value is not None\n"
-        "        result['source'] = 'refined_runtime_maps.process_rss' if refined_runtime_maps.get('process_rss') is not None else ('collect_profile.memory' if value is not None else 'os_missing')\n"
-        "        result['value'] = value\n"
-        "        return result\n"
-        "    if virtual_probe.startswith('benchmark.'):\n"
-        "        matches = [line.strip() for line in lines if any(term in line.lower() for term in searchable_terms)]\n"
-        "        result['observed'] = bool(matches)\n"
-        "        result['source'] = 'runtime_output' if matches else 'unsupported'\n"
-        "        result['value'] = matches[:8] if matches else None\n"
-        "        result['excerpt'] = matches[:8]\n"
-        "        return result\n"
         "    if isinstance(resolved_probe, dict) and resolved_probe.get('availability') == 'unavailable':\n"
         "        result['source'] = 'unavailable'\n"
         "        return result\n"
@@ -2369,11 +2363,13 @@ def _is_env_assignment_token(token: str) -> bool:
 
 
 def _extract_inline_env_assignments(command_tokens: list[str]) -> tuple[list[str], dict[str, str]]:
-    if not command_tokens or command_tokens[0] != "env":
-        return list(command_tokens), {}
+    if not command_tokens:
+        return [], {}
 
-    idx = 1
+    saw_env_prefix = command_tokens[0] == "env"
+    idx = 1 if saw_env_prefix else 0
     env_overrides: dict[str, str] = {}
+    assignment_start = idx
     while idx < len(command_tokens) and _is_env_assignment_token(command_tokens[idx]):
         name, value = command_tokens[idx].split("=", 1)
         env_overrides[name] = value
@@ -2381,6 +2377,9 @@ def _extract_inline_env_assignments(command_tokens: list[str]) -> tuple[list[str
 
     remaining = command_tokens[idx:]
     if not remaining or remaining[0].startswith("-"):
+        return list(command_tokens), {}
+
+    if not saw_env_prefix and idx == assignment_start:
         return list(command_tokens), {}
 
     return remaining, env_overrides
@@ -3365,6 +3364,58 @@ def _format_metric_value(value: float | None) -> str:
     return f"{value:.6g}"
 
 
+def _format_bytes_human(value: int | None) -> str:
+    if value is None:
+        return "-"
+    if value < 1024:
+        return f"{value}B"
+    units = ["KiB", "MiB", "GiB", "TiB"]
+    size = float(value)
+    for unit in units:
+        size /= 1024.0
+        if size < 1024.0 or unit == units[-1]:
+            return f"{size:.1f}{unit}"
+    return f"{value}B"
+
+
+def _render_effective_memory_envelope(
+    profiling_json: dict[str, Any],
+    memory_high: str | None,
+) -> str:
+    evidence = profiling_json.get("cgroup_memory_evidence", {}) if profiling_json else {}
+    if not isinstance(evidence, dict) or not evidence.get("control_group"):
+        return f"## Spawn MemoryHigh Limit\n{memory_high or '(none)'}"
+
+    memory_events = evidence.get("memory_events", {}) if isinstance(evidence.get("memory_events"), dict) else {}
+    memory_pressure = evidence.get("memory_pressure", {}) if isinstance(evidence.get("memory_pressure"), dict) else {}
+    memory_stat = evidence.get("memory_stat", {}) if isinstance(evidence.get("memory_stat"), dict) else {}
+    pressure_some = memory_pressure.get("some", {}) if isinstance(memory_pressure.get("some"), dict) else {}
+    pressure_full = memory_pressure.get("full", {}) if isinstance(memory_pressure.get("full"), dict) else {}
+
+    return (
+        "## Effective Memory Capacity\n"
+        f"Requested MemoryHigh: {evidence.get('requested_memory_high') or '(none)'}\n"
+        f"Control group: {evidence.get('control_group') or '(unknown)'}\n"
+        f"Effective limit: {_format_bytes_human(cast(int | None, evidence.get('effective_limit_bytes')))}\n"
+        f"Current usage: {_format_bytes_human(cast(int | None, evidence.get('current_bytes')))}\n"
+        f"Peak usage: {_format_bytes_human(cast(int | None, evidence.get('peak_bytes')))}\n"
+        f"Minimum headroom: {_format_bytes_human(cast(int | None, evidence.get('min_headroom_bytes')))}\n"
+        f"Sample count: {evidence.get('sample_count', 0)}\n"
+        f"memory.events: high={memory_events.get('high', 0)} max={memory_events.get('max', 0)} "
+        f"oom={memory_events.get('oom', 0)} oom_kill={memory_events.get('oom_kill', 0)}\n"
+        f"memory.pressure.some.total={pressure_some.get('total', 0)} "
+        f"memory.pressure.full.total={pressure_full.get('total', 0)}\n"
+        f"memory.stat: pgfault={memory_stat.get('pgfault', 0)} "
+        f"pgmajfault={memory_stat.get('pgmajfault', 0)} pgscan={memory_stat.get('pgscan', 0)} "
+        f"pgsteal={memory_stat.get('pgsteal', 0)} "
+        f"workingset_refault_anon={memory_stat.get('workingset_refault_anon', 0)} "
+        f"workingset_refault_file={memory_stat.get('workingset_refault_file', 0)}\n"
+        f"Swap current: {_format_bytes_human(cast(int | None, evidence.get('swap_current_bytes')))}\n"
+        f"Status: {evidence.get('status', 'unknown')}\n"
+        "Rule: When this block is present, reason about memory against this cgroup-constrained envelope rather than host total RAM or generic process memory percentages."
+    )
+
+
 async def _run_live_profiling_pipeline(
     agent: SysPilotAgent,
     command_parts: list[str],
@@ -3416,6 +3467,18 @@ async def _run_live_profiling_pipeline(
     process_targets = _discover_related_processes(pid, max_targets=4)
     target_pids = process_targets["target_pids"]
     primary_pid = process_targets["primary_pid"]
+    requested_virtual_probes = extract_declared_virtual_probes(
+        selected_hypothesis_profiles,
+        memory_high=memory_high,
+    )
+    probe_sessions = await start_toolbox_probe_sessions(
+        requested_virtual_probes,
+        {
+            "target_pids": target_pids,
+            "primary_pid": primary_pid,
+            "memory_high": memory_high,
+        },
+    )
 
     tools_used: list[str] = []
     key_findings: list[str] = []
@@ -3621,6 +3684,44 @@ async def _run_live_profiling_pipeline(
         first_key = next(iter(per_pid_collect_profile))
         primary_collect_profile = per_pid_collect_profile[first_key]
 
+    virtual_probe_results = await finish_toolbox_probe_sessions(
+        probe_sessions,
+        {
+            "target_pids": target_pids,
+            "primary_pid": primary_pid,
+            "memory_high": memory_high,
+            "stdout": stdout,
+            "stderr": stderr,
+            "runtime_output": runtime_output,
+            "refined_runtime_maps": refined_runtime_maps,
+            "per_pid_runtime_maps": per_pid_runtime_maps,
+            "collect_profile_data": primary_collect_profile,
+            "per_pid_collect_profile": per_pid_collect_profile,
+            "process_tree_targets": process_targets,
+            "command_parts": command_parts,
+            "workdir": workdir,
+            "launch_env": env,
+        },
+    )
+    for probe_result in virtual_probe_results.values():
+        flat = probe_result.get("flat", {}) if isinstance(probe_result, dict) else {}
+        if isinstance(flat, dict) and flat:
+            refined_runtime_maps = {**refined_runtime_maps, **flat}
+
+    cgroup_probe_result = virtual_probe_results.get("cgroup.memory.events.high", {})
+    cgroup_memory_evidence = (
+        cgroup_probe_result.get("structured", {})
+        if isinstance(cgroup_probe_result, dict)
+        else {}
+    )
+    if isinstance(cgroup_memory_evidence, dict) and cgroup_memory_evidence.get("control_group"):
+        key_findings.append(
+            "cgroup memory envelope: "
+            f"status={cgroup_memory_evidence.get('status', 'unknown')} "
+            f"peak={_format_bytes_human(cast(int | None, cgroup_memory_evidence.get('peak_bytes')))} "
+            f"headroom={_format_bytes_human(cast(int | None, cgroup_memory_evidence.get('min_headroom_bytes')))}"
+        )
+
     profiling_json: dict[str, Any] = {
         "pipeline_used": True,
         "tools_used": tools_used,
@@ -3631,6 +3732,8 @@ async def _run_live_profiling_pipeline(
         "ebpf_summary": ebpf_summary,
         "refined_runtime_maps": refined_runtime_maps,
         "per_pid_runtime_maps": per_pid_runtime_maps,
+        "cgroup_memory_evidence": cgroup_memory_evidence,
+        "virtual_probe_results": virtual_probe_results,
         "runtime_output": runtime_output,
         "process_tree_targets": process_targets,
         "key_findings": key_findings,
@@ -4095,6 +4198,8 @@ async def _run_spawn_tune_loop_async(
         history_text = "\n".join(iteration_summaries[-6:]) if iteration_summaries else "(none)"
         tried_commands = [list(parts) for parts, _ in list(seen_trials)[-12:]]
 
+        memory_envelope_block = _render_effective_memory_envelope(profiling_json, memory_high)
+
         prompt = f"""Analyze this spawn-mode workload and propose the next optimization actions.
 
 ## Current Command
@@ -4103,8 +4208,7 @@ async def _run_spawn_tune_loop_async(
 ## Current Environment Overrides
 {json.dumps(current_env_overrides, indent=2, sort_keys=True) if current_env_overrides else "(none)"}
 
-## Spawn MemoryHigh Limit
-{memory_high or "(none)"}
+{memory_envelope_block}
 
 ## Current Wall Time
 {current_time:.2f}s

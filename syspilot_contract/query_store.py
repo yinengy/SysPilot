@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 from typing import Any, Mapping, cast
 
+from syspilot.toolbox_runtime import resolve_toolbox_probe
 from syspilot_contract.checker import load_contract
 from syspilot_contract.compose_contracts import compose_contracts as compose_contract_models
 from syspilot_contract.schemas import (
@@ -67,65 +68,7 @@ def _control_activation_value(control: Control) -> Any | None:
 
 
 def resolve_virtual_probe(virtual_probe: str) -> dict[str, object]:
-    probe = str(virtual_probe).strip()
-    registry: dict[str, dict[str, object]] = {
-        "cgroup.memory.events.high": {
-            "availability": "available",
-            "collector": "runtime_report",
-            "requirements": ["memory.events.high in refined runtime maps or copied run artifacts"],
-        },
-        "process.memory.rss_peak": {
-            "availability": "available",
-            "collector": "memory",
-            "requirements": ["memory collector or refined runtime maps with process RSS/peak"],
-        },
-        "process.memory.rss": {
-            "availability": "available",
-            "collector": "memory",
-            "requirements": ["memory collector or refined runtime maps with process RSS"],
-        },
-        "process.cpu.thread_count": {
-            "availability": "available",
-            "collector": "cpu",
-            "requirements": ["cpu collector thread count or runtime thread report"],
-        },
-        "process.cpu.allowed_cpus": {
-            "availability": "available",
-            "collector": "runtime_report",
-            "requirements": ["Cpus_allowed_list in refined runtime maps"],
-        },
-        "runtime.config.startup_properties": {
-            "availability": "available",
-            "collector": "runtime_output",
-            "requirements": ["workload must emit effective startup/configuration lines"],
-        },
-        "runtime.config.startup_profile": {
-            "availability": "available",
-            "collector": "runtime_output",
-            "requirements": ["workload must emit applied startup profile lines"],
-        },
-        "filesystem.directory_size": {
-            "availability": "unavailable",
-            "collector": "unavailable",
-            "requirements": ["no built-in collector yet; requires future filesystem probe"],
-        },
-    }
-    if probe.startswith("benchmark."):
-        return {
-            "virtual_probe": probe,
-            "availability": "available",
-            "collector": "runtime_output",
-            "requirements": ["workload stdout/stderr must expose the benchmark metric"],
-        }
-    resolved = registry.get(probe)
-    if resolved is None:
-        return {
-            "virtual_probe": probe,
-            "availability": "unavailable",
-            "collector": "unavailable",
-            "requirements": ["no built-in resolver registered for this virtual probe yet"],
-        }
-    return {"virtual_probe": probe, **resolved}
+    return resolve_toolbox_probe(virtual_probe)
 
 
 def _signal_payload(contract: LibraryContract, signal: Signal) -> dict[str, object]:

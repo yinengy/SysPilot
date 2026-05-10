@@ -303,6 +303,57 @@ def test_check_contract_rejects_legacy_payloads_without_migration_path(tmp_path:
     assert '"valid": false' in result.output
 
 
+def test_check_contract_rejects_missing_toolbox_probe(tmp_path: Path) -> None:
+    runner = CliRunner()
+    contract_path = tmp_path / "missing_probe.yaml"
+    contract_path.write_text(
+        dedent(
+            """
+            version: lpcl/v1
+            contract: MissingProbeDemo
+            type: library
+            components:
+              - id: worker_pool
+                kind: executor
+                attrs:
+                  workers: 4
+                evidence: [doc]
+            uses:
+              - id: cpu_use
+                resource: cpu.compute
+                by: worker_pool
+                phase: compute
+                scope: process
+                demand:
+                  dimension: workers
+                  min: 1
+                  max: 4
+                share: shared
+                evidence: [doc]
+            assumptions: []
+            controls: []
+            signals:
+              - id: missing_probe_signal
+                target: cpu.compute
+                role: resource_signal
+                metric: demo_metric
+                indicates: demo condition
+                virtual_probe: totally.missing_probe
+                expected_direction_when_mitigated: decrease
+                evidence: [doc]
+            recipes: []
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(cli, ["check-contract", str(contract_path)])
+
+    assert result.exit_code != 0
+    assert "totally.missing_probe" in result.output
+    assert "missing toolbox script" in result.output
+
+
 def test_compose_contracts_and_build_agent_context_commands(tmp_path: Path) -> None:
     runner = CliRunner()
     artifact_root = tmp_path / "artifacts"

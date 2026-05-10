@@ -225,6 +225,34 @@ def test_extract_inline_env_assignments_from_spawn_command() -> None:
     }
 
 
+def test_extract_inline_env_assignments_without_env_prefix() -> None:
+    command = [
+        "OMP_NUM_THREADS=24",
+        "OMP_PROC_BIND=false",
+        "python",
+        "worker_case.py",
+        "--workers",
+        "4",
+    ]
+
+    stripped_command, env_overrides = _extract_inline_env_assignments(command)
+
+    assert stripped_command == ["python", "worker_case.py", "--workers", "4"]
+    assert env_overrides == {
+        "OMP_NUM_THREADS": "24",
+        "OMP_PROC_BIND": "false",
+    }
+
+
+def test_extract_inline_env_assignments_without_executable_preserves_original_tokens() -> None:
+    command = ["OMP_NUM_THREADS=24", "OMP_PROC_BIND=false"]
+
+    stripped_command, env_overrides = _extract_inline_env_assignments(command)
+
+    assert stripped_command == command
+    assert env_overrides == {}
+
+
 def test_build_spawn_execution_plan_preserves_inline_env_baseline() -> None:
     base = _gmx_mdrun_base_command()
     action = {
@@ -270,6 +298,50 @@ def test_command_rewrite_with_inline_env_prefix_keeps_executable_and_merges_env_
     assert env_overrides == {
         "OMP_NUM_THREADS": "1",
         "OMP_PROC_BIND": "spread",
+    }
+    assert skipped == []
+    assert any(item.startswith("command ") for item in applied)
+
+
+def test_command_rewrite_with_bare_inline_env_prefix_keeps_executable_and_merges_env_overrides() -> None:
+    base = [
+        "/home/yyan/miniconda3/envs/agent/bin/python",
+        "run_kafka.py",
+        "--run-prefix",
+        "baseline",
+        "--num-workflows",
+        "1000",
+    ]
+    action = {
+        "config_type": "command",
+        "new_value": (
+            "BENCHMARK_COMMIT_INTERVAL_MS=10000 "
+            "BENCHMARK_STATESTORE_CACHE_MAX_BYTES=268435456 "
+            "/home/yyan/miniconda3/envs/agent/bin/python run_kafka.py "
+            "--run-prefix tuned --num-workflows 1000"
+        ),
+    }
+
+    command, env_overrides, applied, skipped = _build_spawn_execution_plan(
+        base,
+        [action],
+        base_env_overrides={
+            "BENCHMARK_COMMIT_INTERVAL_MS": "30000",
+            "BENCHMARK_STATESTORE_CACHE_MAX_BYTES": "536870912",
+        },
+    )
+
+    assert command == [
+        "/home/yyan/miniconda3/envs/agent/bin/python",
+        "run_kafka.py",
+        "--run-prefix",
+        "tuned",
+        "--num-workflows",
+        "1000",
+    ]
+    assert env_overrides == {
+        "BENCHMARK_COMMIT_INTERVAL_MS": "10000",
+        "BENCHMARK_STATESTORE_CACHE_MAX_BYTES": "268435456",
     }
     assert skipped == []
     assert any(item.startswith("command ") for item in applied)

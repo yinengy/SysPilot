@@ -30,6 +30,10 @@ from syspilot_contract.integration import write_contract_bundle
 from syspilot_contract.schemas import LibraryContract as LibraryContractDSL
 from syspilot_manual.integration import write_manual_bundle
 from syspilot_manual.schemas import LibraryManual
+from toolbox.shared.cgroup_v2 import (
+    flatten_cgroup_memory_evidence as _flatten_cgroup_memory_evidence,
+    normalize_cgroup_memory_evidence as _normalize_cgroup_memory_evidence,
+)
 
 
 FIXTURE_ROOT = Path(__file__).resolve().parents[1] / "examples" / "manual_mvp"
@@ -175,7 +179,7 @@ def _library_contract(
             ],
             "assumptions": [
                 {
-                    "id": "solo_compute_pool",
+                    "id": f"{prefix}_not_nested",
                     "resource": "cpu.compute",
                     "predicate": {"kind": "not_nested"},
                     "evidence": [f"{contract_name}_doc:chunk_001"],
@@ -183,59 +187,66 @@ def _library_contract(
             ],
             "controls": [
                 {
-                    "id": "omp_num_threads",
+                    "id": f"{prefix}_threads_control",
                     "name": control_name,
                     "kind": "env",
                     "type": "int",
                     "target": f"{prefix}_threads.workers",
-                    "effect": {"kind": "set", "value": "input"},
-                    "evidence": [f"{contract_name}_doc:chunk_001"],
-                },
-                {
-                    "id": "omp_display_env",
-                    "name": "OMP_DISPLAY_ENV",
-                    "kind": "env",
-                    "type": "enum",
-                    "target": f"{prefix}_threads",
-                    "effect": {"kind": "set", "value": "true"},
-                    "evidence": [f"{contract_name}_doc:chunk_001"],
-                },
-                {
-                    "id": "omp_display_affinity",
-                    "name": "OMP_DISPLAY_AFFINITY",
-                    "kind": "env",
-                    "type": "bool",
-                    "target": f"{prefix}_threads",
-                    "effect": {"kind": "set", "value": True},
+                    "effect": {"kind": "set", "value": "input", "direction": "unknown"},
+                    "interacts_with": [f"{prefix}_thread_count"],
                     "evidence": [f"{contract_name}_doc:chunk_001"],
                 },
             ],
             "signals": [
                 {
-                    "id": "ctx_switch_rate",
-                    "metric": "os.context_switch_rate",
-                    "target": "cpu.compute",
-                    "indicates": "contention",
-                    "probe": {"kind": "perf", "name": "perf_stat"},
+                    "id": f"{prefix}_thread_count",
+                    "target": f"{prefix}_threads.workers",
+                    "role": "config_check",
+                    "metric": "active_thread_count",
+                    "indicates": "effective_worker_count",
+                    "virtual_probe": "process.cpu.thread_count",
+                    "expected_direction_when_mitigated": "unknown",
                     "evidence": [f"{contract_name}_doc:chunk_001"],
                 },
                 {
-                    "id": "display_env_signal",
-                    "metric": "openmp.display_env",
-                    "target": f"{prefix}_threads",
-                    "indicates": "effective thread settings",
-                    "probe": {"kind": "log", "name": "OMP_DISPLAY_ENV"},
+                    "id": f"{prefix}_ctx_switch_rate",
+                    "metric": "os.context_switch_rate",
+                    "target": "cpu.compute",
+                    "role": "resource_signal",
+                    "indicates": "oversubscription",
+                    "virtual_probe": "benchmark.context_switch_rate",
+                    "expected_direction_when_mitigated": "decrease",
                     "evidence": [f"{contract_name}_doc:chunk_001"],
                 },
             ],
             "recipes": [
                 {
-                    "id": "reduce_oversubscription",
+                    "id": f"{prefix}_recipe",
                     "for": "shared_cpu_compute_conflict",
-                    "collect": ["ctx_switch_rate", "display_env_signal"],
-                    "actions": [f"decrease {control_name}"],
-                    "accept": "throughput improves",
-                    "rollback": "throughput regresses",
+                    "collect": [f"{prefix}_thread_count", f"{prefix}_ctx_switch_rate"],
+                    "diagnose": [
+                        {
+                            "label": "confirm_runtime_and_contention_signals",
+                            "signals": [f"{prefix}_thread_count", f"{prefix}_ctx_switch_rate"],
+                        }
+                    ],
+                    "config_checks": [f"{prefix}_thread_count"],
+                    "outcomes": ["throughput_not_worse"],
+                    "guardrails": [f"{prefix}_ctx_switch_rate"],
+                    "actions": [
+                        {
+                            "label": f"set_{prefix}_threads_to_one",
+                            "summary": f"set {control_name} to 1",
+                            "control": f"{prefix}_threads_control",
+                            "effect": "set",
+                            "expected_changes": [
+                                {
+                                    "signal": f"{prefix}_ctx_switch_rate",
+                                    "expected_direction_when_mitigated": "decrease",
+                                }
+                            ],
+                        }
+                    ],
                     "evidence": [f"{contract_name}_doc:chunk_001"],
                 }
             ],
@@ -855,7 +866,6 @@ def test_spawn_mode_passes_contract_hypotheses_into_first_profiling_round(tmp_pa
     assert captured_profiles
     assert {str(item["hypothesis_id"]) for item in captured_profiles[0]} == expected_ids
     assert _collect_contract_report_env(captured_profiles[0]) == expected_report_env
-    assert expected_report_env
     prompt = _DummyAgent.instances[0].prompts[0]
     assert "Contract Hypothesis Validation" in prompt
     assert next(iter(expected_ids)) in prompt
@@ -949,6 +959,83 @@ def test_spawn_mode_manual_hints_support_comma_splitting_and_escaped_commas() ->
     assert "- latency spikes appear after warmup" in prompt
 
 
+def test_spawn_mode_prompt_includes_effective_cgroup_memory_envelope() -> None:
+    runner = CliRunner()
+    _DummyAgent.instances.clear()
+
+    async def _profiled_runs(*args: object, **kwargs: object) -> dict[str, object]:
+        _ = args
+        _ = kwargs
+        return {
+            "pid": 9999,
+            "wall_time": 1.0,
+            "stdout": "runtime output",
+            "stderr": "",
+            "returncode": 0,
+            "timed_out": False,
+            "profiling_text": "profile text",
+            "profiling_json": {
+                "cgroup_memory_evidence": {
+                    "requested_memory_high": "1G",
+                    "control_group": "/user.slice/demo.scope",
+                    "effective_limit_bytes": 1073741824,
+                    "current_bytes": 805306368,
+                    "peak_bytes": 966367641,
+                    "min_headroom_bytes": 107374183,
+                    "sample_count": 8,
+                    "memory_events": {"high": 5, "max": 0, "oom": 0, "oom_kill": 0},
+                    "memory_pressure": {
+                        "some": {"total": 21},
+                        "full": {"total": 0},
+                    },
+                    "memory_stat": {
+                        "pgfault": 100,
+                        "pgmajfault": 2,
+                        "pgscan": 3,
+                        "pgsteal": 4,
+                        "workingset_refault_anon": 5,
+                        "workingset_refault_file": 6,
+                    },
+                    "swap_current_bytes": 0,
+                    "status": "pressured",
+                }
+            },
+            "tool_calls_used": 0,
+        }
+
+    with (
+        patch("syspilot.cli.SysPilotAgent", _DummyAgent),
+        patch("syspilot.cli._register_default_skills", _noop),
+        patch("syspilot.cli._register_profiling_tools", _noop),
+        patch("syspilot.cli._register_tuning_tools", _noop),
+        patch("syspilot.cli._run_live_profiling_pipeline", _profiled_runs),
+        patch("syspilot.cli._run_command", _fake_run_command),
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "tune",
+                "--ui-mode",
+                "plain",
+                "--command",
+                "echo hi",
+                "--memory-high",
+                "1G",
+                "--max-iterations",
+                "1",
+                "--timeout",
+                "1",
+            ],
+        )
+
+    assert result.exit_code == 0
+    prompt = _DummyAgent.instances[-1].prompts[0]
+    assert "Effective Memory Capacity" in prompt
+    assert "memory.events: high=5" in prompt
+    assert "memory.pressure.some.total=21" in prompt
+    assert "Rule: When this block is present" in prompt
+
+
 def test_build_spawn_profiling_env_enables_openmp_observability() -> None:
     env = _build_spawn_profiling_env({"OMP_NUM_THREADS": "8"})
     assert env is not None
@@ -1021,6 +1108,82 @@ def test_summarize_spawn_runtime_output_extracts_openmp_signals() -> None:
     assert summary["threads_counted"] == 24
     assert "OMP_PLACES" in str(summary["stdout_excerpt"])
     assert "affinity" in str(summary["affinity_excerpt"])
+
+
+def test_normalize_and_flatten_cgroup_memory_evidence() -> None:
+    evidence = _normalize_cgroup_memory_evidence(
+        requested_memory_high="1G",
+        cgroup_context={
+            "selected_path": "/user.slice/demo.scope",
+            "selected_pid": 4321,
+            "selected_target_pids": [4321, 4322],
+            "per_pid_paths": {"4321": "/user.slice/demo.scope"},
+        },
+        sample_result={
+            "sampled_peak_bytes": 900,
+            "min_headroom_bytes": 124,
+            "sample_count": 4,
+            "latest_snapshot": {
+                "cgroup_root": "/sys/fs/cgroup/user.slice/demo.scope",
+                "memory_high_bytes": 1024,
+                "memory_max_bytes": None,
+                "memory_current_bytes": 800,
+                "memory_peak_bytes": 880,
+                "memory_events": {"high": 7, "oom": 0, "oom_kill": 0},
+                "memory_pressure": {
+                    "some": {"avg10": 0.25, "total": 11},
+                    "full": {"avg10": 0.0, "total": 0},
+                },
+                "memory_stat": {"pgfault": 15, "pgsteal": 3},
+                "memory_swap_current_bytes": 64,
+                "memory_swap_events": {"high": 1},
+            },
+        },
+    )
+
+    assert evidence["status"] == "pressured"
+    assert evidence["peak_bytes"] == 900
+    assert evidence["effective_limit_bytes"] == 1024
+    flat = _flatten_cgroup_memory_evidence(cast(dict[str, object], evidence))
+    assert flat["memory.events.high"] == 7
+    assert flat["cgroup.memory.events.high"] == 7
+    assert flat["memory.pressure.some.total"] == 11
+    assert flat["memory.stat.pgfault"] == 15
+    assert flat["memory.swap.current"] == 64
+
+
+def test_normalize_cgroup_memory_evidence_keeps_zero_psi_run_healthy() -> None:
+    evidence = _normalize_cgroup_memory_evidence(
+        requested_memory_high="1G",
+        cgroup_context={
+            "selected_path": "/user.slice/demo.scope",
+            "selected_pid": 4321,
+            "selected_target_pids": [4321],
+            "per_pid_paths": {"4321": "/user.slice/demo.scope"},
+        },
+        sample_result={
+            "sampled_peak_bytes": 512,
+            "min_headroom_bytes": 512,
+            "sample_count": 2,
+            "latest_snapshot": {
+                "cgroup_root": "/sys/fs/cgroup/user.slice/demo.scope",
+                "memory_high_bytes": 1024,
+                "memory_max_bytes": None,
+                "memory_current_bytes": 512,
+                "memory_peak_bytes": 512,
+                "memory_events": {"high": 0, "max": 0, "oom": 0, "oom_kill": 0},
+                "memory_pressure": {
+                    "some": {"avg10": 0.0, "avg60": 0.0, "avg300": 0.0, "total": 0},
+                    "full": {"avg10": 0.0, "avg60": 0.0, "avg300": 0.0, "total": 0},
+                },
+                "memory_stat": {},
+                "memory_swap_current_bytes": 0,
+                "memory_swap_events": {},
+            },
+        },
+    )
+
+    assert evidence["status"] == "healthy"
 
 
 def test_spawn_mode_degrades_to_no_actions_when_llm_analysis_fails() -> None:
@@ -1645,6 +1808,91 @@ def test_live_profiling_pipeline_restores_agent_target_pid() -> None:
         assert result["stdout"] == "ok\n"
         assert callback_lines == [("stdout", "ok\n")]
         assert agent.context.target_pid == 777
+
+    asyncio.run(_run())
+
+
+def test_live_profiling_pipeline_captures_cgroup_memory_evidence() -> None:
+    agent = _ProfilingToolAgent()
+
+    class _FakeReader:
+        async def readline(self) -> bytes:
+            return b""
+
+    class _FakeProc:
+        pid = 1234
+        returncode: int | None = None
+
+        def __init__(self) -> None:
+            self.stdout = _FakeReader()
+            self.stderr = _FakeReader()
+
+        async def wait(self) -> int:
+            self.returncode = 0
+            return 0
+
+        def kill(self) -> None:
+            return None
+
+    async def _fake_start_toolbox_probe_sessions(
+        virtual_probes: list[str],
+        payload: dict[str, object],
+    ) -> dict[str, object]:
+        _ = payload
+        assert "cgroup.memory.events.high" in virtual_probes
+        return {"cgroup.memory.events.high": {"probe": "session"}}
+
+    async def _fake_finish_toolbox_probe_sessions(
+        sessions: dict[str, object],
+        payload: dict[str, object],
+    ) -> dict[str, dict[str, object]]:
+        _ = sessions
+        _ = payload
+        return {
+            "cgroup.memory.events.high": {
+                "observed": True,
+                "source": "live_cgroup_v2",
+                "value": 7,
+                "flat": {
+                    "memory.events.high": 7,
+                    "memory.pressure.some.total": 11,
+                },
+                "structured": {
+                    "control_group": "/user.slice/demo.scope",
+                    "effective_limit_bytes": 1024,
+                    "status": "pressured",
+                    "peak_bytes": 900,
+                    "min_headroom_bytes": 124,
+                },
+            }
+        }
+
+    async def _run() -> None:
+        with (
+            patch("syspilot.cli.asyncio.create_subprocess_exec", return_value=_FakeProc()),
+            patch("syspilot.cli.asyncio.sleep", new=_noop_async),
+            patch(
+                "syspilot.cli._discover_related_processes",
+                return_value={"target_pids": [1234], "primary_pid": 1234, "workers": []},
+            ),
+            patch("syspilot.cli.start_toolbox_probe_sessions", _fake_start_toolbox_probe_sessions),
+            patch("syspilot.cli.finish_toolbox_probe_sessions", _fake_finish_toolbox_probe_sessions),
+        ):
+            result = await _run_live_profiling_pipeline(
+                cast(SysPilotAgent, cast(object, agent)),
+                ["echo", "hi"],
+                timeout=1,
+                memory_high="1G",
+                hypothesis_profiles=[],
+            )
+
+        profiling_json = cast(dict[str, object], result["profiling_json"])
+        cgroup_memory = cast(dict[str, object], profiling_json["cgroup_memory_evidence"])
+        refined_runtime_maps = cast(dict[str, object], profiling_json["refined_runtime_maps"])
+        assert cgroup_memory["status"] == "pressured"
+        assert cgroup_memory["effective_limit_bytes"] == 1024
+        assert refined_runtime_maps["memory.events.high"] == 7
+        assert refined_runtime_maps["memory.pressure.some.total"] == 11
 
     asyncio.run(_run())
 

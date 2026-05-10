@@ -5,6 +5,7 @@ from pathlib import Path
 
 import yaml
 from pydantic import ValidationError
+from syspilot.toolbox_runtime import missing_toolbox_probe_issues
 from syspilot_contract.schemas import (
     AnyContract,
     ComposedContract,
@@ -121,6 +122,11 @@ def _check_library_contract(contract: LibraryContract) -> list[str]:
     issues.extend(_duplicate_id_issues("controls", [item.id for item in contract.controls]))
     issues.extend(_duplicate_id_issues("signals", [item.id for item in contract.signals]))
     issues.extend(_duplicate_id_issues("recipes", [item.id for item in contract.recipes]))
+    issues.extend(
+        missing_toolbox_probe_issues(
+            [(item.id, item.virtual_probe) for item in contract.signals],
+        )
+    )
     return issues
 
 
