@@ -13,6 +13,7 @@ Probe scripts may expose either:
 
 - `collect(payload) -> dict` for one-shot probes
 - `begin(payload) -> Any` and `finish(payload, state) -> dict` for probes that need live sampling during the run
+- optional `sample(payload, state) -> dict` for periodic mid-run sampling; if absent, SysPilot falls back to repeated `collect(payload)` calls when a mode needs live checkpoints
 
 Standard result shape:
 

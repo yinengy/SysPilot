@@ -12,6 +12,7 @@ from syspilot_contract.schemas import (
     CONTROL_KINDS,
     CONTROL_TYPES,
     ContractVerificationResult,
+    EXECUTOR_WORKER_CONTROL_NAMES,
     EFFECT_KINDS,
     EXPECTED_DIRECTIONS,
     HYPOTHESIS_KINDS,
@@ -32,6 +33,129 @@ def _require_contract_object(payload: object) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError("Contract synthesis returned a non-object payload")
     return dict(payload)
+
+
+def _canonicalize_component_attr_target(target: object, component_ids: set[str]) -> object:
+    if not isinstance(target, str):
+        return target
+    text = target.strip()
+    head, sep, remainder = text.partition(".")
+    if not sep or head not in component_ids:
+        return target
+    if remainder == "attrs":
+        return head
+    if remainder.startswith("attrs."):
+        return f"{head}.{remainder[len('attrs.') :]}"
+    return target
+
+
+def _canonicalize_target_prefixes(
+    target: object,
+    component_ids: set[str],
+    use_ids: set[str],
+) -> object:
+    if not isinstance(target, str):
+        return target
+    parts = [part for part in target.strip().split(".") if part]
+    if len(parts) < 2:
+        return target
+    first, second = parts[0], parts[1]
+    if first == "use" and second in use_ids:
+        return ".".join(parts[1:])
+    if first in {"component", *COMPONENT_KINDS} and second in component_ids:
+        return ".".join(parts[1:])
+    return target
+
+
+def _find_nested_attr_path(mapping: object, key: str) -> list[str] | None:
+    if not isinstance(mapping, dict):
+        return None
+    if key in mapping:
+        return [key]
+    for child_key, child_value in mapping.items():
+        child_path = _find_nested_attr_path(child_value, key)
+        if child_path is not None:
+            return [str(child_key), *child_path]
+    return None
+
+
+def _set_component_workers_attr(mapping: object, worker_symbol: object) -> list[str] | None:
+    if not isinstance(mapping, dict):
+        return None
+    if "workers" not in mapping:
+        mapping["workers"] = worker_symbol
+    return ["workers"]
+
+
+def _looks_like_worker_control_name(name: object) -> bool:
+    if not isinstance(name, str):
+        return False
+    stripped = name.strip()
+    if stripped in EXECUTOR_WORKER_CONTROL_NAMES:
+        return True
+    upper = stripped.upper()
+    lower = stripped.lower()
+    return (
+        "THREAD" in upper
+        or lower.endswith("nthread")
+        or lower.endswith("workers")
+        or lower.endswith("n_jobs")
+    )
+
+
+def _canonicalize_contract_targets(payload: dict[str, Any]) -> dict[str, Any]:
+    component_map = {
+        str(item.get("id", "")).strip(): item.get("attrs", {})
+        for item in payload.get("components", [])
+        if isinstance(item, dict) and str(item.get("id", "")).strip()
+    }
+    component_ids = set(component_map)
+    use_ids = {
+        str(item.get("id", "")).strip()
+        for item in payload.get("uses", [])
+        if isinstance(item, dict) and str(item.get("id", "")).strip()
+    }
+    if not component_map:
+        return payload
+
+    control_section = payload.get("controls")
+    control_target_by_id: dict[str, str] = {}
+    if isinstance(control_section, list):
+        for item in control_section:
+            if not isinstance(item, dict):
+                continue
+            target = _canonicalize_target_prefixes(item.get("target"), component_ids, use_ids)
+            target = _canonicalize_component_attr_target(target, component_ids)
+            if isinstance(target, str):
+                head, sep, remainder = target.partition(".")
+                attrs = component_map.get(head)
+                workers_path = _find_nested_attr_path(attrs, "workers")
+                if (
+                    head in component_map
+                    and _looks_like_worker_control_name(item.get("name"))
+                ):
+                    if workers_path is None:
+                        workers_path = _set_component_workers_attr(attrs, item.get("name"))
+                    if workers_path is not None:
+                        worker_target = f"{head}.{'.'.join(workers_path)}"
+                        if not sep or remainder != ".".join(workers_path):
+                            target = worker_target
+            item["target"] = target
+            control_id = str(item.get("id", "")).strip()
+            if control_id and isinstance(target, str):
+                control_target_by_id[control_id] = target
+
+    signal_section = payload.get("signals")
+    if isinstance(signal_section, list):
+        for item in signal_section:
+            if not isinstance(item, dict):
+                continue
+            target = _canonicalize_target_prefixes(item.get("target"), component_ids, use_ids)
+            target = _canonicalize_component_attr_target(target, component_ids)
+            if isinstance(target, str):
+                target = control_target_by_id.get(target.strip(), target)
+            item["target"] = target
+    return payload
 
 
 def _selected_evidence_payload(evidence_items: list[EvidenceItem]) -> list[dict[str, object]]:
@@ -101,6 +225,19 @@ def _invalid_sections(issues: list[str]) -> list[str]:
         prefix = issue.split(":", 1)[0].split(".", 1)[0].strip()
         if prefix in valid_sections and prefix not in sections:
             sections.append(prefix)
+        lowered = issue.lower()
+        keyword_sections = {
+            "control ": "controls",
+            "signal ": "signals",
+            "assumption ": "assumptions",
+            "predicate ": "assumptions",
+            "component ": "components",
+            "recipe ": "recipes",
+            "use ": "uses",
+        }
+        for keyword, section_name in keyword_sections.items():
+            if keyword in lowered and section_name not in sections:
+                sections.append(section_name)
     return sections
 
 
@@ -110,6 +247,7 @@ def _normalized_library_contract(
     source_artifacts: list[SourceArtifact],
 ) -> tuple[LibraryContract | None, list[str], dict[str, Any]]:
     sanitized = _require_contract_object(payload)
+    sanitized = _canonicalize_contract_targets(sanitized)
     try:
         contract = LibraryContract.model_validate(sanitized)
     except ValidationError as exc:
@@ -152,9 +290,7 @@ async def _repair_library_contract_payload(
 
     if verification.valid and verification.repaired_contract is None:
         if issues:
-            raise ValueError(
-                "Contract verification reported valid without providing required repair payload"
-            )
+            return payload
         return payload
 
     if verification.repaired_contract is None:

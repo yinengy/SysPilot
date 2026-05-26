@@ -8,7 +8,7 @@ Hard requirements:
 - include top-level fields: version, contract, type, components, uses, assumptions, controls, signals, recipes
 - every component, use, assumption, control, signal, and recipe must include evidence
 - omit weak claims instead of guessing
-- do not emit benchmark-wrapper variables like BENCHMARK_* unless the contract itself is explicitly for a benchmark wrapper
+- BENCHMARK_* environment controls are allowed in library contracts when they are the real fixed-workload action surface exposed to SysPilot
 
 Keep the existing LPCL structure: components, uses, assumptions, controls, signals, recipes.
 Do not invent new top-level layers.
@@ -43,11 +43,21 @@ Recipe requirements:
 
 Control guidance:
 - control.target should point to a component id, component attribute path, use id, use demand path, or a valid resource
+- component attribute paths must be written as <component>.<attr_path>, never <component>.attrs.<attr_path>
 - control.interacts_with should name related controls or signal ids when coordination matters
 - control.effect may include kind, direction, formula, value, and resource
 - worker-count controls should target executor.workers
+- if a worker-count control exists, model the controlled runtime as a component kind executor with an attrs.workers field
 - affinity controls should target cpu.placement uses or placement attributes
 - memory-budget controls should target the specific mem.capacity use or component attribute they change
+
+Signal targeting guidance:
+- config-check signals should target the configured component/use/resource path itself, never a control id
+
+Predicate guidance:
+- use predicate kind not_nested only with cpu.compute or gpu.compute
+- use predicate kind placement_compatible only with cpu.placement
+- use predicates competitors_at_most or total_at_most only when the assumption really needs an explicit numeric or symbolic value
 
 Good signal probe examples:
 - runtime.config.startup_properties

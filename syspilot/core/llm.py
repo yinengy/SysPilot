@@ -37,6 +37,10 @@ class LLMProviderError(LLMError):
 
 
 def _is_transient_exception(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    if "empty_stream" in message or "upstream stream closed before first payload" in message:
+        return True
+
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError)):
         return True
 

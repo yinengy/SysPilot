@@ -268,3 +268,52 @@ async def finish_toolbox_probe_sessions(
             }
         results[probe] = _normalize_probe_result(probe, session.resolved_probe, raw)
     return results
+
+
+async def sample_toolbox_probe_sessions(
+    sessions: dict[str, ToolboxProbeSession],
+    payload: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    results: dict[str, dict[str, Any]] = {}
+    for probe, session in sessions.items():
+        if session.module is None or session.resolved_probe.get("availability") != "available":
+            requirements = session.resolved_probe.get("requirements", [])
+            requirement_list = requirements if isinstance(requirements, list) else [requirements]
+            results[probe] = _normalize_probe_result(
+                probe,
+                session.resolved_probe,
+                {
+                    "observed": False,
+                    "source": "unavailable",
+                    "flat": {},
+                    "structured": {},
+                    "error": "; ".join(str(item) for item in requirement_list),
+                },
+            )
+            continue
+
+        try:
+            sample = getattr(session.module, "sample", None)
+            collect = getattr(session.module, "collect", None)
+            if callable(sample):
+                raw = await _maybe_await(sample(dict(payload), session.state))
+            elif callable(collect):
+                raw = await _maybe_await(collect(dict(payload)))
+            else:
+                raw = {
+                    "observed": False,
+                    "source": "unsupported",
+                    "flat": {},
+                    "structured": {},
+                    "error": "toolbox probe script does not support periodic sampling",
+                }
+        except Exception as exc:
+            raw = {
+                "observed": False,
+                "source": "probe_error",
+                "flat": {},
+                "structured": {},
+                "error": str(exc),
+            }
+        results[probe] = _normalize_probe_result(probe, session.resolved_probe, raw)
+    return results

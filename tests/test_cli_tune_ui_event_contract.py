@@ -482,6 +482,15 @@ def test_spawn_flow_final_output_uses_speedup_for_baseline_comparison() -> None:
     assert result.exit_code == 0
     assert "Wall time: 0.80s (+20.0% vs current)" in result.output
     assert "New current wall time: 0.80s (+20.0% vs previous)" in result.output
+    assert "Best found at: round 1, trial 1 (candidate trial run 1)" in result.output
+    assert (
+        "Search to best: 1 round(s), 1 candidate trial run(s), 2 profiled run(s)"
+        in result.output
+    )
+    assert (
+        "Full tuning search: 1 round(s), 1 candidate trial run(s), 2 profiled run(s)"
+        in result.output
+    )
     assert "1.25x speed up" in result.output
     assert "✓ Success! 1.25x speed up (20.0% improvement)" in result.output
     result_comparison = next(
@@ -492,6 +501,13 @@ def test_spawn_flow_final_output_uses_speedup_for_baseline_comparison() -> None:
     comparison_payload = cast(dict[str, object], result_comparison["payload"])
     assert comparison_payload["speedup"] == 1.25
     assert abs(cast(float, comparison_payload["improvement_pct"]) - 20.0) < 1e-9
+    assert comparison_payload["best_found_round"] == 1
+    assert comparison_payload["best_found_trial"] == 1
+    assert comparison_payload["best_candidate_trials_to_find"] == 1
+    assert comparison_payload["best_profiled_runs_to_find"] == 2
+    assert comparison_payload["total_rounds_executed"] == 1
+    assert comparison_payload["total_candidate_trials_executed"] == 1
+    assert comparison_payload["total_profiled_runs"] == 2
 
 
 def test_spawn_flow_primary_objective_updates_comparison_payload() -> None:
@@ -570,7 +586,11 @@ def test_spawn_flow_primary_objective_updates_comparison_payload() -> None:
     assert comparison_payload["primary_objective_mode"] == "minimize"
     assert comparison_payload["baseline_primary_objective"] == 100.0
     assert comparison_payload["tuned_primary_objective"] == 90.0
+    assert abs(cast(float, comparison_payload["primary_objective_speedup_ratio"]) - 1.1111111111111112) < 1e-9
+    assert comparison_payload["primary_objective_speedup_label"] == "better"
     assert abs(cast(float, comparison_payload["improvement_pct"]) - 10.0) < 1e-9
+    assert "✓ Success! wall time improved to 1.11x (better) with actions:" in result.output
+    assert "OMP_PROC_BIND=close" in result.output
 
 
 def test_spawn_flow_emits_next_action_in_recommendation_payload_and_output() -> None:
@@ -647,6 +667,18 @@ def test_spawn_flow_retries_candidate_after_runtime_unsupported_option() -> None
     async def _unsupported_then_success(*args: object, **kwargs: object) -> dict[str, object]:
         command = cast(list[str], args[1])
         profile_calls.append(command)
+        if len(profile_calls) == 1:
+            return {
+                "pid": 10000,
+                "wall_time": 1.0,
+                "stdout": "baseline",
+                "stderr": "",
+                "returncode": 0,
+                "timed_out": False,
+                "profiling_text": "baseline profile",
+                "profiling_json": {},
+                "tool_calls_used": 0,
+            }
         if "--badchild" in command:
             return {
                 "pid": 10001,
@@ -678,6 +710,7 @@ def test_spawn_flow_retries_candidate_after_runtime_unsupported_option() -> None
         patch("syspilot.cli._register_profiling_tools", _noop),
         patch("syspilot.cli._register_tuning_tools", _noop),
         patch("syspilot.cli._run_live_profiling_pipeline", _unsupported_then_success),
+        patch("syspilot.cli._validate_spawn_command_rewrite", return_value=[]),
     ):
         result = runner.invoke(
             cli,
@@ -699,4 +732,20 @@ def test_spawn_flow_retries_candidate_after_runtime_unsupported_option() -> None
     assert "--badchild" in profile_calls[1]
     assert profile_calls[2] == ["python3", "-u", "-V"]
     assert "Retrying without unsupported option(s): --badchild" in result.output
-
+    assert (
+        "Full tuning search: 1 round(s), 1 candidate trial run(s), 3 profiled run(s)"
+        in result.output
+    )
+    result_comparison = next(
+        record
+        for record in _CaptureEmitter.instances[-1].records
+        if record["event"] == "result.comparison"
+    )
+    comparison_payload = cast(dict[str, object], result_comparison["payload"])
+    assert comparison_payload["best_found_round"] == 1
+    assert comparison_payload["best_found_trial"] == 1
+    assert comparison_payload["best_candidate_trials_to_find"] == 1
+    assert comparison_payload["best_profiled_runs_to_find"] == 3
+    assert comparison_payload["total_rounds_executed"] == 1
+    assert comparison_payload["total_candidate_trials_executed"] == 1
+    assert comparison_payload["total_profiled_runs"] == 3

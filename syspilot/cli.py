@@ -8,9 +8,8 @@ import os
 import re
 import shlex
 import subprocess
-import sys
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -22,7 +21,6 @@ import yaml
 from rich.console import Console
 from rich.markup import escape as rich_escape
 from rich.table import Table
-from rich.panel import Panel
 
 from syspilot import __version__
 from syspilot.core.config import SysPilotConfig, LLMConfig
@@ -39,11 +37,14 @@ from syspilot.core.openai_auth import (
     wait_for_callback_code,
 )
 from syspilot.profiling import ProfilingManager
+from syspilot.prompt_budget import contract_context_json_for_prompt, profiling_json_for_prompt
+from syspilot.quick_mode import QuickModeDefaults
+from syspilot.spawn_runtime import execute_profiled_spawn_run
 from syspilot.skills import SkillRegistry
 from syspilot.ui.events import is_critical_event
 from syspilot.toolbox_runtime import (
-    extract_declared_virtual_probes,
     finish_toolbox_probe_sessions,
+    sample_toolbox_probe_sessions,
     start_toolbox_probe_sessions,
 )
 from syspilot.skills.builtin import (
@@ -61,6 +62,15 @@ from syspilot.ui.tui_sidecar import TuneTuiOrchestrator, should_wait_for_user_on
 
 console = Console()
 logger = logging.getLogger(__name__)
+DEFAULT_QUICK_MODE_DEFAULTS = QuickModeDefaults()
+
+
+async def _agent_step_for_prompt(agent: Any, prompt: str) -> Any:
+    stateless_step = getattr(agent, "step_stateless", None)
+    if callable(stateless_step):
+        typed_step = cast(Callable[..., Awaitable[Any]], stateless_step)
+        return await typed_step(prompt, include_tools=False)
+    return await agent.step(prompt)
 
 
 def _default_llm_config_path() -> Path:
@@ -538,6 +548,17 @@ def _normalize_multi_value_option(values: Sequence[str]) -> list[str]:
             normalized.append(item)
             seen.add(item)
     return normalized
+
+
+def _render_excluded_config_names(names: Sequence[str]) -> str:
+    if not names:
+        return "(none)"
+    joined = ", ".join(names)
+    return (
+        f"Keep exactly these controls unchanged: {joined}. Only these exact listed "
+        "environment variables, command-line parameters, or config controls are immutable; "
+        "related controls with different names remain tunable when supported by evidence."
+    )
 
 
 def _build_structured_context_bundle(
@@ -1197,6 +1218,14 @@ def skills() -> None:
         "values (escape literal commas as \\,)."
     ),
 )
+@click.option(
+    "--exclude-config",
+    multiple=True,
+    help=(
+        "Environment variable, command-line parameter, or config control that tune must keep unchanged. "
+        "Repeat the option or use comma-separated values (escape literal commas as \\,)."
+    ),
+)
 @click.option("--max-iterations", default=5, help="Maximum tuning iterations")
 @click.option("--dry-run/--no-dry-run", default=True, help="Show changes without applying")
 @click.option("--timeout", default=120, help="Timeout per command run in seconds")
@@ -1218,6 +1247,92 @@ def skills() -> None:
         "for common metric names."
     ),
 )
+@click.option(
+    "--quick-mode/--no-quick-mode",
+    default=False,
+    show_default=True,
+    help=(
+        "Enable quick tuning mode with one full sampled baseline, short signal-screening runs, "
+        "and capped full validation."
+    ),
+)
+@click.option(
+    "--quick-sample-interval-sec",
+    type=click.FloatRange(min=0.0, min_open=True),
+    default=DEFAULT_QUICK_MODE_DEFAULTS.sample_interval_sec,
+    show_default=True,
+    help="Quick-mode periodic probe sampling interval in seconds.",
+)
+@click.option(
+    "--quick-short-measurement-sec",
+    type=click.FloatRange(min=0.0, min_open=True),
+    default=DEFAULT_QUICK_MODE_DEFAULTS.short_measurement_sec,
+    show_default=True,
+    help="Quick-mode short-screen measurement budget in seconds.",
+)
+@click.option(
+    "--quick-full-run-ratio",
+    type=click.FloatRange(min=0.0, max=1.0),
+    default=DEFAULT_QUICK_MODE_DEFAULTS.full_run_ratio,
+    show_default=True,
+    help="Fraction of short-screen winners to promote to full validation within each signal group.",
+)
+@click.option(
+    "--quick-max-full-runs-per-group",
+    type=click.IntRange(min=1),
+    default=DEFAULT_QUICK_MODE_DEFAULTS.max_full_runs_per_group,
+    show_default=True,
+    help="Quick-mode cap on promoted full validations per checked signal group.",
+)
+@click.option(
+    "--quick-min-signal-samples",
+    type=click.IntRange(min=1),
+    default=DEFAULT_QUICK_MODE_DEFAULTS.min_signal_samples,
+    show_default=True,
+    help="Minimum baseline samples a quick-mode signal needs before it can be screened.",
+)
+@click.option(
+    "--quick-neutral-change-pct",
+    type=click.FloatRange(min=0.0),
+    default=DEFAULT_QUICK_MODE_DEFAULTS.neutral_change_pct,
+    show_default=True,
+    help="Quick-mode threshold below which signal or objective change counts as neutral.",
+)
+@click.option(
+    "--quick-significant-improvement-pct",
+    type=click.FloatRange(min=0.0),
+    default=DEFAULT_QUICK_MODE_DEFAULTS.significant_improvement_pct,
+    show_default=True,
+    help="Quick-mode full-run improvement threshold for a significant win.",
+)
+@click.option(
+    "--quick-max-windows-per-signal",
+    type=click.IntRange(min=1),
+    default=DEFAULT_QUICK_MODE_DEFAULTS.max_windows_per_signal,
+    show_default=True,
+    help="Maximum ranked abnormal windows to keep per signal during quick mode.",
+)
+@click.option(
+    "--quick-max-signal-groups",
+    type=click.IntRange(min=1),
+    default=DEFAULT_QUICK_MODE_DEFAULTS.max_signal_groups,
+    show_default=True,
+    help="Maximum ranked signal windows quick mode will check overall.",
+)
+@click.option(
+    "--quick-max-total-short-runs",
+    type=click.IntRange(min=1),
+    default=DEFAULT_QUICK_MODE_DEFAULTS.max_total_short_runs,
+    show_default=True,
+    help="Quick-mode total cap on short-screen candidate runs.",
+)
+@click.option(
+    "--quick-max-total-full-runs",
+    type=click.IntRange(min=1),
+    default=DEFAULT_QUICK_MODE_DEFAULTS.max_total_full_runs,
+    show_default=True,
+    help="Quick-mode total cap on promoted full validation runs.",
+)
 @click.pass_context
 def tune(
     ctx: click.Context,
@@ -1228,11 +1343,24 @@ def tune(
     memory_high: str | None,
     contract: tuple[str, ...],
     manual: tuple[str, ...],
+    exclude_config: tuple[str, ...],
     max_iterations: int,
     dry_run: bool,
     timeout: int,
     primary_objective: str | None,
     primary_objective_mode: str | None,
+    quick_mode: bool,
+    quick_sample_interval_sec: float,
+    quick_short_measurement_sec: float,
+    quick_full_run_ratio: float,
+    quick_max_full_runs_per_group: int,
+    quick_min_signal_samples: int,
+    quick_neutral_change_pct: float,
+    quick_significant_improvement_pct: float,
+    quick_max_windows_per_signal: int,
+    quick_max_signal_groups: int,
+    quick_max_total_short_runs: int,
+    quick_max_total_full_runs: int,
 ) -> None:
     """Iteratively tune a spawned command.
 
@@ -1251,6 +1379,7 @@ def tune(
     resolved_primary_objective_mode: str | None = None
     contract_names = _normalize_multi_value_option(contract)
     manual_hints = _normalize_multi_value_option(manual)
+    excluded_config_names = _normalize_multi_value_option(exclude_config)
     if primary_objective is not None:
         resolved_primary_objective = primary_objective.strip()
         if not resolved_primary_objective:
@@ -1269,6 +1398,20 @@ def tune(
         if not normalized_memory_high:
             sink.print("[red]Error: --memory-high cannot be empty[/red]")
             raise SystemExit(1)
+
+    quick_mode_defaults = QuickModeDefaults(
+        sample_interval_sec=quick_sample_interval_sec,
+        short_measurement_sec=quick_short_measurement_sec,
+        full_run_ratio=quick_full_run_ratio,
+        max_full_runs_per_group=quick_max_full_runs_per_group,
+        min_signal_samples=quick_min_signal_samples,
+        neutral_change_pct=quick_neutral_change_pct,
+        significant_improvement_pct=quick_significant_improvement_pct,
+        max_windows_per_signal=quick_max_windows_per_signal,
+        max_signal_groups=quick_max_signal_groups,
+        max_total_short_runs=quick_max_total_short_runs,
+        max_total_full_runs=quick_max_total_full_runs,
+    )
 
     tui_orchestrator: TuneTuiOrchestrator | None = None
     tui_sink: SwitchableOutputSink | None = None
@@ -1319,6 +1462,12 @@ def tune(
     if manual_hints:
         sink.print(f"[cyan]Using application manual hint(s): {', '.join(manual_hints)}[/cyan]")
 
+    if excluded_config_names:
+        sink.print(
+            "[cyan]Keeping config control(s) unchanged: "
+            f"{', '.join(excluded_config_names)}[/cyan]"
+        )
+
     if initial_hypothesis_profiles:
         sink.print(
             f"[cyan]Generated {len(initial_hypothesis_profiles)} contract hypothesis profile(s) at startup[/cyan]"
@@ -1349,22 +1498,45 @@ def tune(
         syspilot_logger.addHandler(logger_forward_handler)
 
     try:
-        _run_spawn_tune_loop(
-            agent,
-            command,
-            contract_names,
-            manual_hints,
-            max_iterations,
-            timeout,
-            resolved_primary_objective,
-            resolved_primary_objective_mode,
-            workdir,
-            normalized_memory_high,
-            sink,
-            event_emitter,
-            structured_context_bundle if _has_structured_context(structured_context_bundle) else None,
-            initial_hypothesis_profiles,
-        )
+        if quick_mode:
+            _run_quick_tune_loop(
+                agent=agent,
+                command=command,
+                contracts=contract_names,
+                manual_hints=manual_hints,
+                max_iterations=max_iterations,
+                timeout=timeout,
+                primary_objective=resolved_primary_objective,
+                primary_objective_mode=resolved_primary_objective_mode,
+                workdir=workdir,
+                memory_high=normalized_memory_high,
+                sink=sink,
+                event_emitter=event_emitter,
+                structured_context_bundle=(
+                    structured_context_bundle if _has_structured_context(structured_context_bundle) else None
+                ),
+                initial_hypothesis_profiles=initial_hypothesis_profiles,
+                defaults=quick_mode_defaults,
+                excluded_config_names=excluded_config_names,
+            )
+        else:
+            _run_spawn_tune_loop(
+                agent,
+                command,
+                contract_names,
+                manual_hints,
+                max_iterations,
+                timeout,
+                resolved_primary_objective,
+                resolved_primary_objective_mode,
+                workdir,
+                normalized_memory_high,
+                sink,
+                event_emitter,
+                structured_context_bundle if _has_structured_context(structured_context_bundle) else None,
+                initial_hypothesis_profiles,
+                excluded_config_names,
+            )
     finally:
         if logger_forward_handler is not None:
             syspilot_logger.removeHandler(logger_forward_handler)
@@ -2473,6 +2645,7 @@ def _retry_spawn_candidate_without_unsupported_options(
     *,
     base_env_overrides: dict[str, str] | None,
     unsupported_options: list[str],
+    excluded_config_names: Sequence[str] | None = None,
 ) -> tuple[dict[str, Any] | None, list[str]]:
     if not unsupported_options:
         return None, []
@@ -2494,6 +2667,7 @@ def _retry_spawn_candidate_without_unsupported_options(
         base_command,
         retry_actions,
         base_env_overrides=base_env_overrides,
+        excluded_config_names=excluded_config_names,
     )
     if not tuned_cmd:
         return None, removed_options
@@ -2691,6 +2865,7 @@ def _validate_spawn_command_rewrite(
         return ["command rewrite validation received an empty command"]
 
     issues: list[str] = []
+    issues.extend(_validate_wrapper_command_options(base_command, candidate_command))
 
     executable_name = Path(base_command[0]).name
     if executable_name == "llama-bench":
@@ -2849,10 +3024,89 @@ def _recommendation_next_action_display(actions: list[dict[str, Any]]) -> str:
     return preview
 
 
+def _matching_excluded_config_name(name: str, excluded_config_names: Sequence[str]) -> str | None:
+    stripped_name = name.strip()
+    if not stripped_name:
+        return None
+    comparable_name = stripped_name.lstrip("-")
+    for excluded_name in excluded_config_names:
+        stripped_excluded = str(excluded_name).strip()
+        if not stripped_excluded:
+            continue
+        if stripped_name == stripped_excluded:
+            return stripped_excluded
+        if (stripped_name.startswith("-") or stripped_excluded.startswith("-")) and (
+            comparable_name == stripped_excluded.lstrip("-")
+        ):
+            return stripped_excluded
+    return None
+
+
+def _excluded_inline_env_changes(
+    env_updates: dict[str, str],
+    base_env_overrides: dict[str, str],
+    excluded_config_names: Sequence[str],
+) -> list[str]:
+    changed: list[str] = []
+    for name, value in env_updates.items():
+        matched = _matching_excluded_config_name(name, excluded_config_names)
+        if matched is None:
+            continue
+        if base_env_overrides.get(name) == value:
+            continue
+        changed.append(name)
+    return changed
+
+
+def _excluded_env_assignments_in_tokens(
+    tokens: list[str],
+    excluded_config_names: Sequence[str],
+) -> list[str]:
+    changed: list[str] = []
+    idx = 1 if tokens and tokens[0] == "env" else 0
+    while idx < len(tokens) and _is_env_assignment_token(tokens[idx]):
+        name, _ = tokens[idx].split("=", 1)
+        if _matching_excluded_config_name(name, excluded_config_names) is not None:
+            changed.append(name)
+        idx += 1
+    return changed
+
+
+def _excluded_option_tokens_in_tokens(
+    tokens: list[str],
+    excluded_config_names: Sequence[str],
+) -> list[str]:
+    changed: list[str] = []
+    for token in tokens:
+        if not _is_option_token(token):
+            continue
+        option_name = token.split("=", 1)[0]
+        if _matching_excluded_config_name(option_name, excluded_config_names) is not None:
+            changed.append(option_name)
+    return changed
+
+
+def _excluded_command_option_changes(
+    base_command: list[str],
+    candidate_command: list[str],
+    excluded_config_names: Sequence[str],
+) -> list[str]:
+    base_options, _ = _parse_cli_command_signature(base_command)
+    candidate_options, _ = _parse_cli_command_signature(candidate_command)
+    changed: list[str] = []
+    for option_name in sorted(set(base_options) | set(candidate_options)):
+        if _matching_excluded_config_name(option_name, excluded_config_names) is None:
+            continue
+        if base_options.get(option_name) != candidate_options.get(option_name):
+            changed.append(option_name)
+    return changed
+
+
 def _build_spawn_execution_plan(
     base_command: list[str],
     actions: list[dict[str, Any]],
     base_env_overrides: dict[str, str] | None = None,
+    excluded_config_names: Sequence[str] | None = None,
 ) -> tuple[list[str], dict[str, str], list[str], list[str]]:
     if not base_command:
         return [], {}, [], ["base command was empty"]
@@ -2863,6 +3117,7 @@ def _build_spawn_execution_plan(
     env_overrides: dict[str, str] = dict(base_env_overrides or {})
     applied: list[str] = []
     skipped: list[str] = []
+    excluded_controls = list(excluded_config_names or [])
 
     for idx, action in enumerate(actions):
         config_type = str(action.get("config_type", "")).strip().lower()
@@ -2870,6 +3125,12 @@ def _build_spawn_execution_plan(
         new_value = action.get("new_value")
 
         if config_type == "env_var":
+            matched_excluded = _matching_excluded_config_name(parameter, excluded_controls)
+            if matched_excluded is not None:
+                skipped.append(
+                    f"action[{idx}] changes excluded config '{matched_excluded}'"
+                )
+                continue
             if new_value is None:
                 skipped.append(f"action[{idx}] env_var '{parameter}' missing new_value")
                 continue
@@ -2893,6 +3154,18 @@ def _build_spawn_execution_plan(
                 skipped.append(f"action[{idx}] command rewrite produced no executable tokens")
                 continue
 
+            excluded_env_changes = _excluded_inline_env_changes(
+                inline_env_overrides,
+                env_overrides,
+                excluded_controls,
+            )
+            if excluded_env_changes:
+                skipped.append(
+                    f"action[{idx}] command rewrite changes excluded config(s): "
+                    f"{', '.join(excluded_env_changes)}"
+                )
+                continue
+
             if Path(normalized_tokens[0]).name != Path(base_command[0]).name:
                 skipped.append(
                     f"action[{idx}] command replacement must keep executable '{base_command[0]}'"
@@ -2903,6 +3176,18 @@ def _build_spawn_execution_plan(
             if rewrite_issues:
                 for issue in rewrite_issues:
                     skipped.append(f"action[{idx}] {issue}")
+                continue
+
+            excluded_option_changes = _excluded_command_option_changes(
+                base_command,
+                normalized_tokens,
+                excluded_controls,
+            )
+            if excluded_option_changes:
+                skipped.append(
+                    f"action[{idx}] command rewrite changes excluded config(s): "
+                    f"{', '.join(excluded_option_changes)}"
+                )
                 continue
 
             command_tokens = normalized_tokens
@@ -2917,11 +3202,27 @@ def _build_spawn_execution_plan(
             if not tokens:
                 skipped.append(f"action[{idx}] numactl flags were empty")
                 continue
+            excluded_options = _excluded_option_tokens_in_tokens(tokens, excluded_controls)
+            if excluded_options:
+                skipped.append(
+                    f"action[{idx}] numactl changes excluded config(s): "
+                    f"{', '.join(excluded_options)}"
+                )
+                continue
             prefix_tokens.extend(["numactl", *tokens])
             applied.append(f"numactl {' '.join(tokens)}")
             continue
 
         if config_type == "command_prefix":
+            excluded_env_changes = _excluded_env_assignments_in_tokens(tokens, excluded_controls)
+            excluded_options = _excluded_option_tokens_in_tokens(tokens, excluded_controls)
+            if excluded_env_changes or excluded_options:
+                excluded_changes = [*excluded_env_changes, *excluded_options]
+                skipped.append(
+                    f"action[{idx}] command prefix changes excluded config(s): "
+                    f"{', '.join(excluded_changes)}"
+                )
+                continue
             prefix_tokens.extend(tokens)
             applied.append(f"prefix {' '.join(tokens)}")
             continue
@@ -2946,6 +3247,7 @@ def _build_spawn_candidates(
     actions: list[dict[str, Any]],
     max_candidates: int,
     base_env_overrides: dict[str, str] | None = None,
+    excluded_config_names: Sequence[str] | None = None,
 ) -> list[dict[str, Any]]:
     if max_candidates < 1:
         return []
@@ -2977,6 +3279,7 @@ def _build_spawn_candidates(
             base_command,
             action_set,
             base_env_overrides=base_env_overrides,
+            excluded_config_names=excluded_config_names,
         )
         if not tuned_cmd:
             continue
@@ -3100,6 +3403,7 @@ async def _extract_metrics_from_output(
     output: str,
     context: str = "",
 ) -> dict[str, Any]:
+    literal_metrics = _extract_literal_numeric_metrics(output)
     prompt = f"""Extract ONLY runtime performance outcome metrics from this program output. Return JSON only.
 
 {f"Context: {context}" if context else ""}
@@ -3129,9 +3433,12 @@ If no metrics found, return: {{"no_metrics": true}}
 RESPOND WITH ONLY THE JSON OBJECT, NO EXPLANATION:"""
 
     try:
-        response = await agent.step(prompt)
+        response = await _agent_step_for_prompt(agent, prompt)
     except LLMError as exc:
         logger.warning("Output metric extraction skipped after LLM failure: %s", exc)
+        if literal_metrics:
+            literal_metrics["error"] = str(exc)
+            return literal_metrics
         return {"no_metrics": True, "error": str(exc)}
 
     import re
@@ -3141,10 +3448,47 @@ RESPOND WITH ONLY THE JSON OBJECT, NO EXPLANATION:"""
         try:
             parsed = json.loads(json_match.group())
             if isinstance(parsed, dict):
-                return _normalize_metric_mapping(parsed)
+                normalized = _normalize_metric_mapping(parsed)
+                if literal_metrics:
+                    return {**literal_metrics, **normalized}
+                return normalized
         except json.JSONDecodeError:
             pass
+    if literal_metrics:
+        return literal_metrics
     return {"no_metrics": True}
+
+
+def _extract_literal_numeric_metrics(output: str) -> dict[str, Any]:
+    metrics: dict[str, Any] = {}
+    metric_tokens = (
+        "per_sec",
+        "throughput",
+        "latency",
+        "runtime",
+        "elapsed",
+        "wall_time",
+        "duration",
+        "bandwidth",
+        "ops_per_sec",
+        "bytes_per_sec",
+        "loss",
+        "accuracy",
+    )
+    metric_pattern = re.compile(
+        r'"(?P<key>[A-Za-z][A-Za-z0-9_]*)"\s*:\s*(?P<value>-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)'
+    )
+    for match in metric_pattern.finditer(output):
+        key = _normalize_metric_key(match.group("key"))
+        if not key:
+            continue
+        if not any(token in key for token in metric_tokens):
+            continue
+        try:
+            metrics[key] = float(match.group("value"))
+        except ValueError:
+            continue
+    return metrics
 
 
 def _normalize_metric_key(name: str) -> str:
@@ -3352,6 +3696,34 @@ def _compute_objective_change_pct(
     return ((reference_value - candidate_value) / abs(reference_value)) * 100
 
 
+def _compute_objective_speedup_ratio(
+    reference_value: float | None,
+    candidate_value: float | None,
+    objective_mode: str,
+) -> float | None:
+    if reference_value is None or candidate_value is None:
+        return None
+    if reference_value <= 0.0 or candidate_value <= 0.0:
+        return None
+    if objective_mode == "maximize":
+        return candidate_value / reference_value
+    return reference_value / candidate_value
+
+
+def _objective_speedup_label(ratio: float | None) -> str:
+    if ratio is None:
+        return ""
+    if abs(ratio - 1.0) <= 1e-9:
+        return "same"
+    return "better" if ratio > 1.0 else "slower"
+
+
+def _format_objective_speedup(ratio: float | None, *, unavailable: str = "-") -> str:
+    if ratio is None:
+        return unavailable
+    return f"{ratio:.2f}x ({_objective_speedup_label(ratio)})"
+
+
 def _objective_display_name(primary_objective: str | None) -> str:
     if not primary_objective:
         return "Primary Objective"
@@ -3425,370 +3797,35 @@ async def _run_live_profiling_pipeline(
     env_overrides: dict[str, str] | None = None,
     hypothesis_profiles: list[dict[str, Any]] | None = None,
     live_output_callback: Callable[[str, str], None] | None = None,
+    stop_after_seconds: float | None = None,
+    intentional_stop_reason: str = "screen_budget_reached",
+    periodic_sample_interval_s: float | None = None,
 ) -> dict[str, Any]:
-    started_at = time.monotonic()
-    selected_hypothesis_profiles = hypothesis_profiles or []
-    report_env_overrides = _collect_contract_report_env(selected_hypothesis_profiles)
-    env = _build_spawn_profiling_env(env_overrides, report_env_overrides)
-    launch_command = _wrap_spawn_command_with_memory_high(command_parts, memory_high, workdir)
-    launch_cwd = None if memory_high else workdir
-
-    proc = await asyncio.create_subprocess_exec(
-        *launch_command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=launch_cwd,
-        env=env,
-    )
-
-    async def _drain_stream(stream_name: str, stream: asyncio.StreamReader | None) -> str:
-        if stream is None:
-            return ""
-        chunks: list[str] = []
-        while True:
-            line = await stream.readline()
-            if not line:
-                break
-            text = line.decode("utf-8", errors="replace")
-            chunks.append(text)
-            if live_output_callback is not None:
-                live_output_callback(stream_name, text)
-        return "".join(chunks)
-
-    stdout_task = asyncio.create_task(_drain_stream("stdout", proc.stdout))
-    stderr_task = asyncio.create_task(_drain_stream("stderr", proc.stderr))
-
-    pid = proc.pid
-    prev_target_pid = getattr(agent.context, "target_pid", None)
-    agent.context.target_pid = pid
-
-    await asyncio.sleep(1.0)
-
-    process_targets = _discover_related_processes(pid, max_targets=4)
-    target_pids = process_targets["target_pids"]
-    primary_pid = process_targets["primary_pid"]
-    requested_virtual_probes = extract_declared_virtual_probes(
-        selected_hypothesis_profiles,
+    artifact = await execute_profiled_spawn_run(
+        agent,
+        command_parts,
+        timeout,
+        workdir=workdir,
         memory_high=memory_high,
+        env_overrides=env_overrides,
+        hypothesis_profiles=hypothesis_profiles,
+        live_output_callback=live_output_callback,
+        build_spawn_profiling_env=_build_spawn_profiling_env,
+        wrap_spawn_command_with_memory_high=_wrap_spawn_command_with_memory_high,
+        discover_related_processes=_discover_related_processes,
+        summarize_spawn_runtime_output=_summarize_spawn_runtime_output,
+        collect_contract_report_env=_collect_contract_report_env,
+        run_contract_hypothesis_validation=_run_contract_hypothesis_validation,
+        stringify_env_value=_stringify_env_value,
+        format_bytes_human=_format_bytes_human,
+        start_probe_sessions=start_toolbox_probe_sessions,
+        finish_probe_sessions=finish_toolbox_probe_sessions,
+        sample_probe_sessions=sample_toolbox_probe_sessions,
+        stop_after_seconds=stop_after_seconds,
+        intentional_stop_reason=intentional_stop_reason,
+        periodic_sample_interval_s=periodic_sample_interval_s,
     )
-    probe_sessions = await start_toolbox_probe_sessions(
-        requested_virtual_probes,
-        {
-            "target_pids": target_pids,
-            "primary_pid": primary_pid,
-            "memory_high": memory_high,
-        },
-    )
-
-    tools_used: list[str] = []
-    key_findings: list[str] = []
-    per_pid_runtime_maps: dict[str, dict[str, Any]] = {}
-    per_pid_collect_profile: dict[str, dict[str, Any]] = {}
-    collect_summaries: list[str] = []
-    agent_tool_calls = 0
-
-    for target_pid in target_pids:
-        try:
-            collect_result = await agent._execute_tool(
-                "collect_profile",
-                {
-                    "collectors": ["cpu", "memory", "process", "numa"],
-                    "pid": target_pid,
-                },
-            )
-            agent_tool_calls += 1
-            tools_used.append(f"collect_profile:{target_pid}")
-
-            if isinstance(collect_result, dict):
-                per_pid_collect_profile[str(target_pid)] = collect_result
-                summaries: list[str] = []
-                for collector_name, payload in collect_result.items():
-                    if isinstance(payload, dict) and "summary" in payload:
-                        summaries.append(f"{collector_name}: {payload['summary']}")
-                if summaries:
-                    collect_summaries.append(f"pid {target_pid}: " + " | ".join(summaries))
-        except Exception as e:
-            key_findings.append(f"collect_profile failed for pid {target_pid}: {e}")
-
-    ebpf_summary = ""
-    ebpf_data: dict[str, Any] = {}
-    try:
-        ebpf_check = await agent._execute_tool("skill_ebpf", {"action": "check_availability"})
-        agent_tool_calls += 1
-        tools_used.append("skill_ebpf.check_availability")
-        if isinstance(ebpf_check, dict):
-            ebpf_summary = str(ebpf_check.get("summary", ""))
-            raw_data = ebpf_check.get("data", {})
-            if isinstance(raw_data, dict):
-                ebpf_data = raw_data
-
-        template_name = ""
-        if ebpf_data.get("bpftrace_available"):
-            template_name = "syscall_count"
-        elif ebpf_data.get("bcc_available"):
-            template_name = "bcc_syscall_latency"
-
-        if template_name:
-            ebpf_profile = await agent._execute_tool(
-                "skill_ebpf",
-                {
-                    "action": "run_template",
-                    "template_name": template_name,
-                    "pid": primary_pid,
-                    "duration": 2,
-                },
-            )
-            agent_tool_calls += 1
-            tools_used.append(f"skill_ebpf.run_template:{template_name}:{primary_pid}")
-            if isinstance(ebpf_profile, dict):
-                profile_summary = str(ebpf_profile.get("summary", "")).strip()
-                profile_error = str(ebpf_profile.get("error", "")).strip()
-                if profile_summary:
-                    ebpf_summary = profile_summary
-                if profile_error:
-                    ebpf_summary = (
-                        f"{ebpf_summary} ({profile_error})" if ebpf_summary else profile_error
-                    )
-
-                profile_success = bool(ebpf_profile.get("success", False))
-                if (
-                    not profile_success
-                    and template_name == "syscall_count"
-                    and ebpf_data.get("bcc_available")
-                ):
-                    fallback_profile = await agent._execute_tool(
-                        "skill_ebpf",
-                        {
-                            "action": "run_template",
-                            "template_name": "bcc_syscall_latency",
-                            "pid": primary_pid,
-                            "duration": 2,
-                        },
-                    )
-                    agent_tool_calls += 1
-                    tools_used.append(f"skill_ebpf.run_template:bcc_syscall_latency:{primary_pid}")
-                    if isinstance(fallback_profile, dict):
-                        fallback_summary = str(fallback_profile.get("summary", "")).strip()
-                        fallback_error = str(fallback_profile.get("error", "")).strip()
-                        fallback_text = fallback_summary
-                        if fallback_error:
-                            fallback_text = (
-                                f"{fallback_text} ({fallback_error})"
-                                if fallback_text
-                                else fallback_error
-                            )
-                        if fallback_text:
-                            ebpf_summary = f"{ebpf_summary} | fallback: {fallback_text}"
-    except Exception as e:
-        key_findings.append(f"ebpf profiling failed: {e}")
-
-    processor_script = (
-        "import json\n"
-        "data = {}\n"
-        "line_count = 0\n"
-        "for line in raw_data.splitlines():\n"
-        "    line_count += 1\n"
-        "    if ':' not in line:\n"
-        "        continue\n"
-        "    key, value = line.split(':', 1)\n"
-        "    key = key.strip()\n"
-        "    value = value.strip()\n"
-        "    if key in {'Name', 'State', 'Threads', 'Cpus_allowed_list', 'Mems_allowed_list', 'VmRSS', 'voluntary_ctxt_switches', 'nonvoluntary_ctxt_switches'}:\n"
-        "        data[key] = value\n"
-        "data['line_count'] = line_count\n"
-        "print(json.dumps(data))\n"
-    )
-
-    for target_pid in target_pids:
-        try:
-            capture_result = await agent._execute_tool(
-                "skill_data_processor",
-                {
-                    "action": "capture",
-                    "command": f"cat /proc/{target_pid}/status",
-                },
-            )
-            agent_tool_calls += 1
-            tools_used.append(f"skill_data_processor.capture:{target_pid}")
-
-            capture_id = None
-            if isinstance(capture_result, dict):
-                capture_data = capture_result.get("data", {})
-                if isinstance(capture_data, dict):
-                    capture_id = capture_data.get("capture_id")
-
-            if capture_id:
-                process_result = await agent._execute_tool(
-                    "skill_data_processor",
-                    {
-                        "action": "process",
-                        "capture_id": capture_id,
-                        "script": processor_script,
-                    },
-                )
-                agent_tool_calls += 1
-                tools_used.append(f"skill_data_processor.process:{target_pid}")
-
-                if isinstance(process_result, dict):
-                    output = process_result.get("output", "")
-                    try:
-                        refined = json.loads(output.strip()) if output else {}
-                        if isinstance(refined, dict):
-                            per_pid_runtime_maps[str(target_pid)] = refined
-                    except json.JSONDecodeError:
-                        key_findings.append(
-                            f"status parsing returned invalid JSON for pid {target_pid}"
-                        )
-        except Exception as e:
-            key_findings.append(f"dynamic status pipeline failed for pid {target_pid}: {e}")
-
-    timed_out = False
-    try:
-        await asyncio.wait_for(proc.wait(), timeout=timeout)
-        rc = proc.returncode if proc.returncode is not None else 0
-    except asyncio.TimeoutError:
-        proc.kill()
-        try:
-            await proc.wait()
-        except ProcessLookupError:
-            pass
-        rc = -1
-        timed_out = True
-
-    stdout = await stdout_task
-    stderr = await stderr_task
-    if timed_out:
-        timeout_message = "Command timed out during profiling pipeline"
-        stderr = f"{stderr}\n{timeout_message}".strip() if stderr else timeout_message
-
-    wall = float(timeout) if timed_out else (time.monotonic() - started_at)
-    runtime_output = _summarize_spawn_runtime_output(stdout, stderr)
-    workers = process_targets.get("workers", [])
-    if workers:
-        heavy_workers = ", ".join(
-            f"pid {worker.get('pid')} cpu={worker.get('cpu_percent')}% rss={worker.get('rss_mb')}MB"
-            for worker in workers[:3]
-        )
-        key_findings.append(f"worker-heavy profiling targets: {heavy_workers}")
-
-    if not key_findings:
-        key_findings.append("profiling pipeline executed")
-
-    refined_runtime_maps = per_pid_runtime_maps.get(str(primary_pid), {})
-    if not refined_runtime_maps and per_pid_runtime_maps:
-        first_key = next(iter(per_pid_runtime_maps))
-        refined_runtime_maps = per_pid_runtime_maps[first_key]
-
-    primary_collect_profile = per_pid_collect_profile.get(str(primary_pid), {})
-    if not primary_collect_profile and per_pid_collect_profile:
-        first_key = next(iter(per_pid_collect_profile))
-        primary_collect_profile = per_pid_collect_profile[first_key]
-
-    virtual_probe_results = await finish_toolbox_probe_sessions(
-        probe_sessions,
-        {
-            "target_pids": target_pids,
-            "primary_pid": primary_pid,
-            "memory_high": memory_high,
-            "stdout": stdout,
-            "stderr": stderr,
-            "runtime_output": runtime_output,
-            "refined_runtime_maps": refined_runtime_maps,
-            "per_pid_runtime_maps": per_pid_runtime_maps,
-            "collect_profile_data": primary_collect_profile,
-            "per_pid_collect_profile": per_pid_collect_profile,
-            "process_tree_targets": process_targets,
-            "command_parts": command_parts,
-            "workdir": workdir,
-            "launch_env": env,
-        },
-    )
-    for probe_result in virtual_probe_results.values():
-        flat = probe_result.get("flat", {}) if isinstance(probe_result, dict) else {}
-        if isinstance(flat, dict) and flat:
-            refined_runtime_maps = {**refined_runtime_maps, **flat}
-
-    cgroup_probe_result = virtual_probe_results.get("cgroup.memory.events.high", {})
-    cgroup_memory_evidence = (
-        cgroup_probe_result.get("structured", {})
-        if isinstance(cgroup_probe_result, dict)
-        else {}
-    )
-    if isinstance(cgroup_memory_evidence, dict) and cgroup_memory_evidence.get("control_group"):
-        key_findings.append(
-            "cgroup memory envelope: "
-            f"status={cgroup_memory_evidence.get('status', 'unknown')} "
-            f"peak={_format_bytes_human(cast(int | None, cgroup_memory_evidence.get('peak_bytes')))} "
-            f"headroom={_format_bytes_human(cast(int | None, cgroup_memory_evidence.get('min_headroom_bytes')))}"
-        )
-
-    profiling_json: dict[str, Any] = {
-        "pipeline_used": True,
-        "tools_used": tools_used,
-        "target_pids": target_pids,
-        "primary_pid": primary_pid,
-        "collect_profile_summary": " | ".join(collect_summaries)[:1800],
-        "collect_profile_data": primary_collect_profile,
-        "ebpf_summary": ebpf_summary,
-        "refined_runtime_maps": refined_runtime_maps,
-        "per_pid_runtime_maps": per_pid_runtime_maps,
-        "cgroup_memory_evidence": cgroup_memory_evidence,
-        "virtual_probe_results": virtual_probe_results,
-        "runtime_output": runtime_output,
-        "process_tree_targets": process_targets,
-        "key_findings": key_findings,
-    }
-
-    if selected_hypothesis_profiles:
-        (
-            validation_result,
-            validation_tool_calls,
-            validation_tools,
-        ) = await _run_contract_hypothesis_validation(
-            agent,
-            selected_hypothesis_profiles,
-            profiling_json,
-            stdout,
-            stderr,
-            report_env_overrides,
-            {
-                **(
-                    {key: _stringify_env_value(value) for key, value in env_overrides.items()}
-                    if env_overrides
-                    else {}
-                ),
-                **report_env_overrides,
-            },
-        )
-        agent_tool_calls += validation_tool_calls
-        tools_used.extend(validation_tools)
-        profiling_json["tools_used"] = tools_used
-        profiling_json["contract_hypothesis_validation"] = validation_result
-        if validation_result.get("profiles"):
-            key_findings.append(
-                f"contract-guided validation evaluated {len(validation_result.get('profiles', []))} hypothesis profile(s)"
-            )
-        elif validation_result.get("error"):
-            key_findings.append(
-                f"contract-guided validation unavailable: {validation_result.get('error')}"
-            )
-        profiling_json["key_findings"] = key_findings
-    profiling_text = json.dumps(profiling_json)
-
-    result = {
-        "pid": pid,
-        "launch_command": launch_command,
-        "wall_time": wall,
-        "stdout": stdout,
-        "stderr": stderr,
-        "returncode": rc,
-        "timed_out": timed_out,
-        "profiling_text": profiling_text,
-        "profiling_json": profiling_json,
-        "tool_calls_used": agent_tool_calls,
-    }
-    agent.context.target_pid = prev_target_pid
-    return result
+    return artifact.to_dict()
 
 
 async def _run_spawn_tune_loop_async(
@@ -3806,6 +3843,7 @@ async def _run_spawn_tune_loop_async(
     event_emitter: _TuneEmitter | None = None,
     structured_context_bundle: dict[str, object] | None = None,
     initial_hypothesis_profiles: list[dict[str, Any]] | None = None,
+    excluded_config_names: Sequence[str] | None = None,
 ) -> None:
     if sink is None:
         sink = make_output_sink(ui_mode=TuneUIMode.PLAIN, console=console)
@@ -3848,6 +3886,7 @@ async def _run_spawn_tune_loop_async(
 
     loaded_contract_names = list(contracts)
     manual_hint_list = list(manual_hints)
+    excluded_config_list = list(excluded_config_names or [])
     loaded_manual_names = sorted(agent.context.loaded_manuals.keys())
 
     _emit_tune_event(
@@ -3863,6 +3902,7 @@ async def _run_spawn_tune_loop_async(
             "loaded_contracts": loaded_contract_names,
             "loaded_manuals": loaded_manual_names,
             "manual_hints": manual_hint_list,
+            "excluded_config_names": excluded_config_list,
             "baseline_env_overrides": dict(inline_env_overrides),
             "startup_hypothesis_profile_count": len(initial_hypothesis_profiles or []),
             "primary_objective_query": primary_objective or "",
@@ -3886,11 +3926,12 @@ async def _run_spawn_tune_loop_async(
     )
 
     contract_content = (
-        json.dumps(structured_context_bundle, indent=2)
+        contract_context_json_for_prompt(structured_context_bundle)
         if structured_context_bundle
         else ""
     )
     manual_hint_content = _render_spawn_manual_hints(manual_hint_list)
+    excluded_config_content = _render_excluded_config_names(excluded_config_list)
 
     benchmark_deterministic = _is_env_flag_enabled("SYSPILOT_BENCH_DETERMINISTIC")
     if benchmark_deterministic:
@@ -4157,17 +4198,15 @@ async def _run_spawn_tune_loop_async(
     current_objective_value = baseline_objective_value
 
     best_time = baseline_time
-    best_stdout = baseline_stdout
-    best_stderr = baseline_stderr
     best_label = "(none)"
     best_command_parts = list(cmd_parts)
     best_env_overrides: dict[str, str] = {}
-    best_profiling_text = baseline_profiling_text
-    best_profiling_json = baseline_profiling_json
-    best_contract_validation = baseline_contract_validation
-    best_profile_artifacts = dict(baseline_artifacts)
     best_metrics = dict(baseline_metrics)
     best_objective_value = baseline_objective_value
+    best_found_round = 0
+    best_found_trial = 0
+    best_candidate_trials_to_find = 0
+    best_profiled_runs_to_find = 1
 
     seen_trials: set[tuple[tuple[str, ...], tuple[tuple[str, str], ...]]] = {
         _command_key(current_command_parts, current_env_overrides)
@@ -4177,8 +4216,12 @@ async def _run_spawn_tune_loop_async(
     convergence_patience = 2
     min_improvement_pct = 1.0
     active_hypothesis_refs: list[str] = []
+    total_rounds_executed = 0
+    total_candidate_trials_executed = 0
+    total_profiled_runs = 1
 
     for iteration in range(1, max_iterations + 1):
+        total_rounds_executed = iteration
         _emit_tune_event(
             event_emitter,
             "phase.started",
@@ -4208,6 +4251,9 @@ async def _run_spawn_tune_loop_async(
 ## Current Environment Overrides
 {json.dumps(current_env_overrides, indent=2, sort_keys=True) if current_env_overrides else "(none)"}
 
+## Immutable Controls
+{excluded_config_content}
+
 {memory_envelope_block}
 
 ## Current Wall Time
@@ -4229,10 +4275,10 @@ async def _run_spawn_tune_loop_async(
 {json.dumps(tried_commands)}
 
 ## Refined Profiling Evidence
-{json.dumps(profiling_json, indent=2) if profiling_json else profiling_text[:2500]}
+{profiling_json_for_prompt(profiling_json) if profiling_json else profiling_text[:2500]}
 
 ## Contract Hypothesis Validation
-{json.dumps(contract_validation, indent=2) if contract_validation else "(No contract-guided validation findings)"}
+{profiling_json_for_prompt(contract_validation) if contract_validation else "(No contract-guided validation findings)"}
 
 ## Loaded Contract Context
 {contract_content if contract_content else "(No contract context provided)"}
@@ -4246,6 +4292,7 @@ async def _run_spawn_tune_loop_async(
 - Contract hypothesis validation, when present, is runtime-generated structured evidence. Prefer it over inferring raw DSL semantics yourself.
 - The current accepted run was already profiled during execution, and candidate runs in this iteration will also be profiled during execution.
 - Avoid recommending exact commands already tried.
+- Keep only the exact immutable controls listed above unchanged; do not treat same-library or related controls as immutable unless their exact names are listed.
 - Keep workload-defining arguments fixed (model/input/token counts/repetitions/output mode) so comparisons stay fair.
 - Recommend only options that are valid for the target executable.
 - If evidence is insufficient, return no actions.
@@ -4287,7 +4334,7 @@ async def _run_spawn_tune_loop_async(
         else:
             analysis_started_at = time.time()
             try:
-                response = await agent.step(prompt)
+                response = await _agent_step_for_prompt(agent, prompt)
             except LLMError as exc:
                 analysis_wall_time_s = time.time() - analysis_started_at
                 logger.warning("Spawn-mode tuning analysis unavailable: %s", exc)
@@ -4393,6 +4440,7 @@ async def _run_spawn_tune_loop_async(
             actions,
             max_candidates=max_iterations,
             base_env_overrides=current_env_overrides,
+            excluded_config_names=excluded_config_list,
         )
         candidate_plans = [
             candidate
@@ -4454,10 +4502,14 @@ async def _run_spawn_tune_loop_async(
         iteration_best_profile_artifacts = dict(current_profile_artifacts)
         iteration_best_metrics = dict(current_metrics)
         iteration_best_objective_value = current_objective_value
+        iteration_best_trial = 0
+        iteration_best_candidate_trials_to_find = total_candidate_trials_executed
+        iteration_best_profiled_runs_to_find = total_profiled_runs
         successful_trials = 0
         non_improving_trials = 0
 
         for idx, candidate in enumerate(candidate_plans, start=1):
+            total_candidate_trials_executed += 1
             trial_plan = candidate
             trial_cmd = trial_plan["cmd"]
             trial_env = trial_plan["env_overrides"]
@@ -4521,6 +4573,7 @@ async def _run_spawn_tune_loop_async(
                     hypothesis_profiles=candidate_hypothesis_profiles,
                     live_output_callback=_plain_live_output_callback,
                 )
+                total_profiled_runs += 1
                 trial_time = trial_artifacts["wall_time"]
                 trial_stdout = trial_artifacts.get("stdout", "")
                 trial_stderr = trial_artifacts.get("stderr", "")
@@ -4570,6 +4623,7 @@ async def _run_spawn_tune_loop_async(
                     current_command_parts,
                     cast(list[dict[str, Any]], trial_actions),
                     base_env_overrides=current_env_overrides,
+                    excluded_config_names=excluded_config_list,
                     unsupported_options=_extract_runtime_unsupported_options(
                         trial_stdout,
                         trial_stderr,
@@ -4738,6 +4792,9 @@ async def _run_spawn_tune_loop_async(
                 iteration_best_profile_artifacts = dict(trial_artifacts)
                 iteration_best_metrics = dict(trial_metrics)
                 iteration_best_objective_value = trial_objective_value
+                iteration_best_trial = idx
+                iteration_best_candidate_trials_to_find = total_candidate_trials_executed
+                iteration_best_profiled_runs_to_find = total_profiled_runs
                 if current_change_pct >= min_improvement_pct:
                     non_improving_trials = 0
                 else:
@@ -4824,17 +4881,15 @@ async def _run_spawn_tune_loop_async(
 
             if best_candidate_wins:
                 best_time = current_time
-                best_stdout = current_stdout
-                best_stderr = current_stderr
                 best_label = iteration_best_label
                 best_command_parts = list(current_command_parts)
                 best_env_overrides = dict(current_env_overrides)
-                best_profiling_text = current_profiling_text
-                best_profiling_json = current_profiling_json
-                best_contract_validation = current_contract_validation
-                best_profile_artifacts = dict(current_profile_artifacts)
                 best_metrics = dict(current_metrics)
                 best_objective_value = current_objective_value
+                best_found_round = iteration
+                best_found_trial = iteration_best_trial
+                best_candidate_trials_to_find = iteration_best_candidate_trials_to_find
+                best_profiled_runs_to_find = iteration_best_profiled_runs_to_find
 
             if improvement_pct >= min_improvement_pct:
                 stagnation_iterations = 0
@@ -4888,15 +4943,28 @@ async def _run_spawn_tune_loop_async(
 
     action_label = best_label
     tuned_time = best_time
-    tuned_stdout = best_stdout
-    tuned_stderr = best_stderr
     if action_label == "(none)":
         sink.print("  No tuned candidate outperformed baseline; keeping baseline configuration")
+        sink.print("  Best found at: baseline (round 0 before candidate trials)")
     else:
         sink.print(f"  Selected best candidate: {action_label}")
+        sink.print(
+            f"  Best found at: round {best_found_round}, trial {best_found_trial} "
+            f"(candidate trial run {best_candidate_trials_to_find})"
+        )
         sink.print(f"  Best command: {' '.join(best_command_parts)}")
         if best_env_overrides:
             sink.print(f"  Best environment overrides: {best_env_overrides}")
+    sink.print(
+        f"  Search to best: {best_found_round} round(s), "
+        f"{best_candidate_trials_to_find} candidate trial run(s), "
+        f"{best_profiled_runs_to_find} profiled run(s) including baseline/retries"
+    )
+    sink.print(
+        f"  Full tuning search: {total_rounds_executed} round(s), "
+        f"{total_candidate_trials_executed} candidate trial run(s), "
+        f"{total_profiled_runs} profiled run(s) including baseline/retries"
+    )
 
     tuned_metrics: dict[str, Any] = dict(best_metrics)
     tuned_objective_value = best_objective_value
@@ -4913,12 +4981,20 @@ async def _run_spawn_tune_loop_async(
         ((baseline_time - tuned_time) / baseline_time) * 100 if baseline_time > 0 else 0
     )
     primary_improvement_pct: float | None = None
+    primary_speedup_ratio: float | None = None
+    primary_speedup_label = ""
     if primary_objective and baseline_objective_value is not None and tuned_objective_value is not None:
         primary_improvement_pct = _compute_objective_change_pct(
             baseline_objective_value,
             tuned_objective_value,
             cast(str, primary_objective_mode),
         )
+        primary_speedup_ratio = _compute_objective_speedup_ratio(
+            baseline_objective_value,
+            tuned_objective_value,
+            cast(str, primary_objective_mode),
+        )
+        primary_speedup_label = _objective_speedup_label(primary_speedup_ratio)
     reported_improvement_pct = (
         primary_improvement_pct if primary_improvement_pct is not None else wall_time_improvement_pct
     )
@@ -4939,6 +5015,15 @@ async def _run_spawn_tune_loop_async(
             "tuned_primary_objective": tuned_objective_value,
             "wall_time_improvement_pct": wall_time_improvement_pct,
             "primary_objective_improvement_pct": primary_improvement_pct,
+            "primary_objective_speedup_ratio": primary_speedup_ratio,
+            "primary_objective_speedup_label": primary_speedup_label,
+            "best_found_round": best_found_round,
+            "best_found_trial": best_found_trial,
+            "best_candidate_trials_to_find": best_candidate_trials_to_find,
+            "best_profiled_runs_to_find": best_profiled_runs_to_find,
+            "total_rounds_executed": total_rounds_executed,
+            "total_candidate_trials_executed": total_candidate_trials_executed,
+            "total_profiled_runs": total_profiled_runs,
         },
     )
 
@@ -4954,7 +5039,7 @@ async def _run_spawn_tune_loop_async(
                 _objective_display_name(primary_objective),
                 _format_metric_value(baseline_objective_value),
                 _format_metric_value(tuned_objective_value),
-                f"{cast(float, primary_improvement_pct):+.1f}%",
+                _format_objective_speedup(primary_speedup_ratio),
             ]
         )
 
@@ -5018,8 +5103,8 @@ async def _run_spawn_tune_loop_async(
     if reported_improvement_pct > 5:
         if primary_improvement_pct is not None:
             sink.print(
-                f"\n[bold green]✓ Success! {_objective_display_name(primary_objective)} improved by "
-                f"{primary_improvement_pct:.1f}% with actions: {action_label}[/bold green]"
+                f"\n[bold green]✓ Success! {_objective_display_name(primary_objective)} improved to "
+                f"{_format_objective_speedup(primary_speedup_ratio, unavailable='ratio unavailable')} with actions: {action_label}[/bold green]"
             )
         else:
             sink.print(
@@ -5029,7 +5114,7 @@ async def _run_spawn_tune_loop_async(
     elif reported_improvement_pct > 0:
         if primary_improvement_pct is not None:
             sink.print(
-                f"\n[yellow]Modest primary-objective improvement ({primary_improvement_pct:.1f}%)[/yellow]"
+                f"\n[yellow]Modest primary-objective improvement ({_format_objective_speedup(primary_speedup_ratio, unavailable='ratio unavailable')})[/yellow]"
             )
         else:
             sink.print(
@@ -5037,7 +5122,12 @@ async def _run_spawn_tune_loop_async(
             )
         run_status = "modest_improvement"
     else:
-        sink.print(f"\n[red]No improvement or regression ({reported_improvement_pct:.1f}%)[/red]")
+        if primary_improvement_pct is not None:
+            sink.print(
+                f"\n[red]No improvement or regression ({_format_objective_speedup(primary_speedup_ratio, unavailable='ratio unavailable')})[/red]"
+            )
+        else:
+            sink.print(f"\n[red]No improvement or regression ({reported_improvement_pct:.1f}%)[/red]")
         run_status = "no_improvement"
 
     _emit_tune_event(
@@ -5053,6 +5143,15 @@ async def _run_spawn_tune_loop_async(
             "primary_objective_query": primary_objective or "",
             "primary_objective_metric": resolved_primary_objective_metric or "",
             "primary_objective_mode": primary_objective_mode or "",
+            "primary_objective_speedup_ratio": primary_speedup_ratio,
+            "primary_objective_speedup_label": primary_speedup_label,
+            "best_found_round": best_found_round,
+            "best_found_trial": best_found_trial,
+            "best_candidate_trials_to_find": best_candidate_trials_to_find,
+            "best_profiled_runs_to_find": best_profiled_runs_to_find,
+            "total_rounds_executed": total_rounds_executed,
+            "total_candidate_trials_executed": total_candidate_trials_executed,
+            "total_profiled_runs": total_profiled_runs,
         },
     )
 
@@ -5072,6 +5171,7 @@ def _run_spawn_tune_loop(
     event_emitter: _TuneEmitter | None = None,
     structured_context_bundle: dict[str, object] | None = None,
     initial_hypothesis_profiles: list[dict[str, Any]] | None = None,
+    excluded_config_names: Sequence[str] | None = None,
 ) -> None:
     workdir_str = str(workdir) if workdir else None
     asyncio.run(
@@ -5090,7 +5190,63 @@ def _run_spawn_tune_loop(
             event_emitter=event_emitter,
             structured_context_bundle=structured_context_bundle,
             initial_hypothesis_profiles=initial_hypothesis_profiles,
+            excluded_config_names=excluded_config_names,
         )
+    )
+
+
+def _run_quick_tune_loop(
+    *,
+    agent: SysPilotAgent,
+    command: str,
+    contracts: Sequence[str],
+    manual_hints: Sequence[str],
+    max_iterations: int,
+    timeout: int,
+    primary_objective: str | None,
+    primary_objective_mode: str | None,
+    workdir: Path | None,
+    memory_high: str | None,
+    sink: OutputSink | None,
+    event_emitter: _TuneEmitter | None,
+    structured_context_bundle: dict[str, object] | None,
+    initial_hypothesis_profiles: list[dict[str, Any]] | None,
+    defaults: QuickModeDefaults | None,
+    excluded_config_names: Sequence[str] | None = None,
+) -> None:
+    from syspilot.quick_mode import run_quick_tune_loop
+
+    run_quick_tune_loop(
+        agent=agent,
+        command=command,
+        contracts=contracts,
+        manual_hints=manual_hints,
+        max_iterations=max_iterations,
+        timeout=timeout,
+        primary_objective=primary_objective,
+        primary_objective_mode=primary_objective_mode,
+        workdir=workdir,
+        memory_high=memory_high,
+        sink=sink,
+        event_emitter=event_emitter,
+        structured_context_bundle=structured_context_bundle,
+        initial_hypothesis_profiles=initial_hypothesis_profiles,
+        run_executor=_run_live_profiling_pipeline,
+        parse_spawn_actions=_parse_spawn_actions,
+        build_spawn_candidates=_build_spawn_candidates,
+        extract_hypothesis_profiles=_extract_hypothesis_profiles,
+        recommendation_next_action_display=_recommendation_next_action_display,
+        extract_inline_env_assignments=_extract_inline_env_assignments,
+        extract_metrics_from_output=_extract_metrics_from_output,
+        resolve_primary_objective_metric=_resolve_primary_objective_metric,
+        extract_primary_objective_value=_extract_primary_objective_value,
+        infer_primary_objective_mode=_infer_primary_objective_mode,
+        compare_objective_values=_compare_objective_values,
+        compute_objective_change_pct=_compute_objective_change_pct,
+        objective_display_name=_objective_display_name,
+        format_metric_value=_format_metric_value,
+        defaults=defaults,
+        excluded_config_names=excluded_config_names,
     )
 
 

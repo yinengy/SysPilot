@@ -90,8 +90,14 @@ syspilot tune --command "./benchmark -t 4" --contract numactl --primary-objectiv
 # Add application-specific tuning hints alongside library contracts
 syspilot tune --command "./benchmark -t 4" --contract numactl --manual "parent process forks worker processes after warmup"
 
+# Keep selected controls unchanged while tuning
+syspilot tune --command "./benchmark -t 4" --contract numactl --exclude-config OMP_NUM_THREADS
+
 # Optional: constrain spawn-mode runs with a MemoryHigh scope
 syspilot tune --command "./benchmark -t 4" --contract numactl --memory-high 1536M
+
+# Run quick screening mode with periodic contract-signal sampling
+syspilot tune --command "./benchmark -t 4" --contract numactl --quick-mode
 
 # Force plain text mode for tune (optional)
 syspilot tune --ui-mode plain --command "./benchmark -t 4" --contract numactl
@@ -143,20 +149,58 @@ syspilot tune \
 **Features:**
 - Runs initial baseline benchmark automatically
 - Runs iterative loop: re-profile current config -> generate new actions -> run candidate(s) -> accept best improvement
+- `--quick-mode` switches to a fast-screening workflow: one full baseline run with periodic contract-signal sampling, offline abnormal-window detection, short candidate screens that stop at the matched baseline window budget, then capped full validation of the best short screens
 - Uses process-tree-aware profiling (manager + heavy child workers) to avoid parent-only blind spots
 - Stops by convergence (non-improving iteration patience) or `--max-iterations`
 - Compares baseline vs best-found configuration side-by-side
+- Final summaries identify the round and per-round trial that found the reported best configuration, plus cumulative candidate trial runs and full-process round/trial/profiled-run totals
 - `--contract <name[,name...]>` loads library contract context for spawn-mode tune. Repeat the option or use comma-separated values when multiple libraries are involved.
 - When multiple contracts are present, SysPilot synthesizes contract-guided hypotheses and uses them to steer profiling and candidate selection.
 - `--manual <hint[,hint...]>` adds application-specific natural-language hints directly to the tuning prompt. Manual hints never generate LPCL hypotheses.
 - `--contract` and `--manual` are orthogonal and can be used together in the same tune run.
+- `--exclude-config <name[,name...]>` marks environment variables, command-line parameters, or config controls as immutable for the tuning prompt and candidate validation, so SysPilot keeps controls such as `BENCHMARK_BLOSC_CNAME` unchanged even if the LLM recommends modifying them.
 - When `--primary-objective` is set, SysPilot uses the LLM to extract workload outcome metrics (for example elapsed time, throughput, latency, or bandwidth) from stdout and rank candidates on the resolved metric first.
 - `--primary-objective <query>` is free-form user intent, so phrases like `"wall time"`, `"throughput"`, or even near-miss strings like `"ELAPSED SED"` can resolve onto extracted numeric metrics.
 - `--primary-objective-mode {minimize,maximize}` remains available when the resolved metric is real but its optimization direction is not obvious from the metric name.
 - When a primary objective is configured, orchestration `wall_time` becomes a secondary tie-breaker instead of the main search objective, so wrapper/setup noise does not silently override a better workload result.
+- For JSON-like benchmark output, SysPilot first scans the full captured output for exact numeric objective keys such as `throughput`, `samples_per_sec`, or `steps_per_sec` before using LLM extraction, so long structured summaries do not lose the target metric just because it appears after the prompt slice.
+- When a primary objective is configured, the final spawn-mode comparison output now reports the baseline-relative objective result as a ratio like `1.11x (better)` or `0.83x (slower)`, while iterative candidate-search lines stay percent-based (`vs current` / `vs previous`).
+- Quick mode supports `--primary-objective` and `--primary-objective-mode` for baseline parsing, promoted full validation, and final winner selection, while still keeping short-run screening strictly signal-based.
 - `--memory-high <value>` optionally launches the spawn-mode command through `systemd-run --user --scope -p MemoryHigh=...` so baseline and candidate runs stay inside the same user-scope memory-pressure envelope
+- Under `--memory-high`, quick mode can now screen on periodic `cgroup.memory.events.high` samples from that same cgroup envelope instead of treating the signal as unavailable until final post-run evidence.
 - If `--command` begins with `env KEY=VALUE ...`, SysPilot now treats those assignments as tunable baseline environment overrides instead of opaque command tokens, so spawn-mode env tuning can adjust the user-specified starting values across candidate trials.
 - Candidate command rewrites that include inline `env KEY=VALUE ...` are normalized the same way, so the tuning engine can safely try env-prefixed command variants without rejecting them as different executables.
+- Quick-mode artifacts are written under `artifacts/quick_tune_runs/<run_id>/` and include structured baseline/full/short run metadata, per-run raw `run_artifact.json` files, saved stdout/stderr, flattened per-signal sample rows, ranked abnormal windows, promotion decisions, and a final `quick_report.json`.
+- Quick mode now filters duplicate semantic signals before ranking and excludes objective-only `role=outcome` metrics such as benchmark elapsed time from the profiling-first quick-mode signal set.
+
+### Quick Mode Workflow
+
+Use quick mode when you have contract signals that are directionally meaningful early in the run and you want to screen more candidates before paying for full validation.
+
+For implementation and maintenance details, see [docs/QUICK_MODE.md](docs/QUICK_MODE.md).
+
+```bash
+syspilot tune \
+  --command "/path/to/app --args" \
+  --contract numactl \
+  --quick-mode \
+  --max-iterations 6
+```
+
+Quick mode currently:
+
+- keeps the default tune workflow unchanged unless `--quick-mode` is explicitly enabled
+- runs one full sampled baseline, ranks abnormal windows across useful contract signals offline, and checks them under internal short/full run budgets
+- screens candidates only until the exact ranked baseline window end offset for the currently ranked window, so short runs compare the same relative sampled slice
+- ranks short runs only on target-signal directional improvement in that matched window
+- ranks baseline abnormal windows with a direction-aware burst preference so onset windows beat later plateau-only windows when they describe the same anomaly
+- interleaves ranked windows across distinct signals before revisiting a second window for the same signal, so one strong probe cannot consume the early screening budget by itself
+- promotes only a capped fraction of short-screen winners to full validation within each checked signal/window group
+- uses `--primary-objective` for full validation and final winner selection when configured, otherwise falls back to wall time
+- keeps evaluating ranked windows within the configured short/full run budgets instead of stopping at the first validated improvement
+- emits distinct quick baseline, short screen, and full validation phases for plain output and event consumers
+- suppresses known wrapper footer summaries like `RUN_LABEL=` / `RESULT_JSON=` from the live plain-output stream only for short screens, while still preserving the full captured stdout/stderr inside quick-mode artifacts
+- exposes quick-mode budgets and thresholds via `--quick-*` flags when you need to retune sampling cadence, screening budgets, or promotion caps
 
 ### Tune UI Overhead Gate
 

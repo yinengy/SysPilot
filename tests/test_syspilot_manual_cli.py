@@ -15,7 +15,10 @@ from syspilot.cli import (
     _load_default_llm_config,
     _build_spawn_profiling_env,
     _collect_contract_report_env,
+    _compute_objective_speedup_ratio,
+    _extract_literal_numeric_metrics,
     _extract_hypothesis_profiles,
+    _format_objective_speedup,
     _recommendation_next_action_display,
     _parse_spawn_actions,
     _run_live_profiling_pipeline,
@@ -37,6 +40,24 @@ from toolbox.shared.cgroup_v2 import (
 
 
 FIXTURE_ROOT = Path(__file__).resolve().parents[1] / "examples" / "manual_mvp"
+
+
+def test_primary_objective_speedup_helpers_format_better_and_slower() -> None:
+    assert _compute_objective_speedup_ratio(100.0, 90.0, "minimize") == 100.0 / 90.0
+    assert _format_objective_speedup(100.0 / 90.0) == "1.11x (better)"
+    assert _compute_objective_speedup_ratio(100.0, 125.0, "minimize") == 0.8
+    assert _format_objective_speedup(0.8) == "0.80x (slower)"
+
+
+def test_literal_metric_extraction_reads_full_json_output() -> None:
+    long_prefix = "x" * 5000
+    output = f'{long_prefix} {{"steps_per_sec": 4.25, "throughput": 136.0, "batch_size": 32}}'
+
+    metrics = _extract_literal_numeric_metrics(output)
+
+    assert metrics["steps_per_sec"] == 4.25
+    assert metrics["throughput"] == 136.0
+    assert "batch_size" not in metrics
 
 
 def test_recommendation_next_action_display_formats_first_action_preview() -> None:
@@ -959,6 +980,47 @@ def test_spawn_mode_manual_hints_support_comma_splitting_and_escaped_commas() ->
     assert "- latency spikes appear after warmup" in prompt
 
 
+def test_spawn_mode_prompt_includes_excluded_config_controls() -> None:
+    runner = CliRunner()
+    _DummyAgent.instances.clear()
+
+    with (
+        patch("syspilot.cli.SysPilotAgent", _DummyAgent),
+        patch("syspilot.cli._register_default_skills", _noop),
+        patch("syspilot.cli._register_profiling_tools", _noop),
+        patch("syspilot.cli._register_tuning_tools", _noop),
+        patch("syspilot.cli._run_live_profiling_pipeline", _fake_live_profile),
+        patch("syspilot.cli._run_command", _fake_run_command),
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "tune",
+                "--ui-mode",
+                "plain",
+                "--command",
+                "echo hi",
+                "--exclude-config",
+                "BENCHMARK_BLOSC_CNAME,BENCHMARK_BLOSC_SHUFFLE",
+                "--max-iterations",
+                "1",
+                "--timeout",
+                "1",
+            ],
+        )
+
+    assert result.exit_code == 0
+    prompt = _DummyAgent.instances[-1].prompts[0]
+    assert "## Immutable Controls" in prompt
+    assert (
+        "Keep exactly these controls unchanged: "
+        "BENCHMARK_BLOSC_CNAME, BENCHMARK_BLOSC_SHUFFLE"
+    ) in prompt
+    assert "Only these exact listed environment variables" in prompt
+    assert "related controls with different names remain tunable" in prompt
+    assert "do not treat same-library or related controls as immutable" in prompt
+
+
 def test_spawn_mode_prompt_includes_effective_cgroup_memory_envelope() -> None:
     runner = CliRunner()
     _DummyAgent.instances.clear()
@@ -1428,6 +1490,7 @@ def test_spawn_mode_primary_objective_accepts_better_metric_even_if_wall_time_wo
     assert "Resolved primary objective metric: elapsed_sec (minimize)" in result.output
     assert "New current wall time: 90 (+10.0% vs previous)" in result.output
     assert "Current wall time: 1.20s" in result.output
+    assert "✓ Success! wall time improved to 1.11x (better) with actions:" in result.output
     assert "No tuned candidate outperformed baseline" not in result.output
 
 

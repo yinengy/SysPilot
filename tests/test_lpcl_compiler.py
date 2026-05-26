@@ -570,6 +570,94 @@ def test_compile_lpcl_file_can_include_evidence(tmp_path: Path) -> None:
     )
 
 
+def test_compile_lpcl_from_yaml_text_omits_null_mapping_fields() -> None:
+    yaml_text = (
+        dedent(
+            """
+            version: lpcl/v1
+            contract: cp2k
+            type: library
+            components:
+              - id: hybrid_executor
+                kind: executor
+                attrs:
+                  workers: OMP_NUM_THREADS
+                  report_maxloc: null
+                evidence:
+                  - cp2k_doc
+            uses:
+              - id: use_cpu_threads_compute
+                resource: cpu.compute
+                by: hybrid_executor
+                phase: compute
+                scope: process
+                demand:
+                  dimension: workers
+                  min: 1
+                  max: OMP_NUM_THREADS
+                share: shared
+                evidence:
+                  - cp2k_doc
+            assumptions:
+              - id: asm_not_nested
+                resource: cpu.compute
+                predicate:
+                  kind: not_nested
+                evidence:
+                  - cp2k_doc
+            controls:
+              - id: ctl_omp_num_threads
+                name: OMP_NUM_THREADS
+                kind: env
+                type: int
+                target: hybrid_executor.workers
+                effect:
+                  kind: set
+                  value: input
+                  direction: unknown
+                evidence:
+                  - cp2k_doc
+            signals:
+              - id: sig_rank_max_self_time
+                target: hybrid_executor
+                role: guardrail
+                metric: slowest_rank_self_time
+                indicates: worst-case rank timing in the final timing report
+                virtual_probe: cp2k.log.rank_max_self_time
+                expected_direction_when_mitigated: decrease
+                evidence:
+                  - cp2k_doc
+            recipes:
+              - id: recipe_shared_cpu_compute_conflict
+                for: shared_cpu_compute_conflict
+                collect:
+                  - sig_rank_max_self_time
+                diagnose:
+                  - label: inspect_rank_self_time
+                    signals:
+                      - sig_rank_max_self_time
+                config_checks:
+                  - sig_rank_max_self_time
+                outcomes:
+                  - sig_rank_max_self_time
+                guardrails:
+                  - sig_rank_max_self_time
+                actions:
+                  - label: keep_threads_bounded
+                    summary: keep OMP threads bounded
+                evidence:
+                  - cp2k_doc
+            """
+        ).strip()
+        + "\n"
+    )
+
+    output = compile_lpcl_from_yaml_text(yaml_text)
+
+    assert "report_maxloc" not in output
+    assert "workers = OMP_NUM_THREADS;" in output
+
+
 def test_composed_contract_emits_validation_and_action_sections() -> None:
     composed = compose_contracts(
         "openmp_openblas",

@@ -188,12 +188,16 @@ def test_gmx_mdrun_rewrite_accepts_valid_subcommand_options(
     assert "12" in command
 
 
-def test_gmx_mdrun_rewrite_defers_unsupported_subcommand_option_to_runtime() -> None:
+def test_gmx_mdrun_rewrite_defers_unsupported_subcommand_option_to_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     base = _gmx_mdrun_base_command()
     action = {
         "config_type": "command",
         "new_value": "gmx_mpi_d mdrun -s topol.tpr -npme 0 -ntomp 12 -pin on -badflag 1 -deffnm run",
     }
+
+    monkeypatch.setattr(cli_module, "_discover_supported_cli_options", lambda help_target: None)
 
     command, env_overrides, applied, skipped = _build_spawn_execution_plan(base, [action])
 
@@ -281,6 +285,27 @@ def test_build_spawn_execution_plan_preserves_inline_env_baseline() -> None:
     assert applied == ["env OMP_PROC_BIND=close"]
 
 
+def test_build_spawn_execution_plan_skips_excluded_env_var() -> None:
+    base = _gmx_mdrun_base_command()
+    action = {
+        "config_type": "env_var",
+        "parameter": "OMP_PROC_BIND",
+        "new_value": "close",
+    }
+
+    command, env_overrides, applied, skipped = _build_spawn_execution_plan(
+        base,
+        [action],
+        base_env_overrides={"OMP_PROC_BIND": "spread"},
+        excluded_config_names=["OMP_PROC_BIND"],
+    )
+
+    assert command == base
+    assert env_overrides == {"OMP_PROC_BIND": "spread"}
+    assert applied == []
+    assert skipped == ["action[0] changes excluded config 'OMP_PROC_BIND'"]
+
+
 def test_command_rewrite_with_inline_env_prefix_keeps_executable_and_merges_env_overrides() -> None:
     base = ["python", "worker_case.py", "--workers", "4", "--items", "2000"]
     action = {
@@ -345,6 +370,135 @@ def test_command_rewrite_with_bare_inline_env_prefix_keeps_executable_and_merges
     }
     assert skipped == []
     assert any(item.startswith("command ") for item in applied)
+
+
+def test_command_rewrite_skips_excluded_inline_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    base = ["python", "worker_case.py", "--workers", "4"]
+    action = {
+        "config_type": "command",
+        "new_value": "env BENCHMARK_BLOSC_CNAME=lz4 python worker_case.py --workers 4",
+    }
+
+    def _no_help_options(help_target: tuple[str, ...]) -> set[str] | None:
+        _ = help_target
+        return None
+
+    monkeypatch.setattr(cli_module, "_discover_supported_cli_options", _no_help_options)
+
+    command, env_overrides, applied, skipped = _build_spawn_execution_plan(
+        base,
+        [action],
+        base_env_overrides={"BENCHMARK_BLOSC_CNAME": "zstd"},
+        excluded_config_names=["BENCHMARK_BLOSC_CNAME"],
+    )
+
+    assert command == base
+    assert env_overrides == {"BENCHMARK_BLOSC_CNAME": "zstd"}
+    assert applied == []
+    assert skipped == [
+        "action[0] command rewrite changes excluded config(s): BENCHMARK_BLOSC_CNAME"
+    ]
+
+
+def test_command_rewrite_skips_excluded_option(monkeypatch: pytest.MonkeyPatch) -> None:
+    base = ["worker", "--threads", "24", "--items", "100"]
+    action = {
+        "config_type": "command",
+        "new_value": "worker --threads 12 --items 100",
+    }
+
+    def _no_help_options(help_target: tuple[str, ...]) -> set[str] | None:
+        _ = help_target
+        return None
+
+    monkeypatch.setattr(cli_module, "_discover_supported_cli_options", _no_help_options)
+
+    command, env_overrides, applied, skipped = _build_spawn_execution_plan(
+        base,
+        [action],
+        excluded_config_names=["--threads"],
+    )
+
+    assert command == base
+    assert env_overrides == {}
+    assert applied == []
+    assert skipped == ["action[0] command rewrite changes excluded config(s): --threads"]
+
+
+def test_command_prefix_skips_excluded_inline_env() -> None:
+    base = ["worker", "--items", "100"]
+    action = {
+        "config_type": "command_prefix",
+        "new_value": ["env", "BENCHMARK_BLOSC_CNAME=lz4"],
+    }
+
+    command, env_overrides, applied, skipped = _build_spawn_execution_plan(
+        base,
+        [action],
+        excluded_config_names=["BENCHMARK_BLOSC_CNAME"],
+    )
+
+    assert command == base
+    assert env_overrides == {}
+    assert applied == []
+    assert skipped == [
+        "action[0] command prefix changes excluded config(s): BENCHMARK_BLOSC_CNAME"
+    ]
+
+
+def test_build_spawn_candidates_keeps_allowed_actions_after_excluded_env_var() -> None:
+    base = ["worker", "--items", "100"]
+    actions = [
+        {"config_type": "env_var", "parameter": "A", "new_value": "2"},
+        {"config_type": "env_var", "parameter": "B", "new_value": "3"},
+    ]
+
+    candidates = _build_spawn_candidates(
+        base,
+        actions,
+        max_candidates=4,
+        base_env_overrides={"A": "1"},
+        excluded_config_names=["A"],
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0]["cmd"] == base
+    assert candidates[0]["env_overrides"] == {"A": "1", "B": "3"}
+    assert candidates[0]["skipped_actions"] == ["action[0] changes excluded config 'A'"]
+
+
+def test_python_command_rewrite_rejects_unsupported_script_option_when_help_is_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = ["python", "worker_case.py", "--workers", "4", "--items", "2000"]
+    action = {
+        "config_type": "command",
+        "new_value": "env OMP_NUM_THREADS=1 python worker_case.py --workers 4 --items 2000 --pre-dispatch 4",
+    }
+
+    def fake_discover_supported_cli_options(help_target: tuple[str, ...]) -> set[str] | None:
+        if help_target == ("python", "worker_case.py"):
+            return {"--workers", "--items"}
+        if help_target == ("python",):
+            return {"-c", "-h", "--help", "-m"}
+        return None
+
+    monkeypatch.setattr(
+        cli_module,
+        "_discover_supported_cli_options",
+        fake_discover_supported_cli_options,
+    )
+
+    command, env_overrides, applied, skipped = _build_spawn_execution_plan(
+        base,
+        [action],
+        base_env_overrides={"OMP_NUM_THREADS": "8"},
+    )
+
+    assert command == base
+    assert env_overrides == {"OMP_NUM_THREADS": "8"}
+    assert applied == []
+    assert any("option '--pre-dispatch' is not supported by executable 'python'" in item for item in skipped)
 
 
 def test_build_spawn_candidates_separates_command_prefix_alternatives() -> None:
@@ -517,7 +671,9 @@ def test_mpirun_wrapper_rewrite_accepts_wrapper_and_child_flags(
     assert "-ntomp" in command
 
 
-def test_mpirun_wrapper_rewrite_defers_bad_wrapper_flag_to_runtime() -> None:
+def test_mpirun_wrapper_rewrite_defers_bad_wrapper_flag_to_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     base = _mpirun_gmx_base_command()
     action = {
         "config_type": "command",
@@ -525,6 +681,8 @@ def test_mpirun_wrapper_rewrite_defers_bad_wrapper_flag_to_runtime() -> None:
             "mpirun -np 4 --badwrap 1 gmx_mpi_d mdrun -s topol.tpr -npme 0 -pin off -deffnm run"
         ),
     }
+
+    monkeypatch.setattr(cli_module, "_discover_supported_cli_options", lambda help_target: None)
 
     command, env_overrides, applied, skipped = _build_spawn_execution_plan(base, [action])
 
@@ -534,7 +692,9 @@ def test_mpirun_wrapper_rewrite_defers_bad_wrapper_flag_to_runtime() -> None:
     assert any(item.startswith("command ") for item in applied)
 
 
-def test_mpirun_wrapper_rewrite_defers_bad_child_flag_to_runtime() -> None:
+def test_mpirun_wrapper_rewrite_defers_bad_child_flag_to_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     base = _mpirun_gmx_base_command()
     action = {
         "config_type": "command",
@@ -542,6 +702,8 @@ def test_mpirun_wrapper_rewrite_defers_bad_child_flag_to_runtime() -> None:
             "mpirun -np 4 gmx_mpi_d mdrun -s topol.tpr -npme 0 -pin off -badchild 1 -deffnm run"
         ),
     }
+
+    monkeypatch.setattr(cli_module, "_discover_supported_cli_options", lambda help_target: None)
 
     command, env_overrides, applied, skipped = _build_spawn_execution_plan(base, [action])
 

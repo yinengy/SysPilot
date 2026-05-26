@@ -13,6 +13,7 @@ If the contract is invalid:
 - set valid=false
 - include the issues you fixed in "issues"
 - include one full repaired_contract object that matches the provided schema exactly
+- if the input issues list is non-empty, never return valid=true with repaired_contract=null
 
 Repair rules:
 - Change only the sections listed in invalid_sections unless another section must change to keep refs consistent
@@ -30,7 +31,9 @@ LPCL v1 ontology:
 - control kinds: env, api, config, cli, vlc
 - control types: int, float, bool, string, enum, set
 - effect kinds: set, increase, decrease, partition, disable, enable
-- probe kinds: api, perf, os, log, profiler, benchmark, manual
+- virtual probes are capability names such as runtime.config.startup_properties, runtime.config.startup_profile, process.cpu.thread_count, process.cpu.allowed_cpus, process.memory.rss_peak, cgroup.memory.events.high, benchmark.elapsed_time, benchmark.completion_count, and benchmark.throughput when justified by evidence
+- signal roles: config_check, resource_signal, subcomponent_signal, outcome, guardrail
+- expected signal directions: increase, decrease, stable, unknown
 - recipe.for values:
   - shared_cpu_compute_conflict
   - cpu_placement_conflict
@@ -46,6 +49,17 @@ Canonicalization requirements:
 - cpu.thread is invalid; use cpu.compute with demand.dimension=workers
 - worker.pool is invalid as a resource; use a component plus cpu.compute
 - cpu.affinity is invalid; use cpu.placement
+- use predicate kind not_nested only with cpu.compute or gpu.compute
+- use predicate kind placement_compatible only with cpu.placement
+- predicates total_at_most and competitors_at_most require a numeric or symbolic value
 - controls must target components, component attrs, uses, use demand paths, or valid resources
-- signals must use probe.kind + probe.name
+- component attribute targets must be written as <component>.<attr_path>, never <component>.attrs.<attr_path>
+- config-check signals must target the configured component/use/resource path, never a control id
+- if a worker-count control exists, the controlled component must be kind executor and expose an attrs.workers field; do not redirect worker-count controls to use demand paths or raw resources just to satisfy existence
+- signals must use direct virtual_probe strings, not nested probe objects
+- signal.virtual_probe must be a virtual probe capability name, never a script path, and should align with toolbox-backed probes such as runtime.config.startup_properties, runtime.config.startup_profile, process.cpu.thread_count, process.cpu.allowed_cpus, process.memory.rss_peak, cgroup.memory.events.high, benchmark.elapsed_time, or benchmark.completion_count when justified by evidence
+- every signal must include role and expected_direction_when_mitigated
 - recipes.collect must reference signal ids
+- recipes must include diagnose blocks, config_checks, outcomes, and guardrails
+- recipes.actions must be structured objects with a stable label, and should point to control ids plus expected_changes when the evidence supports it
+- BENCHMARK_* environment controls are valid in library contracts when they are the real fixed-workload action surface exposed to SysPilot

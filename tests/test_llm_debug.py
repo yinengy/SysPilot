@@ -15,6 +15,7 @@ from syspilot.core.llm import (
     Message,
     OpenAIProvider,
     ToolDefinition,
+    _is_transient_exception,
 )
 from syspilot.core.openai_auth_provider import OpenAIAuthProvider
 
@@ -412,3 +413,9 @@ async def test_openai_provider_passes_timeout_to_stream_chat_request() -> None:
     assert chunks == ["hello"]
     assert provider.client.chat.completions.calls[0]["stream"] is True
     assert provider.client.chat.completions.calls[0]["timeout"] == 7.25
+
+
+def test_empty_stream_message_is_retryable_provider_failure() -> None:
+    assert _is_transient_exception(
+        RuntimeError("empty_stream: upstream stream closed before first payload")
+    )

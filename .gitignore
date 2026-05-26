@@ -94,6 +94,8 @@ node_modules
 ui/ratatui/target/
 manual/*
 contracts/*
+runs/*
+work/*
 
 # OpenCode
 .sisyphus

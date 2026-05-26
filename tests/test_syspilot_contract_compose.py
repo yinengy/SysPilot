@@ -382,6 +382,20 @@ def test_kafka_rocksdb_context_exposes_actionable_memory_hypothesis() -> None:
     explanation = str(memory_hypothesis["explanation"])
     assert "share resource claims" in explanation
 
+    profile_first = cast(list[dict[str, object]], context["profile_first"])
+    assert profile_first
+    assert all(item.get("role") != "outcome" for item in profile_first)
+    assert all(item.get("virtual_probe") != "benchmark.elapsed_time" for item in profile_first)
+    assert all(item.get("title") != "benchmark_elapsed_time" for item in profile_first)
+
+    top_level_signals = cast(list[dict[str, object]], context["signals_to_collect"])
+    assert top_level_signals
+    assert all(item.get("role") != "outcome" for item in top_level_signals)
+    assert all(item.get("virtual_probe") != "benchmark.elapsed_time" for item in top_level_signals)
+    assert all(item.get("title") != "benchmark_elapsed_time" for item in top_level_signals)
+
     signals_to_collect = cast(list[dict[str, object]], memory_hypothesis["signals_to_collect"])
     assert any(item.get("role") == "config_check" for item in signals_to_collect)
     assert any(item.get("virtual_probe") == "cgroup.memory.events.high" for item in signals_to_collect)
+    assert all(item.get("role") != "outcome" for item in signals_to_collect)
+    assert all(item.get("virtual_probe") != "benchmark.elapsed_time" for item in signals_to_collect)

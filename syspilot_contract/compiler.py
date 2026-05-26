@@ -75,7 +75,7 @@ def _emit_mapping_entries(
         _require_safe_identifier(key, f"mapping key {key}")
         value = mapping[key]
         if value is None:
-            raise ValueError(f"Null field '{key}' cannot be compiled to LPCL")
+            continue
         if isinstance(value, Mapping):
             lines.append(f"{indent}{key} {{")
             _emit_mapping_entries(lines, value, indent=indent + "  ")

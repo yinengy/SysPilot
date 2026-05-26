@@ -212,7 +212,11 @@ Available tools will be provided for each interaction."""
             "parameters": tool.parameters,
         }
 
-    def _record_llm_prompt(self) -> None:
+    def _record_llm_prompt_messages(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None,
+    ) -> None:
         if self._llm_prompt_log_path is None:
             return
         self._llm_prompt_log_index += 1
@@ -220,11 +224,14 @@ Available tools will be provided for each interaction."""
             "index": self._llm_prompt_log_index,
             "timestamp": datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
             "state": self.state.value,
-            "messages": [self._message_to_prompt_dict(msg) for msg in self._message_history],
-            "tools": [self._tool_to_prompt_dict(tool) for tool in self._tool_definitions],
+            "messages": [self._message_to_prompt_dict(msg) for msg in messages],
+            "tools": [self._tool_to_prompt_dict(tool) for tool in tools or []],
         }
         with self._llm_prompt_log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload) + "\n")
+
+    def _record_llm_prompt(self) -> None:
+        self._record_llm_prompt_messages(self._message_history, self._tool_definitions)
 
     def _update_system_prompt(self) -> None:
         prompt_parts = [self.SYSTEM_PROMPT]
@@ -391,6 +398,17 @@ Respond with your analysis and any tool calls needed."""
             return await self.step()
 
         return response
+
+    async def step_stateless(self, user_input: str, *, include_tools: bool = False) -> LLMResponse:
+        """Send one prompt without retaining prior tuning-analysis history."""
+        self._update_system_prompt()
+        messages: list[Message] = []
+        if self._message_history and self._message_history[0].role == "system":
+            messages.append(self._message_history[0])
+        messages.append(Message(role="user", content=user_input))
+        tools = self._tool_definitions if include_tools and self._tool_definitions else None
+        self._record_llm_prompt_messages(messages, tools)
+        return await self.llm.chat(messages=messages, tools=tools)
 
     async def run_monitoring_loop(self) -> None:
         self._running = True

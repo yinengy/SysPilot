@@ -6,7 +6,7 @@ import pytest
 from syspilot_contract.checker import dump_contract_yaml, validate_contract_text
 from syspilot_contract.query_store import ContractStore
 from syspilot_contract.schemas import LibraryContract, SourceArtifact
-from syspilot_contract.synthesize_contract import synthesize_library_contract
+from syspilot_contract.synthesize_contract import _invalid_sections, synthesize_library_contract
 from syspilot_manual.schemas import EvidenceItem
 
 
@@ -394,7 +394,7 @@ def test_validator_rejects_vague_metric_and_missing_virtual_probe() -> None:
     assert any("virtual_probe" in issue for issue in result.issues)
 
 
-def test_validator_rejects_benchmark_wrapper_controls_in_library_contract() -> None:
+def test_validator_allows_benchmark_env_controls_in_library_contract() -> None:
     _, result = validate_contract_text(
         dedent(
             """
@@ -437,8 +437,8 @@ def test_validator_rejects_benchmark_wrapper_controls_in_library_contract() -> N
         )
     )
 
-    assert result.valid is False
-    assert any("benchmark-wrapper variable" in issue for issue in result.issues)
+    assert result.valid is True
+    assert result.issues == []
 
 
 def test_validator_allows_backend_control_targeting_component_attribute() -> None:
@@ -626,6 +626,186 @@ class _YamlContractLLM:
         )
 
 
+class _RepairingContractLLM:
+    def __init__(self, contract_name: str, control_name: str) -> None:
+        self.contract_name = contract_name
+        self.control_name = control_name
+        self.verify_called = False
+
+    async def complete_prompt(self, prompt_name: str, payload: dict[str, object]) -> str:
+        if prompt_name == "synthesize_contract.txt":
+            return dedent(
+                f"""
+                version: lpcl/v1
+                contract: ignored
+                type: library
+                components:
+                  - id: {self.contract_name.lower().replace('-', '_')}_threads
+                    kind: executor
+                    attrs:
+                      workers: host.cpu_slots
+                    evidence: [doc_001:chunk_001]
+                uses:
+                  - id: {self.contract_name.lower().replace('-', '_')}_cpu_compute
+                    resource: cpu.compute
+                    by: {self.contract_name.lower().replace('-', '_')}_threads
+                    phase: compute
+                    scope: process
+                    demand:
+                      dimension: workers
+                      min: 1
+                      max: host.cpu_slots
+                    share: shared
+                    evidence: [doc_001:chunk_001]
+                assumptions:
+                  - id: avoid_nested_parallelism
+                    resource: cpu.compute
+                    predicate:
+                      kind: not_nested
+                    evidence: [doc_001:chunk_001]
+                controls:
+                  - id: {self.contract_name.lower().replace('-', '_')}_threads_control
+                    name: {self.control_name}
+                    kind: api
+                    type: int
+                    target: {self.contract_name.lower().replace('-', '_')}_threads.workers
+                    effect:
+                      kind: set
+                      value: input
+                    evidence: [doc_001:chunk_001]
+                signals:
+                  - id: runtime_threads
+                    target: {self.contract_name.lower().replace('-', '_')}_threads.workers
+                    metric: active_thread_count
+                    indicates: effective_worker_count
+                    probe:
+                      kind: os
+                      name: process.cpu.thread_count
+                    evidence: [doc_001:chunk_001]
+                  - id: contention_signal
+                    target: cpu.compute
+                    metric: os.context_switch_rate
+                    indicates: oversubscription
+                    probe:
+                      kind: benchmark
+                      name: benchmark.context_switch_rate
+                    evidence: [doc_001:chunk_001]
+                recipes:
+                  - id: repair_me
+                    for: shared_cpu_compute_conflict
+                    collect: [runtime_threads, contention_signal]
+                    actions:
+                      - decrease {self.control_name}
+                    evidence: [doc_001:chunk_001]
+                """
+            )
+        if prompt_name == "verify_contract.txt":
+            self.verify_called = True
+            invalid_sections = payload.get("invalid_sections")
+            assert isinstance(invalid_sections, list)
+            assert "signals" in invalid_sections
+            assert "recipes" in invalid_sections
+            return dedent(
+                f"""
+                valid: false
+                issues:
+                  - repaired stale probe structure and recipe blocks
+                repaired_contract:
+                  version: lpcl/v1
+                  contract: {self.contract_name}
+                  type: library
+                  components:
+                    - id: {self.contract_name.lower().replace('-', '_')}_threads
+                      kind: executor
+                      attrs:
+                        workers: host.cpu_slots
+                      evidence: [doc_001:chunk_001]
+                  uses:
+                    - id: {self.contract_name.lower().replace('-', '_')}_cpu_compute
+                      resource: cpu.compute
+                      by: {self.contract_name.lower().replace('-', '_')}_threads
+                      phase: compute
+                      scope: process
+                      demand:
+                        dimension: workers
+                        min: 1
+                        max: host.cpu_slots
+                      share: shared
+                      evidence: [doc_001:chunk_001]
+                  assumptions:
+                    - id: avoid_nested_parallelism
+                      resource: cpu.compute
+                      predicate:
+                        kind: not_nested
+                      evidence: [doc_001:chunk_001]
+                  controls:
+                    - id: {self.contract_name.lower().replace('-', '_')}_threads_control
+                      name: {self.control_name}
+                      kind: api
+                      type: int
+                      target: {self.contract_name.lower().replace('-', '_')}_threads.workers
+                      effect:
+                        kind: set
+                        value: input
+                        direction: unknown
+                      interacts_with:
+                        - runtime_threads
+                      evidence: [doc_001:chunk_001]
+                  signals:
+                    - id: runtime_threads
+                      target: {self.contract_name.lower().replace('-', '_')}_threads.workers
+                      role: config_check
+                      metric: active_thread_count
+                      indicates: effective_worker_count
+                      virtual_probe: process.cpu.thread_count
+                      expected_direction_when_mitigated: unknown
+                      evidence: [doc_001:chunk_001]
+                    - id: contention_signal
+                      target: cpu.compute
+                      role: resource_signal
+                      metric: os.context_switch_rate
+                      indicates: oversubscription
+                      virtual_probe: benchmark.context_switch_rate
+                      expected_direction_when_mitigated: decrease
+                      evidence: [doc_001:chunk_001]
+                  recipes:
+                    - id: repair_me
+                      for: shared_cpu_compute_conflict
+                      collect: [runtime_threads, contention_signal]
+                      diagnose:
+                        - label: confirm_runtime_and_contention_signals
+                          signals: [runtime_threads, contention_signal]
+                      config_checks: [runtime_threads]
+                      outcomes: [throughput_not_worse]
+                      guardrails: [contention_signal]
+                      actions:
+                        - label: set_threads_lower
+                          summary: reduce thread parallelism
+                          control: {self.contract_name.lower().replace('-', '_')}_threads_control
+                          effect: set
+                          expected_changes:
+                            - signal: contention_signal
+                              expected_direction_when_mitigated: decrease
+                      search_space_hints: [bounded thread-count sweep]
+                      evidence: [doc_001:chunk_001]
+                """
+            )
+        raise AssertionError(prompt_name)
+
+
+class _RetryingRepairContractLLM(_RepairingContractLLM):
+    def __init__(self, contract_name: str, control_name: str) -> None:
+        super().__init__(contract_name, control_name)
+        self.verify_attempts = 0
+
+    async def complete_prompt(self, prompt_name: str, payload: dict[str, object]) -> str:
+        if prompt_name == "verify_contract.txt":
+            self.verify_attempts += 1
+            if self.verify_attempts == 1:
+                return '{"valid": true, "issues": [], "repaired_contract": null}'
+        return await super().complete_prompt(prompt_name, payload)
+
+
 @pytest.mark.asyncio
 async def test_synthesizer_accepts_yaml_and_canonicalizes_v1_fields() -> None:
     contract = await synthesize_library_contract(
@@ -659,3 +839,572 @@ async def test_synthesizer_accepts_yaml_and_canonicalizes_v1_fields() -> None:
     assert contract.assumptions[0].predicate == {"kind": "placement_compatible"}
     assert contract.signals[0].virtual_probe == "runtime.config.startup_properties"
     assert contract.recipes[0].config_checks == ["sig_omp_display_env"]
+
+
+class _AttrsTargetContractLLM:
+    async def complete_prompt(self, prompt_name: str, payload: dict[str, object]) -> str:
+        _ = prompt_name
+        _ = payload
+        return dedent(
+            """
+            version: lpcl/v1
+            contract: ignored
+            type: library
+            components:
+              - id: xgboost_core
+                kind: executor
+                attrs:
+                  device: cpu
+                  executor:
+                    workers: nthread
+                evidence: [doc_001:chunk_001]
+            uses:
+              - id: xgboost_cpu_compute
+                resource: cpu.compute
+                by: xgboost_core
+                phase: compute
+                scope: process
+                demand:
+                  dimension: workers
+                  min: 1
+                  max: host.cpu_slots
+                share: shared
+                evidence: [doc_001:chunk_001]
+            assumptions:
+              - id: avoid_nested_parallelism
+                resource: cpu.compute
+                predicate:
+                  kind: not_nested
+                evidence: [doc_001:chunk_001]
+            controls:
+              - id: ctl_nthread
+                name: nthread
+                kind: api
+                type: int
+                target: xgboost_core.attrs.pool.workers
+                effect:
+                  kind: set
+                  value: input
+                  direction: unknown
+                evidence: [doc_001:chunk_001]
+              - id: ctl_device
+                name: device
+                kind: api
+                type: enum
+                target: xgboost_core.attrs.device
+                effect:
+                  kind: set
+                  value: input
+                  direction: unknown
+                evidence: [doc_001:chunk_001]
+            signals:
+              - id: sig_thread_count
+                target: xgboost_core.attrs.executor.workers
+                role: config_check
+                metric: active_thread_count
+                indicates: effective_worker_count
+                virtual_probe: process.cpu.thread_count
+                expected_direction_when_mitigated: unknown
+                evidence: [doc_001:chunk_001]
+            recipes:
+              - id: recipe_threads
+                for: shared_cpu_compute_conflict
+                collect: [sig_thread_count]
+                diagnose:
+                  - label: confirm_runtime_threads
+                    signals: [sig_thread_count]
+                config_checks: [sig_thread_count]
+                outcomes: [throughput_not_worse]
+                guardrails: [sig_thread_count]
+                actions:
+                  - label: set_threads
+                    summary: set nthread explicitly
+                    control: ctl_nthread
+                    effect: set
+                    expected_changes:
+                      - signal: sig_thread_count
+                        expected_direction_when_mitigated: unknown
+                evidence: [doc_001:chunk_001]
+            """
+        )
+
+
+@pytest.mark.asyncio
+async def test_synthesizer_canonicalizes_component_attrs_targets() -> None:
+    contract = await synthesize_library_contract(
+        "XGBoost",
+        [SourceArtifact(source_id="doc_001", path="docs/xgboost.md", kind="doc")],
+        [
+            EvidenceItem.model_validate(
+                {
+                    "evidence_id": "ev_001",
+                    "library_name": "XGBoost",
+                    "chunk_id": "doc_001:chunk_001",
+                    "kind": "intervention",
+                    "title": "Tune XGBoost thread count",
+                    "content": "Set nthread carefully.",
+                    "keywords": ["nthread"],
+                    "resource_domains": ["cpu_threads"],
+                    "source_quote": "Set nthread carefully.",
+                    "source_refs": ["doc_001:chunk_001"],
+                }
+            )
+        ],
+        _AttrsTargetContractLLM(),
+    )
+
+    assert contract.controls[0].target == "xgboost_core.executor.workers"
+    assert contract.controls[1].target == "xgboost_core.device"
+    assert contract.signals[0].target == "xgboost_core.executor.workers"
+
+
+class _PrefixedTargetContractLLM:
+    async def complete_prompt(self, prompt_name: str, payload: dict[str, object]) -> str:
+        _ = prompt_name
+        _ = payload
+        return dedent(
+            """
+            version: lpcl/v1
+            contract: ignored
+            type: library
+            components:
+              - id: joblib_parallel
+                kind: executor
+                attrs:
+                  default_backend: loky
+                  workers: host.cpu_slots
+                evidence: [doc_001:chunk_001]
+            uses:
+              - id: joblib_cpu_compute
+                resource: cpu.compute
+                by: joblib_parallel
+                phase: compute
+                scope: process
+                demand:
+                  dimension: workers
+                  min: 1
+                  max: host.cpu_slots
+                share: shared
+                evidence: [doc_001:chunk_001]
+            assumptions:
+              - id: avoid_nested_parallelism
+                resource: cpu.compute
+                predicate:
+                  kind: not_nested
+                evidence: [doc_001:chunk_001]
+            controls:
+              - id: ctl_n_jobs
+                name: n_jobs
+                kind: api
+                type: int
+                target: use.joblib_cpu_compute.demand.max
+                effect:
+                  kind: set
+                  value: input
+                  direction: unknown
+                evidence: [doc_001:chunk_001]
+              - id: ctl_backend
+                name: backend
+                kind: api
+                type: enum
+                target: executor.joblib_parallel.default_backend
+                effect:
+                  kind: set
+                  value: loky
+                  direction: unknown
+                evidence: [doc_001:chunk_001]
+            signals:
+              - id: sig_config_n_jobs
+                target: ctl_n_jobs
+                role: config_check
+                metric: joblib.config.n_jobs
+                indicates: configured outer worker count
+                virtual_probe: runtime.config.startup_properties
+                expected_direction_when_mitigated: stable
+                evidence: [doc_001:chunk_001]
+              - id: sig_config_backend
+                target: executor.joblib_parallel.default_backend
+                role: config_check
+                metric: joblib.config.backend
+                indicates: configured joblib backend
+                virtual_probe: runtime.config.startup_properties
+                expected_direction_when_mitigated: stable
+                evidence: [doc_001:chunk_001]
+            recipes:
+              - id: recipe_threads
+                for: shared_cpu_compute_conflict
+                collect: [sig_config_n_jobs, sig_config_backend]
+                diagnose:
+                  - label: confirm_joblib_parallelism
+                    signals: [sig_config_n_jobs, sig_config_backend]
+                config_checks: [sig_config_n_jobs, sig_config_backend]
+                outcomes: [sig_config_n_jobs]
+                guardrails: [sig_config_backend]
+                actions:
+                  - label: bound_outer_parallelism
+                    summary: set n_jobs explicitly
+                    control: ctl_n_jobs
+                    effect: set
+                    expected_changes:
+                      - signal: sig_config_n_jobs
+                        expected_direction_when_mitigated: stable
+                evidence: [doc_001:chunk_001]
+            """
+        )
+
+
+@pytest.mark.asyncio
+async def test_synthesizer_canonicalizes_prefixed_component_and_use_targets() -> None:
+    contract = await synthesize_library_contract(
+        "scikit-learn",
+        [SourceArtifact(source_id="doc_001", path="docs/sklearn.md", kind="doc")],
+        [
+            EvidenceItem.model_validate(
+                {
+                    "evidence_id": "ev_001",
+                    "library_name": "scikit-learn",
+                    "chunk_id": "doc_001:chunk_001",
+                    "kind": "intervention",
+                    "title": "Tune sklearn joblib parallelism",
+                    "content": "Set n_jobs and backend intentionally.",
+                    "keywords": ["n_jobs", "backend"],
+                    "resource_domains": ["cpu_threads"],
+                    "source_quote": "Set n_jobs and backend intentionally.",
+                    "source_refs": ["doc_001:chunk_001"],
+                }
+            )
+        ],
+        _PrefixedTargetContractLLM(),
+    )
+
+    assert contract.controls[0].target == "joblib_cpu_compute.demand.max"
+    assert contract.controls[1].target == "joblib_parallel.default_backend"
+    assert contract.signals[0].target == "joblib_cpu_compute.demand.max"
+    assert contract.signals[1].target == "joblib_parallel.default_backend"
+
+
+@pytest.mark.asyncio
+async def test_synthesizer_adds_workers_attr_for_worker_control_targeting_wrong_executor_attr() -> None:
+    class _MissingWorkersAttrContractLLM:
+        async def complete_prompt(self, prompt_name: str, payload: dict[str, object]) -> str:
+            _ = prompt_name
+            _ = payload
+            return dedent(
+                """
+                version: lpcl/v1
+                contract: ignored
+                type: library
+                components:
+                  - id: hybrid_executor
+                    kind: executor
+                    attrs:
+                      hybrid_runtime: psmp
+                    evidence: [doc_001:chunk_001]
+                uses:
+                  - id: use_cpu_threads_compute
+                    resource: cpu.compute
+                    by: hybrid_executor
+                    phase: compute
+                    scope: process
+                    demand:
+                      dimension: workers
+                      min: 1
+                      max: host.cpu_slots
+                    share: shared
+                    evidence: [doc_001:chunk_001]
+                assumptions:
+                  - id: avoid_nested_parallelism
+                    resource: cpu.compute
+                    predicate:
+                      kind: not_nested
+                    evidence: [doc_001:chunk_001]
+                controls:
+                  - id: ctl_omp_num_threads
+                    name: OMP_NUM_THREADS
+                    kind: env
+                    type: int
+                    target: hybrid_executor.hybrid_runtime
+                    effect:
+                      kind: set
+                      value: input
+                      direction: unknown
+                    evidence: [doc_001:chunk_001]
+                signals:
+                  - id: sig_thread_count
+                    target: ctl_omp_num_threads
+                    role: config_check
+                    metric: active_thread_count
+                    indicates: effective_worker_count
+                    virtual_probe: process.cpu.thread_count
+                    expected_direction_when_mitigated: unknown
+                    evidence: [doc_001:chunk_001]
+                recipes:
+                  - id: recipe_threads
+                    for: shared_cpu_compute_conflict
+                    collect: [sig_thread_count]
+                    diagnose:
+                      - label: confirm_runtime_threads
+                        signals: [sig_thread_count]
+                    config_checks: [sig_thread_count]
+                    outcomes: [throughput_not_worse]
+                    guardrails: [sig_thread_count]
+                    actions:
+                      - label: set_threads
+                        summary: set OMP_NUM_THREADS explicitly
+                        control: ctl_omp_num_threads
+                        effect: set
+                        expected_changes:
+                          - signal: sig_thread_count
+                            expected_direction_when_mitigated: unknown
+                    evidence: [doc_001:chunk_001]
+                """
+            )
+
+    contract = await synthesize_library_contract(
+        "CP2K",
+        [SourceArtifact(source_id="doc_001", path="docs/cp2k.md", kind="doc")],
+        [
+            EvidenceItem.model_validate(
+                {
+                    "evidence_id": "ev_001",
+                    "library_name": "CP2K",
+                    "chunk_id": "doc_001:chunk_001",
+                    "kind": "intervention",
+                    "title": "Tune OMP_NUM_THREADS",
+                    "content": "Set OMP_NUM_THREADS carefully.",
+                    "keywords": ["OMP_NUM_THREADS"],
+                    "resource_domains": ["cpu_threads"],
+                    "source_quote": "Set OMP_NUM_THREADS carefully.",
+                    "source_refs": ["doc_001:chunk_001"],
+                }
+            )
+        ],
+        _MissingWorkersAttrContractLLM(),
+    )
+
+    assert contract.components[0].attrs["workers"] == "OMP_NUM_THREADS"
+    assert contract.controls[0].target == "hybrid_executor.workers"
+    assert contract.signals[0].target == "hybrid_executor.workers"
+
+
+@pytest.mark.asyncio
+async def test_synthesizer_canonicalizes_gromacs_cli_worker_targets_to_workers_attr() -> None:
+    class _NestedWorkerCliContractLLM:
+        async def complete_prompt(self, prompt_name: str, payload: dict[str, object]) -> str:
+            _ = prompt_name
+            _ = payload
+            return dedent(
+                """
+                version: lpcl/v1
+                contract: ignored
+                type: library
+                components:
+                  - id: mdrun_executor
+                    kind: executor
+                    attrs:
+                      workers:
+                        total_threads: -nt
+                        mpi_ranks: -ntmpi
+                        omp_threads: -ntomp
+                    evidence: [doc_001:chunk_001]
+                uses:
+                  - id: use_cpu_threads_compute
+                    resource: cpu.compute
+                    by: mdrun_executor
+                    phase: compute
+                    scope: process
+                    demand:
+                      dimension: workers
+                      min: 1
+                      max: host.cpu_slots
+                    share: shared
+                    evidence: [doc_001:chunk_001]
+                assumptions:
+                  - id: avoid_nested_parallelism
+                    resource: cpu.compute
+                    predicate:
+                      kind: not_nested
+                    evidence: [doc_001:chunk_001]
+                controls:
+                  - id: ctl_ntomp
+                    name: -ntomp
+                    kind: cli
+                    type: int
+                    target: mdrun_executor.workers.omp_threads
+                    effect:
+                      kind: set
+                      value: input
+                      direction: unknown
+                    evidence: [doc_001:chunk_001]
+                signals:
+                  - id: sig_runtime_threads
+                    target: ctl_ntomp
+                    role: config_check
+                    metric: active_thread_count
+                    indicates: effective_worker_count
+                    virtual_probe: process.cpu.thread_count
+                    expected_direction_when_mitigated: unknown
+                    evidence: [doc_001:chunk_001]
+                recipes:
+                  - id: recipe_threads
+                    for: shared_cpu_compute_conflict
+                    collect: [sig_runtime_threads]
+                    diagnose:
+                      - label: confirm_runtime_threads
+                        signals: [sig_runtime_threads]
+                    config_checks: [sig_runtime_threads]
+                    outcomes: [throughput_not_worse]
+                    guardrails: [sig_runtime_threads]
+                    actions:
+                      - label: set_threads
+                        summary: set -ntomp explicitly
+                        control: ctl_ntomp
+                        effect: set
+                        expected_changes:
+                          - signal: sig_runtime_threads
+                            expected_direction_when_mitigated: unknown
+                    evidence: [doc_001:chunk_001]
+                """
+            )
+
+    contract = await synthesize_library_contract(
+        "gromacs",
+        [SourceArtifact(source_id="doc_001", path="docs/gromacs.md", kind="doc")],
+        [
+            EvidenceItem.model_validate(
+                {
+                    "evidence_id": "ev_001",
+                    "library_name": "gromacs",
+                    "chunk_id": "doc_001:chunk_001",
+                    "kind": "intervention",
+                    "title": "Tune GROMACS thread flags",
+                    "content": "Set -ntomp carefully.",
+                    "keywords": ["-ntomp"],
+                    "resource_domains": ["cpu_threads"],
+                    "source_quote": "Set -ntomp carefully.",
+                    "source_refs": ["doc_001:chunk_001"],
+                }
+            )
+        ],
+        _NestedWorkerCliContractLLM(),
+    )
+
+    assert contract.controls[0].target == "mdrun_executor.workers"
+    assert contract.signals[0].target == "mdrun_executor.workers"
+
+
+def test_invalid_sections_detects_control_and_signal_keywords_from_checker_errors() -> None:
+    sections = _invalid_sections(
+        [
+            "Value error, Control ctl_n_jobs targets nonexistent executor.workers.; Signal sig_cfg_n_jobs targets nonexistent ctl_n_jobs."
+        ]
+    )
+
+    assert sections == ["controls", "signals"]
+
+
+@pytest.mark.parametrize(
+    ("contract_name", "control_name"),
+    [("XGBoost", "nthread"), ("scikit-learn", "n_jobs")],
+)
+@pytest.mark.asyncio
+async def test_synthesizer_repairs_stale_probe_and_recipe_shapes_for_new_libraries(
+    contract_name: str,
+    control_name: str,
+) -> None:
+    llm = _RepairingContractLLM(contract_name, control_name)
+    contract = await synthesize_library_contract(
+        contract_name,
+        [SourceArtifact(source_id="doc_001", path=f"docs/{contract_name}.md", kind="doc")],
+        [
+            EvidenceItem.model_validate(
+                {
+                    "evidence_id": "ev_001",
+                    "library_name": contract_name,
+                    "chunk_id": "doc_001:chunk_001",
+                    "kind": "intervention",
+                    "title": "Coordinate parallel worker counts",
+                    "content": "Reduce oversubscription by lowering outer or inner worker counts.",
+                    "keywords": [control_name, "threads", "oversubscription"],
+                    "resource_domains": ["cpu_threads"],
+                    "source_quote": "Reduce oversubscription by lowering worker counts.",
+                    "source_refs": ["doc_001:chunk_001"],
+                }
+            )
+        ],
+        llm,
+    )
+
+    assert llm.verify_called is True
+    assert contract.contract == contract_name
+    assert all(signal.virtual_probe for signal in contract.signals)
+    assert contract.signals[0].virtual_probe == "process.cpu.thread_count"
+    assert contract.signals[1].virtual_probe == "benchmark.context_switch_rate"
+    assert contract.recipes[0].diagnose
+    assert contract.recipes[0].config_checks == ["runtime_threads"]
+    assert contract.recipes[0].guardrails == ["contention_signal"]
+    assert contract.recipes[0].actions[0].label == "set_threads_lower"
+
+
+@pytest.mark.asyncio
+async def test_synthesizer_retries_when_verifier_claims_valid_without_repair_payload() -> None:
+    llm = _RetryingRepairContractLLM("scikit-learn", "n_jobs")
+    contract = await synthesize_library_contract(
+        "scikit-learn",
+        [SourceArtifact(source_id="doc_001", path="docs/scikit-learn.md", kind="doc")],
+        [
+            EvidenceItem.model_validate(
+                {
+                    "evidence_id": "ev_001",
+                    "library_name": "scikit-learn",
+                    "chunk_id": "doc_001:chunk_001",
+                    "kind": "intervention",
+                    "title": "Coordinate parallel worker counts",
+                    "content": "Reduce oversubscription by lowering outer or inner worker counts.",
+                    "keywords": ["n_jobs", "threads", "oversubscription"],
+                    "resource_domains": ["cpu_threads"],
+                    "source_quote": "Reduce oversubscription by lowering worker counts.",
+                    "source_refs": ["doc_001:chunk_001"],
+                }
+            )
+        ],
+        llm,
+    )
+
+    assert llm.verify_attempts == 2
+    assert contract.contract == "scikit-learn"
+
+
+def test_verify_contract_prompt_requires_current_virtual_probe_design() -> None:
+    prompt_path = (
+        Path(__file__).resolve().parents[1]
+        / "syspilot_contract"
+        / "prompts"
+        / "verify_contract.txt"
+    )
+    prompt = prompt_path.read_text(encoding="utf-8")
+
+    assert "signal.virtual_probe" in prompt
+    assert "signals must use probe.kind + probe.name" not in prompt
+    assert "probe.kind" not in prompt
+    assert "probe.name" not in prompt
+    assert "recipes must include diagnose blocks, config_checks, outcomes, and guardrails" in prompt
+    assert "use predicate kind not_nested only with cpu.compute or gpu.compute" in prompt
+    assert "use predicate kind placement_compatible only with cpu.placement" in prompt
+    assert "config-check signals must target the configured component/use/resource path, never a control id" in prompt
+    assert "do not redirect worker-count controls to use demand paths or raw resources just to satisfy existence" in prompt
+
+
+def test_synthesize_contract_prompt_documents_predicate_resource_constraints() -> None:
+    prompt_path = (
+        Path(__file__).resolve().parents[1]
+        / "syspilot_contract"
+        / "prompts"
+        / "synthesize_contract.txt"
+    )
+    prompt = prompt_path.read_text(encoding="utf-8")
+
+    assert "use predicate kind not_nested only with cpu.compute or gpu.compute" in prompt
+    assert "use predicate kind placement_compatible only with cpu.placement" in prompt
+    assert "if a worker-count control exists, model the controlled runtime as a component kind executor with an attrs.workers field" in prompt
+    assert "config-check signals should target the configured component/use/resource path itself, never a control id" in prompt

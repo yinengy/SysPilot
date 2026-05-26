@@ -867,12 +867,6 @@ class LibraryContract(ContractBaseModel):
                 issues.append(f"Use {item.id} references missing component {item.by}.")
 
         for control in self.controls:
-            if control.name.startswith("BENCHMARK_") and not any(
-                token in self.contract.lower() for token in ("benchmark", "wrapper")
-            ):
-                issues.append(
-                    f"Control {control.name} is a benchmark-wrapper variable and must not appear in library contract {self.contract}."
-                )
             if not _target_exists(control.target, self):
                 if control.target == "cpu.thread" and _looks_like_worker_control(control.name):
                     issues.append(
@@ -885,7 +879,7 @@ class LibraryContract(ContractBaseModel):
                 else:
                     issues.append(f"Control {control.id} targets nonexistent {control.target}.")
             elif _looks_like_worker_control(control.name) and not control.target.endswith(
-                ".workers"
+                (".workers", ".threads_per_worker")
             ):
                 issues.append(
                     f"Control {control.name} should target an executor workers attribute, not {control.target}."

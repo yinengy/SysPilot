@@ -63,3 +63,24 @@ async def test_step_writes_llm_prompt_log(tmp_path: Path, monkeypatch: pytest.Mo
         msg["role"] == "user" and msg["content"] == "hello tune" for msg in payload["messages"]
     )
     assert payload["tools"] == []
+
+
+@pytest.mark.asyncio
+async def test_step_stateless_does_not_resend_previous_prompts(monkeypatch: pytest.MonkeyPatch) -> None:
+    agent = SysPilotAgent(SysPilotConfig())
+    captured: list[list[str]] = []
+
+    async def _fake_chat(*args: object, **kwargs: object) -> LLMResponse:
+        _ = args
+        messages = kwargs["messages"]
+        captured.append([msg.content for msg in messages])
+        return LLMResponse(content='{"summary":"ok","actions":[]}')
+
+    monkeypatch.setattr(agent.llm, "chat", _fake_chat)
+
+    await agent.step("large previous tune prompt")
+    await agent.step_stateless("small current tune prompt")
+
+    assert any("large previous tune prompt" in content for content in captured[0])
+    assert any("small current tune prompt" in content for content in captured[1])
+    assert not any("large previous tune prompt" in content for content in captured[1])

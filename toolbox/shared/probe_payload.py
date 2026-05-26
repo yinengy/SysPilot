@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+import csv
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,54 @@ def combined_output(payload: dict[str, Any]) -> str:
     stdout = str(payload.get("stdout", "") or "")
     stderr = str(payload.get("stderr", "") or "")
     return stdout + (("\n" + stderr) if stderr else "")
+
+
+def json_objects_from_output(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    text = combined_output(payload).strip()
+    if not text:
+        return []
+    candidates = [text]
+    candidates.extend(line.strip() for line in text.splitlines() if line.strip())
+    objects: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            objects.append(parsed)
+    return objects
+
+
+def json_rows_from_output(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for item in json_objects_from_output(payload):
+        raw_rows = item.get("rows")
+        if isinstance(raw_rows, list):
+            rows.extend(row for row in raw_rows if isinstance(row, dict))
+            continue
+        rows.append(item)
+    return rows
+
+
+def libcontentbench_metric_timeseries(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for output_row in json_rows_from_output(payload):
+        output_dir = output_row.get("output_dir")
+        if not isinstance(output_dir, str) or not output_dir.strip():
+            continue
+        csv_path = Path(output_dir) / "metrics_timeseries.csv"
+        try:
+            with csv_path.open("r", encoding="utf-8", newline="") as handle:
+                reader = csv.DictReader(handle)
+                rows.extend(dict(row) for row in reader)
+        except OSError:
+            continue
+    return rows
 
 
 def excerpt_lines(text: str, terms: list[str], *, limit: int = 8) -> list[str]:

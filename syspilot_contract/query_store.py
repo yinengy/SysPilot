@@ -523,6 +523,8 @@ class ContractStore:
                 resolved_validation_signals = []
                 for ref in item.validation.collect:
                     contract, signal = self._require_signal_ref(ref, signal_ref_map)
+                    if signal.role == "outcome":
+                        continue
                     signal_payload = _signal_payload(contract, signal)
                     resolved_validation_signals.append(
                         {
@@ -700,6 +702,8 @@ class ContractStore:
         signals_to_collect: list[dict[str, object]] = []
         for contract in libraries:
             for signal in contract.signals:
+                if signal.role == "outcome":
+                    continue
                 payload = _signal_payload(contract, signal)
                 payload["score"] = _score(str(payload.get("text", "")), terms)
                 profile_first.append(payload)
