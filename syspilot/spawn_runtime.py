@@ -50,8 +50,12 @@ ContractValidationRunner = Callable[
     Awaitable[tuple[dict[str, Any], int, list[str]]],
 ]
 StartProbeSessions = Callable[[list[str], dict[str, Any]], Awaitable[dict[str, Any]]]
-FinishProbeSessions = Callable[[dict[str, Any], dict[str, Any]], Awaitable[dict[str, dict[str, Any]]]]
-SampleProbeSessions = Callable[[dict[str, Any], dict[str, Any]], Awaitable[dict[str, dict[str, Any]]]]
+FinishProbeSessions = Callable[
+    [dict[str, Any], dict[str, Any]], Awaitable[dict[str, dict[str, Any]]]
+]
+SampleProbeSessions = Callable[
+    [dict[str, Any], dict[str, Any]], Awaitable[dict[str, dict[str, Any]]]
+]
 
 
 def _read_proc_status_map(pid: int) -> dict[str, Any]:
@@ -146,7 +150,9 @@ async def execute_profiled_spawn_run(
     env_overrides: dict[str, str] | None,
     hypothesis_profiles: list[dict[str, Any]] | None,
     live_output_callback: Callable[[str, str], None] | None,
-    build_spawn_profiling_env: Callable[[dict[str, str] | None, dict[str, str] | None], dict[str, str] | None],
+    build_spawn_profiling_env: Callable[
+        [dict[str, str] | None, dict[str, str] | None], dict[str, str] | None
+    ],
     wrap_spawn_command_with_memory_high: Callable[[list[str], str | None, str | None], list[str]],
     discover_related_processes: Callable[[int, int], dict[str, Any]],
     summarize_spawn_runtime_output: Callable[[str, str], dict[str, object]],
@@ -390,7 +396,10 @@ async def execute_profiled_spawn_run(
         "    key, value = line.split(':', 1)\n"
         "    key = key.strip()\n"
         "    value = value.strip()\n"
-        "    if key in {'Name', 'State', 'Threads', 'Cpus_allowed_list', 'Mems_allowed_list', 'VmRSS', 'voluntary_ctxt_switches', 'nonvoluntary_ctxt_switches'}:\n"
+        "    interesting = {'Name', 'State', 'Threads', 'Cpus_allowed_list', "
+        "'Mems_allowed_list', 'VmRSS', 'voluntary_ctxt_switches', "
+        "'nonvoluntary_ctxt_switches'}\n"
+        "    if key in interesting:\n"
         "        data[key] = value\n"
         "data['line_count'] = line_count\n"
         "print(json.dumps(data))\n"
@@ -579,7 +588,8 @@ async def execute_profiled_spawn_run(
     }
 
     if selected_hypothesis_profiles:
-        validation_result, validation_tool_calls, validation_tools = await run_contract_hypothesis_validation(
+        validation_result, validation_tool_calls, validation_tools = await (
+            run_contract_hypothesis_validation(
             agent,
             selected_hypothesis_profiles,
             profiling_json,
@@ -594,14 +604,16 @@ async def execute_profiled_spawn_run(
                 ),
                 **report_env_overrides,
             },
+            )
         )
         agent_tool_calls += validation_tool_calls
         tools_used.extend(validation_tools)
         profiling_json["tools_used"] = tools_used
         profiling_json["contract_hypothesis_validation"] = validation_result
         if validation_result.get("profiles"):
+            profile_count = len(validation_result.get("profiles", []))
             key_findings.append(
-                f"contract-guided validation evaluated {len(validation_result.get('profiles', []))} hypothesis profile(s)"
+                f"contract-guided validation evaluated {profile_count} hypothesis profile(s)"
             )
         elif validation_result.get("error"):
             key_findings.append(
@@ -628,4 +640,127 @@ async def execute_profiled_spawn_run(
         stop_reason=stop_reason,
         stopped_intentionally=stopped_intentionally,
         stop_after_seconds=stop_after_seconds,
+    )
+
+
+async def execute_unprofiled_spawn_run(
+    agent: SysPilotAgent,
+    command_parts: list[str],
+    timeout: int,
+    *,
+    workdir: str | None,
+    memory_high: str | None,
+    env_overrides: dict[str, str] | None,
+    live_output_callback: Callable[[str, str], None] | None,
+    wrap_spawn_command_with_memory_high: Callable[[list[str], str | None, str | None], list[str]],
+    summarize_spawn_runtime_output: Callable[[str, str], dict[str, object]],
+) -> SharedRunArtifact:
+    started_at = time.monotonic()
+    started_at_wall = datetime.now(timezone.utc).isoformat()
+    launch_command = wrap_spawn_command_with_memory_high(command_parts, memory_high, workdir)
+    launch_cwd = None if memory_high else workdir
+    env = os.environ.copy()
+    if env_overrides:
+        env.update({str(key): str(value) for key, value in env_overrides.items()})
+
+    proc = await asyncio.create_subprocess_exec(
+        *launch_command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=launch_cwd,
+        env=env,
+    )
+    pid = proc.pid
+    prev_target_pid = getattr(agent.context, "target_pid", None)
+    agent.context.target_pid = pid
+
+    async def _drain_stream(
+        stream_name: str,
+        stream: asyncio.StreamReader | None,
+        chunks: list[str],
+    ) -> str:
+        if stream is None:
+            return ""
+        while True:
+            line = await stream.readline()
+            if not line:
+                break
+            text = line.decode("utf-8", errors="replace")
+            chunks.append(text)
+            if live_output_callback is not None:
+                live_output_callback(stream_name, text)
+        return "".join(chunks)
+
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+    stdout_task = asyncio.create_task(_drain_stream("stdout", proc.stdout, stdout_chunks))
+    stderr_task = asyncio.create_task(_drain_stream("stderr", proc.stderr, stderr_chunks))
+
+    timed_out = False
+    stop_reason = "completed"
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=float(timeout))
+        rc = proc.returncode if proc.returncode is not None else 0
+    except asyncio.TimeoutError:
+        proc.kill()
+        try:
+            await proc.wait()
+        except ProcessLookupError:
+            pass
+        rc = -1
+        timed_out = True
+        stop_reason = "timeout"
+
+    stdout = await stdout_task
+    stderr = await stderr_task
+    if timed_out:
+        timeout_message = "Command timed out during no-profile run"
+        stderr = f"{stderr}\n{timeout_message}".strip() if stderr else timeout_message
+
+    wall = time.monotonic() - started_at
+    runtime_output = summarize_spawn_runtime_output(stdout, stderr)
+    profiling_json: dict[str, Any] = {
+        "pipeline_used": False,
+        "profiling_skipped": True,
+        "tools_used": [],
+        "target_pids": [pid],
+        "primary_pid": pid,
+        "collect_profile_summary": "profiling skipped; raw runtime output only",
+        "collect_profile_data": {},
+        "ebpf_summary": "",
+        "refined_runtime_maps": {},
+        "per_pid_runtime_maps": {},
+        "cgroup_memory_evidence": {},
+        "virtual_probe_results": {},
+        "runtime_output": runtime_output,
+        "process_tree_targets": {"target_pids": [pid], "primary_pid": pid, "workers": []},
+        "key_findings": ["profiling skipped by --no-profile; use raw stdout/stderr evidence"],
+        "periodic_probe_samples": [],
+        "requested_virtual_probes": [],
+        "contract_hypothesis_validation": {},
+        "stdout": stdout,
+        "stderr": stderr,
+        "stop_reason": stop_reason,
+        "stopped_intentionally": False,
+        "stop_after_seconds": None,
+    }
+    profiling_text = json.dumps(profiling_json)
+    finished_at_wall = datetime.now(timezone.utc).isoformat()
+    agent.context.target_pid = prev_target_pid
+    return SharedRunArtifact(
+        pid=pid,
+        launch_command=launch_command,
+        wall_time=wall,
+        stdout=stdout,
+        stderr=stderr,
+        returncode=rc,
+        timed_out=timed_out,
+        started_at=started_at_wall,
+        finished_at=finished_at_wall,
+        profiling_text=profiling_text,
+        profiling_json=profiling_json,
+        tool_calls_used=0,
+        stop_reason=stop_reason,
+        stopped_intentionally=False,
+        stop_after_seconds=None,
     )

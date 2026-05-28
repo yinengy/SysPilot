@@ -373,7 +373,7 @@ In spawn mode, contracts provide library policy and hypotheses, while manual hin
 2. Re-profile process tree (parent + heavy worker children), optionally with contract-guided hypothesis validation
 3. Ask agent for structured actions using profiling evidence, loaded contract context, and application manual hints (`summary`, `manual_citation`, `evidence`, `actions`)
 4. Execute bounded candidate search
-5. Keep best-so-far config and stop by convergence or max iterations
+5. Keep best-so-far config and stop by convergence or the `--max-iterations` materialized candidate-trial cap by default, or by `--fixed-budget N` when an explicit candidate-attempt cap is active. Fixed budget limits search cost only and does not promise an optimal result.
 
 ## Future Enhancements
 

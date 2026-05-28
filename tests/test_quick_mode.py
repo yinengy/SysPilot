@@ -2,18 +2,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
-from collections.abc import Sequence
+from typing import Any, cast
 from unittest.mock import patch
 
 from click.testing import CliRunner
+from rich.console import Console
 
 from syspilot.cli import _run_live_profiling_pipeline, cli
 from syspilot.core.agent import SysPilotAgent
 from syspilot.core.config import SysPilotConfig
 from syspilot.core.llm import LLMProviderError
+from syspilot.fixed_budget import FixedBudgetState
 from syspilot.quick_mode import (
     QuickBaselineWindow,
     QuickModeDefaults,
@@ -25,16 +27,15 @@ from syspilot.quick_mode import (
     _extract_signal_specs,
     _format_objective_speedup,
     _interleave_windows_by_signal,
+    _materialize_result,
     _objective_speedup_ratio,
     _plain_live_output_callback,
-    _materialize_result,
     classify_signal_usefulness,
     detect_baseline_window,
     rank_abnormal_windows,
     select_promotions,
 )
 from syspilot.ui.output_sink import PlainOutputSink
-from rich.console import Console
 
 
 class _DummyQuickAgent:
@@ -75,11 +76,16 @@ class _LiveProfileAgent(SysPilotAgent):
 
 
 class _CaptureEmitter:
-    def __init__(self, run_id: str | None = None, capacity: int = 256, critical_reserve: int = 16) -> None:
+    instances: list[_CaptureEmitter] = []
+
+    def __init__(
+        self, run_id: str | None = None, capacity: int = 256, critical_reserve: int = 16
+    ) -> None:
         _ = capacity
         _ = critical_reserve
         self.run_id = run_id or "quick-test-run"
         self.events: list[dict[str, object]] = []
+        type(self).instances.append(self)
 
     def publish(
         self,
@@ -125,7 +131,17 @@ def _noop(*args: object, **kwargs: object) -> None:
     _ = kwargs
 
 
-def _sample_entries(values: Sequence[float | int], probe_name: str = "process.memory.rss") -> list[dict[str, object]]:
+class _RecordingFixedBudgetState(FixedBudgetState):
+    instances: list[_RecordingFixedBudgetState] = []
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        type(self).instances.append(self)
+
+
+def _sample_entries(
+    values: Sequence[float | int], probe_name: str = "process.memory.rss"
+) -> list[dict[str, object]]:
     return [
         {
             "time_offset_s": idx * 5.0,
@@ -143,7 +159,9 @@ def _sample_entries(values: Sequence[float | int], probe_name: str = "process.me
     ]
 
 
-def _multi_probe_sample_entries(probe_values: dict[str, Sequence[float | int]]) -> list[dict[str, object]]:
+def _multi_probe_sample_entries(
+    probe_values: dict[str, Sequence[float | int]],
+) -> list[dict[str, object]]:
     sample_count = max(len(values) for values in probe_values.values()) if probe_values else 0
     entries: list[dict[str, object]] = []
     for idx in range(sample_count):
@@ -161,6 +179,101 @@ def _multi_probe_sample_entries(probe_values: dict[str, Sequence[float | int]]) 
             }
         entries.append({"time_offset_s": idx * 5.0, "results": results})
     return entries
+
+
+def _single_signal_structured_bundle(
+    *,
+    signal_ref: str = "demo.sig",
+    signal_id: str = "sig",
+    metric: str = "rss_mb",
+    probe_name: str = "process.memory.rss",
+    candidate_controls: Sequence[str] = ("OMP_NUM_THREADS",),
+) -> dict[str, object]:
+    controls = list(candidate_controls)
+    return {
+        "profile_first": [
+            {
+                "signal_ref": signal_ref,
+                "role": "resource_signal",
+                "hypothesis_name": "demo-hypothesis",
+                "candidate_controls": controls,
+                "signal": {
+                    "id": signal_id,
+                    "metric": metric,
+                    "virtual_probe": probe_name,
+                    "expected_direction_when_mitigated": "decrease",
+                    "role": "resource_signal",
+                },
+            }
+        ],
+        "hypothesis_profiles": [
+            {
+                "hypothesis_id": "demo-hypothesis",
+                "validation_signals": [
+                    {
+                        "ref": signal_ref,
+                        "role": "resource_signal",
+                        "candidate_controls": controls,
+                        "signal": {
+                            "id": signal_id,
+                            "metric": metric,
+                            "virtual_probe": probe_name,
+                            "expected_direction_when_mitigated": "decrease",
+                            "role": "resource_signal",
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+
+
+def _quick_baseline_artifact(
+    *,
+    stdout: str = "baseline\n",
+    probe_name: str = "process.memory.rss",
+    values: Sequence[float | int] = (10, 10, 10, 20, 20, 20, 20, 10, 10, 10),
+) -> dict[str, Any]:
+    return {
+        "pid": 1000,
+        "launch_command": ["echo", "hi"],
+        "wall_time": 5.0,
+        "stdout": stdout,
+        "stderr": "",
+        "returncode": 0,
+        "timed_out": False,
+        "profiling_text": "{}",
+        "profiling_json": {
+            "periodic_probe_samples": _sample_entries(values, probe_name=probe_name)
+        },
+        "tool_calls_used": 0,
+        "stop_reason": "completed",
+        "stopped_intentionally": False,
+    }
+
+
+def _quick_completed_short_artifact(
+    *,
+    stdout: str = "completed\n",
+    probe_name: str = "process.memory.rss",
+    values: Sequence[float | int] = (10,),
+) -> dict[str, Any]:
+    return {
+        "pid": 1001,
+        "launch_command": ["echo", "hi"],
+        "wall_time": 2.0,
+        "stdout": stdout,
+        "stderr": "",
+        "returncode": 0,
+        "timed_out": False,
+        "profiling_text": "{}",
+        "profiling_json": {
+            "periodic_probe_samples": _sample_entries(values, probe_name=probe_name)
+        },
+        "tool_calls_used": 0,
+        "stop_reason": "completed",
+        "stopped_intentionally": False,
+    }
 
 
 def test_quick_mode_defaults_match_requested_behavior() -> None:
@@ -228,7 +341,9 @@ def test_detect_baseline_window_falls_back_to_level_when_no_burst_exists() -> No
 def test_rank_abnormal_windows_orders_multiple_signals() -> None:
     defaults = QuickModeDefaults()
     specs = [
-        QuickSignalSpec("sig.a", "a", "rss_mb", "process.memory.rss", "decrease", "resource_signal"),
+        QuickSignalSpec(
+            "sig.a", "a", "rss_mb", "process.memory.rss", "decrease", "resource_signal"
+        ),
         QuickSignalSpec("sig.b", "b", "queue_depth", "queue.depth", "decrease", "resource_signal"),
     ]
     artifact = {
@@ -237,8 +352,16 @@ def test_rank_abnormal_windows_orders_multiple_signals() -> None:
                 {
                     "time_offset_s": idx * 5.0,
                     "results": {
-                        "process.memory.rss": {"observed": True, "value": value_a, "flat": {"value": value_a}},
-                        "queue.depth": {"observed": True, "value": value_b, "flat": {"value": value_b}},
+                        "process.memory.rss": {
+                            "observed": True,
+                            "value": value_a,
+                            "flat": {"value": value_a},
+                        },
+                        "queue.depth": {
+                            "observed": True,
+                            "value": value_b,
+                            "flat": {"value": value_b},
+                        },
                     },
                 }
                 for idx, (value_a, value_b) in enumerate(
@@ -260,7 +383,9 @@ def test_rank_abnormal_windows_orders_multiple_signals() -> None:
 
 
 def test_interleave_windows_by_signal_rotates_first_pass_across_distinct_signals() -> None:
-    def _window(window_id: str, signal_ref: str, severity: float, abnormality_score: float) -> QuickBaselineWindow:
+    def _window(
+        window_id: str, signal_ref: str, severity: float, abnormality_score: float
+    ) -> QuickBaselineWindow:
         return QuickBaselineWindow(
             window_id=window_id,
             signal_name=signal_ref,
@@ -297,7 +422,9 @@ def test_interleave_windows_by_signal_rotates_first_pass_across_distinct_signals
 
 
 def test_build_signal_window_groups_keeps_multiple_windows_under_one_signal() -> None:
-    def _window(window_id: str, signal_ref: str, signal_name: str, start: float, end: float) -> QuickBaselineWindow:
+    def _window(
+        window_id: str, signal_ref: str, signal_name: str, start: float, end: float
+    ) -> QuickBaselineWindow:
         return QuickBaselineWindow(
             window_id=window_id,
             signal_name=signal_name,
@@ -493,10 +620,78 @@ def test_rank_abnormal_windows_accepts_cgroup_memory_high_samples() -> None:
 
 def test_select_promotions_caps_fraction() -> None:
     results = [
-        QuickShortResult(1, "c1", "short-1", "sig", "rss", "w1", ["cmd"], {}, "short", 1.0, 0, "screen_budget_reached", True, 1.0, 10.0, "screened"),
-        QuickShortResult(2, "c2", "short-2", "sig", "rss", "w1", ["cmd"], {}, "short", 1.0, 0, "screen_budget_reached", True, 1.0, 8.0, "screened"),
-        QuickShortResult(3, "c3", "short-3", "sig", "rss", "w1", ["cmd"], {}, "short", 1.0, 0, "screen_budget_reached", True, 1.0, 3.0, "screened"),
-        QuickShortResult(4, "c4", "short-4", "sig", "rss", "w1", ["cmd"], {}, "short", 1.0, 0, "screen_budget_reached", True, None, None, "unavailable"),
+        QuickShortResult(
+            1,
+            "c1",
+            "short-1",
+            "sig",
+            "rss",
+            "w1",
+            ["cmd"],
+            {},
+            "short",
+            1.0,
+            0,
+            "screen_budget_reached",
+            True,
+            1.0,
+            10.0,
+            "screened",
+        ),
+        QuickShortResult(
+            2,
+            "c2",
+            "short-2",
+            "sig",
+            "rss",
+            "w1",
+            ["cmd"],
+            {},
+            "short",
+            1.0,
+            0,
+            "screen_budget_reached",
+            True,
+            1.0,
+            8.0,
+            "screened",
+        ),
+        QuickShortResult(
+            3,
+            "c3",
+            "short-3",
+            "sig",
+            "rss",
+            "w1",
+            ["cmd"],
+            {},
+            "short",
+            1.0,
+            0,
+            "screen_budget_reached",
+            True,
+            1.0,
+            3.0,
+            "screened",
+        ),
+        QuickShortResult(
+            4,
+            "c4",
+            "short-4",
+            "sig",
+            "rss",
+            "w1",
+            ["cmd"],
+            {},
+            "short",
+            1.0,
+            0,
+            "screen_budget_reached",
+            True,
+            None,
+            None,
+            "unavailable",
+        ),
     ]
 
     decisions = select_promotions(results, full_run_ratio=0.34, max_full_runs_per_group=2)
@@ -506,15 +701,95 @@ def test_select_promotions_caps_fraction() -> None:
 
 
 def test_classify_signal_usefulness_reports_predictive() -> None:
-    spec = QuickSignalSpec("sig.ref", "sig", "rss", "process.memory.rss", "decrease", "resource_signal")
+    spec = QuickSignalSpec(
+        "sig.ref", "sig", "rss", "process.memory.rss", "decrease", "resource_signal"
+    )
     defaults = QuickModeDefaults()
     short_results = [
-        QuickShortResult(1, "c1", "short-1", "sig.ref", "rss", "w1", ["cmd"], {}, "short", 1.0, 0, "screen_budget_reached", True, 10.0, 15.0, "screened"),
-        QuickShortResult(2, "c2", "short-2", "sig.ref", "rss", "w1", ["cmd"], {}, "short", 1.0, 0, "screen_budget_reached", True, 11.0, 5.0, "screened"),
+        QuickShortResult(
+            1,
+            "c1",
+            "short-1",
+            "sig.ref",
+            "rss",
+            "w1",
+            ["cmd"],
+            {},
+            "short",
+            1.0,
+            0,
+            "screen_budget_reached",
+            True,
+            10.0,
+            15.0,
+            "screened",
+        ),
+        QuickShortResult(
+            2,
+            "c2",
+            "short-2",
+            "sig.ref",
+            "rss",
+            "w1",
+            ["cmd"],
+            {},
+            "short",
+            1.0,
+            0,
+            "screen_budget_reached",
+            True,
+            11.0,
+            5.0,
+            "screened",
+        ),
     ]
     full_results = [
-        QuickShortResult(1, "c1", "full-1", "sig.ref", "rss", "w1", ["cmd"], {}, "full", 3.0, 0, "completed", False, 9.0, 12.0, "screened", objective_metric="throughput", objective_mode="maximize", objective_value=120.0, objective_improvement_pct=20.0, objective_improved=True),
-        QuickShortResult(2, "c2", "full-2", "sig.ref", "rss", "w1", ["cmd"], {}, "full", 3.0, 0, "completed", False, 10.5, 4.0, "screened", objective_metric="throughput", objective_mode="maximize", objective_value=104.0, objective_improvement_pct=4.0, objective_improved=True),
+        QuickShortResult(
+            1,
+            "c1",
+            "full-1",
+            "sig.ref",
+            "rss",
+            "w1",
+            ["cmd"],
+            {},
+            "full",
+            3.0,
+            0,
+            "completed",
+            False,
+            9.0,
+            12.0,
+            "screened",
+            objective_metric="throughput",
+            objective_mode="maximize",
+            objective_value=120.0,
+            objective_improvement_pct=20.0,
+            objective_improved=True,
+        ),
+        QuickShortResult(
+            2,
+            "c2",
+            "full-2",
+            "sig.ref",
+            "rss",
+            "w1",
+            ["cmd"],
+            {},
+            "full",
+            3.0,
+            0,
+            "completed",
+            False,
+            10.5,
+            4.0,
+            "screened",
+            objective_metric="throughput",
+            objective_mode="maximize",
+            objective_value=104.0,
+            objective_improvement_pct=4.0,
+            objective_improved=True,
+        ),
     ]
 
     usefulness = classify_signal_usefulness(
@@ -528,15 +803,95 @@ def test_classify_signal_usefulness_reports_predictive() -> None:
 
 
 def test_classify_signal_usefulness_uses_full_run_outcome() -> None:
-    spec = QuickSignalSpec("sig.ref", "sig", "rss", "process.memory.rss", "decrease", "resource_signal")
+    spec = QuickSignalSpec(
+        "sig.ref", "sig", "rss", "process.memory.rss", "decrease", "resource_signal"
+    )
     defaults = QuickModeDefaults()
     short_results = [
-        QuickShortResult(1, "c1", "short-1", "sig.ref", "rss", "w1", ["cmd"], {}, "short", 1.0, 0, "screen_budget_reached", True, 10.0, 15.0, "screened"),
-        QuickShortResult(2, "c2", "short-2", "sig.ref", "rss", "w1", ["cmd"], {}, "short", 1.0, 0, "screen_budget_reached", True, 11.0, 10.0, "screened"),
+        QuickShortResult(
+            1,
+            "c1",
+            "short-1",
+            "sig.ref",
+            "rss",
+            "w1",
+            ["cmd"],
+            {},
+            "short",
+            1.0,
+            0,
+            "screen_budget_reached",
+            True,
+            10.0,
+            15.0,
+            "screened",
+        ),
+        QuickShortResult(
+            2,
+            "c2",
+            "short-2",
+            "sig.ref",
+            "rss",
+            "w1",
+            ["cmd"],
+            {},
+            "short",
+            1.0,
+            0,
+            "screen_budget_reached",
+            True,
+            11.0,
+            10.0,
+            "screened",
+        ),
     ]
     full_results = [
-        QuickShortResult(1, "c1", "full-1", "sig.ref", "rss", "w1", ["cmd"], {}, "full", 3.0, 0, "completed", False, 9.0, 13.0, "screened", objective_metric="throughput", objective_mode="maximize", objective_value=95.0, objective_improvement_pct=-5.0, objective_improved=False),
-        QuickShortResult(2, "c2", "full-2", "sig.ref", "rss", "w1", ["cmd"], {}, "full", 3.0, 0, "completed", False, 10.0, 6.0, "screened", objective_metric="throughput", objective_mode="maximize", objective_value=112.0, objective_improvement_pct=12.0, objective_improved=True),
+        QuickShortResult(
+            1,
+            "c1",
+            "full-1",
+            "sig.ref",
+            "rss",
+            "w1",
+            ["cmd"],
+            {},
+            "full",
+            3.0,
+            0,
+            "completed",
+            False,
+            9.0,
+            13.0,
+            "screened",
+            objective_metric="throughput",
+            objective_mode="maximize",
+            objective_value=95.0,
+            objective_improvement_pct=-5.0,
+            objective_improved=False,
+        ),
+        QuickShortResult(
+            2,
+            "c2",
+            "full-2",
+            "sig.ref",
+            "rss",
+            "w1",
+            ["cmd"],
+            {},
+            "full",
+            3.0,
+            0,
+            "completed",
+            False,
+            10.0,
+            6.0,
+            "screened",
+            objective_metric="throughput",
+            objective_mode="maximize",
+            objective_value=112.0,
+            objective_improvement_pct=12.0,
+            objective_improved=True,
+        ),
     ]
 
     usefulness = classify_signal_usefulness(
@@ -747,7 +1102,9 @@ def test_quick_mode_end_to_end_writes_structured_artifacts_and_objective_winner(
         "returncode": 0,
         "timed_out": False,
         "profiling_text": "{}",
-        "profiling_json": {"periodic_probe_samples": _sample_entries([10, 10, 10, 20, 20, 20, 20, 10, 10, 10])},
+        "profiling_json": {
+            "periodic_probe_samples": _sample_entries([10, 10, 10, 20, 20, 20, 20, 10, 10, 10])
+        },
         "tool_calls_used": 0,
         "stop_reason": "completed",
         "stopped_intentionally": False,
@@ -799,7 +1156,9 @@ def test_quick_mode_end_to_end_writes_structured_artifacts_and_objective_winner(
             "returncode": 0,
             "timed_out": False,
             "profiling_text": "{}",
-            "profiling_json": {"periodic_probe_samples": _sample_entries([10, 10, 10, 14, 14, 14, 14, 10, 10, 10])},
+            "profiling_json": {
+                "periodic_probe_samples": _sample_entries([10, 10, 10, 14, 14, 14, 14, 10, 10, 10])
+            },
             "tool_calls_used": 0,
             "stop_reason": "completed",
             "stopped_intentionally": False,
@@ -813,7 +1172,9 @@ def test_quick_mode_end_to_end_writes_structured_artifacts_and_objective_winner(
             "returncode": 0,
             "timed_out": False,
             "profiling_text": "{}",
-            "profiling_json": {"periodic_probe_samples": _sample_entries([10, 10, 10, 16, 16, 16, 16, 10, 10, 10])},
+            "profiling_json": {
+                "periodic_probe_samples": _sample_entries([10, 10, 10, 16, 16, 16, 16, 10, 10, 10])
+            },
             "tool_calls_used": 0,
             "stop_reason": "completed",
             "stopped_intentionally": False,
@@ -832,7 +1193,9 @@ def test_quick_mode_end_to_end_writes_structured_artifacts_and_objective_winner(
                 callback("stderr", line)
         return artifact
 
-    async def _fake_extract_metrics(agent: SysPilotAgent, output: str, context: str) -> dict[str, Any]:
+    async def _fake_extract_metrics(
+        agent: SysPilotAgent, output: str, context: str
+    ) -> dict[str, Any]:
         _ = agent
         _ = context
         for line in output.splitlines():
@@ -847,7 +1210,10 @@ def test_quick_mode_end_to_end_writes_structured_artifacts_and_objective_winner(
             patch("syspilot.cli._register_default_skills", _noop),
             patch("syspilot.cli._register_profiling_tools", _noop),
             patch("syspilot.cli._register_tuning_tools", _noop),
-            patch("syspilot.cli._build_contract_context_bundle", lambda *args, **kwargs: structured_bundle),
+            patch(
+                "syspilot.cli._build_contract_context_bundle",
+                lambda *args, **kwargs: structured_bundle,
+            ),
             patch("syspilot.cli._run_live_profiling_pipeline", _fake_profile),
             patch("syspilot.cli._extract_metrics_from_output", _fake_extract_metrics),
         ):
@@ -987,7 +1353,9 @@ def test_quick_mode_uses_completed_short_run_as_validated_objective_evidence() -
         "returncode": 0,
         "timed_out": False,
         "profiling_text": "{}",
-        "profiling_json": {"periodic_probe_samples": _sample_entries([10, 10, 10, 20, 20, 20, 20, 10, 10, 10])},
+        "profiling_json": {
+            "periodic_probe_samples": _sample_entries([10, 10, 10, 20, 20, 20, 20, 10, 10, 10])
+        },
         "tool_calls_used": 0,
         "stop_reason": "completed",
         "stopped_intentionally": False,
@@ -1019,7 +1387,9 @@ def test_quick_mode_uses_completed_short_run_as_validated_objective_evidence() -
                 callback("stderr", line)
         return artifact
 
-    async def _fake_extract_metrics(agent: SysPilotAgent, output: str, context: str) -> dict[str, Any]:
+    async def _fake_extract_metrics(
+        agent: SysPilotAgent, output: str, context: str
+    ) -> dict[str, Any]:
         _ = agent
         _ = context
         for line in output.splitlines():
@@ -1034,7 +1404,10 @@ def test_quick_mode_uses_completed_short_run_as_validated_objective_evidence() -
             patch("syspilot.cli._register_default_skills", _noop),
             patch("syspilot.cli._register_profiling_tools", _noop),
             patch("syspilot.cli._register_tuning_tools", _noop),
-            patch("syspilot.cli._build_contract_context_bundle", lambda *args, **kwargs: structured_bundle),
+            patch(
+                "syspilot.cli._build_contract_context_bundle",
+                lambda *args, **kwargs: structured_bundle,
+            ),
             patch("syspilot.cli._run_live_profiling_pipeline", _fake_profile),
             patch("syspilot.cli._extract_metrics_from_output", _fake_extract_metrics),
         ):
@@ -1073,10 +1446,650 @@ def test_quick_mode_uses_completed_short_run_as_validated_objective_evidence() -
         assert report["short_results"][0]["status"] == "unavailable"
         assert report["short_results"][0]["objective_value"] == 160.0
         assert report["short_results"][0]["objective_speedup_ratio"] == 1.6
-        assert report["promotions"][0]["reason"] == "already completed full workload during short screen"
+        assert (
+            report["promotions"][0]["reason"]
+            == "already completed full workload during short screen"
+        )
         assert "Completed before the quick-screen budget" in result.output
         assert "Quick mode selected" in result.output
         assert "1.60x (better)" in result.output
+
+
+def test_quick_mode_fixed_budget_counts_one_short_and_one_full_then_stops() -> None:
+    runner = CliRunner()
+    _CaptureEmitter.instances.clear()
+    _RecordingFixedBudgetState.instances.clear()
+
+    class _FixedBudgetAgent(_DummyQuickAgent):
+        def __init__(self, config: object) -> None:
+            super().__init__(config)
+            self.window_call_count = 0
+
+        async def step(self, prompt: str) -> SimpleNamespace:
+            _ = prompt
+            self.window_call_count += 1
+            parameter = "OMP_NUM_THREADS" if self.window_call_count == 1 else "OMP_PROC_BIND"
+            value = "1" if self.window_call_count == 1 else "close"
+            return SimpleNamespace(
+                content=json.dumps(
+                    {
+                        "summary": f"screen {parameter}",
+                        "manual_citation": "rule",
+                        "evidence": [parameter],
+                        "actions": [
+                            {
+                                "config_type": "env_var",
+                                "parameter": parameter,
+                                "new_value": value,
+                                "reason": "budgeted check",
+                                "manual_citation": "rule",
+                            }
+                        ],
+                    }
+                )
+            )
+
+    structured_bundle = {
+        "profile_first": [
+            {
+                "signal_ref": "demo.rss",
+                "role": "resource_signal",
+                "hypothesis_name": "rss-hypothesis",
+                "candidate_controls": ["OMP_NUM_THREADS"],
+                "signal": {
+                    "id": "rss",
+                    "metric": "rss_mb",
+                    "virtual_probe": "process.memory.rss",
+                    "expected_direction_when_mitigated": "decrease",
+                    "role": "resource_signal",
+                },
+            },
+            {
+                "signal_ref": "demo.queue",
+                "role": "resource_signal",
+                "hypothesis_name": "queue-hypothesis",
+                "candidate_controls": ["OMP_PROC_BIND"],
+                "signal": {
+                    "id": "queue",
+                    "metric": "queue_depth",
+                    "virtual_probe": "queue.depth",
+                    "expected_direction_when_mitigated": "decrease",
+                    "role": "resource_signal",
+                },
+            },
+        ],
+        "hypothesis_profiles": [
+            {
+                "hypothesis_id": "rss-hypothesis",
+                "validation_signals": [
+                    {
+                        "ref": "demo.rss",
+                        "role": "resource_signal",
+                        "candidate_controls": ["OMP_NUM_THREADS"],
+                        "signal": {
+                            "id": "rss",
+                            "metric": "rss_mb",
+                            "virtual_probe": "process.memory.rss",
+                            "expected_direction_when_mitigated": "decrease",
+                            "role": "resource_signal",
+                        },
+                    }
+                ],
+            },
+            {
+                "hypothesis_id": "queue-hypothesis",
+                "validation_signals": [
+                    {
+                        "ref": "demo.queue",
+                        "role": "resource_signal",
+                        "candidate_controls": ["OMP_PROC_BIND"],
+                        "signal": {
+                            "id": "queue",
+                            "metric": "queue_depth",
+                            "virtual_probe": "queue.depth",
+                            "expected_direction_when_mitigated": "decrease",
+                            "role": "resource_signal",
+                        },
+                    }
+                ],
+            },
+        ],
+    }
+
+    baseline = {
+        "pid": 1000,
+        "launch_command": ["echo", "hi"],
+        "wall_time": 5.0,
+        "stdout": "throughput=100\n",
+        "stderr": "",
+        "returncode": 0,
+        "timed_out": False,
+        "profiling_text": "{}",
+        "profiling_json": {
+            "periodic_probe_samples": _multi_probe_sample_entries(
+                {
+                    "process.memory.rss": [10, 10, 10, 20, 20, 20, 20, 10, 10, 10],
+                    "queue.depth": [5, 5, 5, 5, 5, 12, 12, 12, 12, 5],
+                }
+            )
+        },
+        "tool_calls_used": 0,
+        "stop_reason": "completed",
+        "stopped_intentionally": False,
+    }
+    short_artifact = {
+        "pid": 1001,
+        "launch_command": ["echo", "hi"],
+        "wall_time": 2.0,
+        "stdout": "short\n",
+        "stderr": "",
+        "returncode": -15,
+        "timed_out": False,
+        "profiling_text": "{}",
+        "profiling_json": {
+            "periodic_probe_samples": _sample_entries([10, 10, 10, 18, 18, 18, 18, 10, 10, 10])
+        },
+        "tool_calls_used": 0,
+        "stop_reason": "screen_budget_reached",
+        "stopped_intentionally": True,
+    }
+    full_artifact = {
+        "pid": 1002,
+        "launch_command": ["echo", "hi"],
+        "wall_time": 4.0,
+        "stdout": "throughput=104\nfull\n",
+        "stderr": "",
+        "returncode": 0,
+        "timed_out": False,
+        "profiling_text": "{}",
+        "profiling_json": {
+            "periodic_probe_samples": _sample_entries([10, 10, 10, 18, 18, 18, 18, 10, 10, 10])
+        },
+        "tool_calls_used": 0,
+        "stop_reason": "completed",
+        "stopped_intentionally": False,
+    }
+    artifacts = [baseline, short_artifact, full_artifact]
+
+    async def _fake_profile(*args: object, **kwargs: object) -> dict[str, Any]:
+        _ = args
+        artifact = artifacts.pop(0)
+        callback = kwargs.get("live_output_callback")
+        if callable(callback):
+            for line in str(artifact.get("stdout", "")).splitlines(True):
+                callback("stdout", line)
+            for line in str(artifact.get("stderr", "")).splitlines(True):
+                callback("stderr", line)
+        return artifact
+
+    async def _fake_extract_metrics(
+        agent: SysPilotAgent, output: str, context: str
+    ) -> dict[str, Any]:
+        _ = agent
+        _ = context
+        for line in output.splitlines():
+            if line.startswith("throughput="):
+                return {"throughput": float(line.split("=", 1)[1])}
+        return {"no_metrics": True}
+
+    with runner.isolated_filesystem():
+        with (
+            patch("syspilot.quick_mode.FixedBudgetState", _RecordingFixedBudgetState),
+            patch("syspilot.cli.TuneEventEmitter", _CaptureEmitter),
+            patch("syspilot.cli.SysPilotAgent", _FixedBudgetAgent),
+            patch("syspilot.cli._register_default_skills", _noop),
+            patch("syspilot.cli._register_profiling_tools", _noop),
+            patch("syspilot.cli._register_tuning_tools", _noop),
+            patch(
+                "syspilot.cli._build_contract_context_bundle",
+                lambda *args, **kwargs: structured_bundle,
+            ),
+            patch("syspilot.cli._run_live_profiling_pipeline", _fake_profile),
+            patch("syspilot.cli._extract_metrics_from_output", _fake_extract_metrics),
+        ):
+            result = runner.invoke(
+                cli,
+                [
+                    "tune",
+                    "--quick-mode",
+                    "--fixed-budget",
+                    "2",
+                    "--ui-mode",
+                    "plain",
+                    "--command",
+                    "echo hi",
+                    "--primary-objective",
+                    "throughput",
+                    "--primary-objective-mode",
+                    "maximize",
+                    "--contract",
+                    "demo",
+                    "--max-iterations",
+                    "1",
+                    "--timeout",
+                    "5",
+                ],
+            )
+
+        run_dir = Path("artifacts") / "quick_tune_runs" / "quick-test-run"
+        metadata = json.loads((run_dir / "metadata.json").read_text(encoding="utf-8"))
+        report = json.loads((run_dir / "quick_report.json").read_text(encoding="utf-8"))
+
+        assert result.exit_code == 0
+        assert metadata["fixed_budget_total"] == 2
+        assert metadata["fixed_budget_used"] == 0
+        assert metadata["fixed_budget_remaining"] == 2
+        assert metadata["fixed_budget_stop_reason"] == ""
+        assert metadata["no_action_reprompts_used"] == 0
+        assert report["conclusion"] == "budget_exhausted"
+        assert "fixed candidate budget was exhausted" in report["conclusion_reason"]
+        assert report["fixed_budget_total"] == 2
+        assert report["fixed_budget_used"] == 2
+        assert report["fixed_budget_remaining"] == 0
+        assert report["fixed_budget_stop_reason"] == "fixed_budget_exhausted"
+        assert report["no_action_reprompts_used"] == 0
+        assert report["checked_window_ids"] == ["rss-w2"]
+        assert len(report["short_results"]) == 1
+        assert len(report["full_results"]) == 1
+        assert "Stopped: fixed budget exhausted after 2/2 candidate attempts" in result.output
+        run_started = next(
+            record
+            for record in _CaptureEmitter.instances[-1].events
+            if record["event"] == "run.started"
+        )
+        started_payload = cast(dict[str, object], run_started["payload"])
+        assert started_payload["fixed_budget_total"] == 2
+        assert started_payload["fixed_budget_used"] == 0
+        assert started_payload["fixed_budget_remaining"] == 2
+        assert started_payload["fixed_budget_stop_reason"] == ""
+        assert started_payload["no_action_reprompts_used"] == 0
+        result_comparison = next(
+            record
+            for record in _CaptureEmitter.instances[-1].events
+            if record["event"] == "result.comparison"
+        )
+        comparison_payload = cast(dict[str, object], result_comparison["payload"])
+        assert comparison_payload["fixed_budget_total"] == 2
+        assert comparison_payload["fixed_budget_used"] == 2
+        assert comparison_payload["fixed_budget_remaining"] == 0
+        assert comparison_payload["fixed_budget_stop_reason"] == "fixed_budget_exhausted"
+        assert comparison_payload["no_action_reprompts_used"] == 0
+        run_finished = next(
+            record
+            for record in _CaptureEmitter.instances[-1].events
+            if record["event"] == "run.finished"
+        )
+        finished_payload = cast(dict[str, object], run_finished["payload"])
+        assert finished_payload["fixed_budget_total"] == 2
+        assert finished_payload["fixed_budget_used"] == 2
+        assert finished_payload["fixed_budget_remaining"] == 0
+        assert finished_payload["fixed_budget_stop_reason"] == "fixed_budget_exhausted"
+        assert finished_payload["no_action_reprompts_used"] == 0
+        budget_state = _RecordingFixedBudgetState.instances[-1]
+        assert budget_state.used == 2
+        assert [item.kind for item in budget_state.consumptions] == [
+            "quick_short_candidate",
+            "quick_full_candidate",
+        ]
+
+
+def test_quick_mode_fixed_budget_auto_validated_short_consumes_one_slot() -> None:
+    runner = CliRunner()
+    _RecordingFixedBudgetState.instances.clear()
+
+    class _CompletedShortFixedBudgetAgent(_DummyQuickAgent):
+        async def step(self, prompt: str) -> SimpleNamespace:
+            _ = prompt
+            return SimpleNamespace(
+                content=json.dumps(
+                    {
+                        "summary": "screen one env candidate",
+                        "manual_citation": "rule",
+                        "evidence": ["signal"],
+                        "actions": [
+                            {
+                                "config_type": "env_var",
+                                "parameter": "OMP_NUM_THREADS",
+                                "new_value": "1",
+                                "reason": "reduce contention",
+                                "manual_citation": "rule",
+                            }
+                        ],
+                    }
+                )
+            )
+
+    structured_bundle = {
+        "profile_first": [
+            {
+                "signal_ref": "demo.sig",
+                "role": "resource_signal",
+                "hypothesis_name": "demo-hypothesis",
+                "candidate_controls": ["OMP_NUM_THREADS"],
+                "signal": {
+                    "id": "sig",
+                    "metric": "rss_mb",
+                    "virtual_probe": "process.memory.rss",
+                    "expected_direction_when_mitigated": "decrease",
+                    "role": "resource_signal",
+                },
+            }
+        ],
+        "hypothesis_profiles": [
+            {
+                "hypothesis_id": "demo-hypothesis",
+                "validation_signals": [
+                    {
+                        "ref": "demo.sig",
+                        "role": "resource_signal",
+                        "candidate_controls": ["OMP_NUM_THREADS"],
+                        "signal": {
+                            "id": "sig",
+                            "metric": "rss_mb",
+                            "virtual_probe": "process.memory.rss",
+                            "expected_direction_when_mitigated": "decrease",
+                            "role": "resource_signal",
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+
+    baseline = {
+        "pid": 1000,
+        "launch_command": ["echo", "hi"],
+        "wall_time": 5.0,
+        "stdout": "throughput=100\n",
+        "stderr": "",
+        "returncode": 0,
+        "timed_out": False,
+        "profiling_text": "{}",
+        "profiling_json": {
+            "periodic_probe_samples": _sample_entries([10, 10, 10, 20, 20, 20, 20, 10, 10, 10])
+        },
+        "tool_calls_used": 0,
+        "stop_reason": "completed",
+        "stopped_intentionally": False,
+    }
+    completed_short = {
+        "pid": 1001,
+        "launch_command": ["echo", "hi"],
+        "wall_time": 2.0,
+        "stdout": "throughput=160\n",
+        "stderr": "",
+        "returncode": 0,
+        "timed_out": False,
+        "profiling_text": "{}",
+        "profiling_json": {"periodic_probe_samples": _sample_entries([10])},
+        "tool_calls_used": 0,
+        "stop_reason": "completed",
+        "stopped_intentionally": False,
+    }
+    artifacts = [baseline, completed_short]
+
+    async def _fake_profile(*args: object, **kwargs: object) -> dict[str, Any]:
+        _ = args
+        artifact = artifacts.pop(0)
+        callback = kwargs.get("live_output_callback")
+        if callable(callback):
+            for line in str(artifact.get("stdout", "")).splitlines(True):
+                callback("stdout", line)
+        return artifact
+
+    async def _fake_extract_metrics(
+        agent: SysPilotAgent, output: str, context: str
+    ) -> dict[str, Any]:
+        _ = agent
+        _ = context
+        for line in output.splitlines():
+            if line.startswith("throughput="):
+                return {"throughput": float(line.split("=", 1)[1])}
+        return {"no_metrics": True}
+
+    with runner.isolated_filesystem():
+        with (
+            patch("syspilot.quick_mode.FixedBudgetState", _RecordingFixedBudgetState),
+            patch("syspilot.cli.TuneEventEmitter", _CaptureEmitter),
+            patch("syspilot.cli.SysPilotAgent", _CompletedShortFixedBudgetAgent),
+            patch("syspilot.cli._register_default_skills", _noop),
+            patch("syspilot.cli._register_profiling_tools", _noop),
+            patch("syspilot.cli._register_tuning_tools", _noop),
+            patch(
+                "syspilot.cli._build_contract_context_bundle",
+                lambda *args, **kwargs: structured_bundle,
+            ),
+            patch("syspilot.cli._run_live_profiling_pipeline", _fake_profile),
+            patch("syspilot.cli._extract_metrics_from_output", _fake_extract_metrics),
+        ):
+            result = runner.invoke(
+                cli,
+                [
+                    "tune",
+                    "--quick-mode",
+                    "--fixed-budget",
+                    "1",
+                    "--ui-mode",
+                    "plain",
+                    "--command",
+                    "echo hi",
+                    "--primary-objective",
+                    "throughput",
+                    "--primary-objective-mode",
+                    "maximize",
+                    "--contract",
+                    "demo",
+                    "--max-iterations",
+                    "1",
+                    "--timeout",
+                    "5",
+                ],
+            )
+
+        run_dir = Path("artifacts") / "quick_tune_runs" / "quick-test-run"
+        report = json.loads((run_dir / "quick_report.json").read_text(encoding="utf-8"))
+
+        assert result.exit_code == 0
+        assert report["full_results"] == []
+        budget_state = _RecordingFixedBudgetState.instances[-1]
+        assert budget_state.used == 1
+        assert [item.kind for item in budget_state.consumptions] == ["quick_short_candidate"]
+
+
+def test_quick_mode_fixed_budget_counts_materialized_duplicate_candidate_without_execution() -> (
+    None
+):
+    runner = CliRunner()
+    _RecordingFixedBudgetState.instances.clear()
+    run_calls: list[dict[str, object]] = []
+
+    structured_bundle = {
+        "profile_first": [
+            {
+                "signal_ref": "demo.sig",
+                "role": "resource_signal",
+                "hypothesis_name": "demo-hypothesis",
+                "candidate_controls": ["OMP_PROC_BIND"],
+                "signal": {
+                    "id": "sig",
+                    "metric": "rss_mb",
+                    "virtual_probe": "process.memory.rss",
+                    "expected_direction_when_mitigated": "decrease",
+                    "role": "resource_signal",
+                },
+            },
+            {
+                "signal_ref": "demo.sig2",
+                "role": "resource_signal",
+                "hypothesis_name": "demo-hypothesis-2",
+                "candidate_controls": ["OMP_WAIT_POLICY"],
+                "signal": {
+                    "id": "sig2",
+                    "metric": "queue_depth",
+                    "virtual_probe": "queue.depth",
+                    "expected_direction_when_mitigated": "decrease",
+                    "role": "resource_signal",
+                },
+            },
+        ],
+        "hypothesis_profiles": [
+            {
+                "hypothesis_id": "demo-hypothesis",
+                "validation_signals": [
+                    {
+                        "ref": "demo.sig",
+                        "role": "resource_signal",
+                        "candidate_controls": ["OMP_PROC_BIND"],
+                        "signal": {
+                            "id": "sig",
+                            "metric": "rss_mb",
+                            "virtual_probe": "process.memory.rss",
+                            "expected_direction_when_mitigated": "decrease",
+                            "role": "resource_signal",
+                        },
+                    }
+                ],
+            },
+            {
+                "hypothesis_id": "demo-hypothesis-2",
+                "validation_signals": [
+                    {
+                        "ref": "demo.sig2",
+                        "role": "resource_signal",
+                        "candidate_controls": ["OMP_WAIT_POLICY"],
+                        "signal": {
+                            "id": "sig2",
+                            "metric": "queue_depth",
+                            "virtual_probe": "queue.depth",
+                            "expected_direction_when_mitigated": "decrease",
+                            "role": "resource_signal",
+                        },
+                    }
+                ],
+            },
+        ],
+    }
+
+    baseline = {
+        "pid": 1000,
+        "launch_command": ["echo", "hi"],
+        "wall_time": 5.0,
+        "stdout": "baseline\n",
+        "stderr": "",
+        "returncode": 0,
+        "timed_out": False,
+        "profiling_text": "{}",
+        "profiling_json": {
+            "periodic_probe_samples": _multi_probe_sample_entries(
+                {
+                    "process.memory.rss": [10, 10, 10, 20, 20, 20, 20, 10, 10, 10],
+                    "queue.depth": [5, 5, 5, 5, 5, 12, 12, 12, 12, 5],
+                }
+            )
+        },
+        "tool_calls_used": 0,
+        "stop_reason": "completed",
+        "stopped_intentionally": False,
+    }
+    short_artifact = {
+        "pid": 1001,
+        "launch_command": ["echo", "hi"],
+        "wall_time": 2.0,
+        "stdout": "short\n",
+        "stderr": "",
+        "returncode": -15,
+        "timed_out": False,
+        "profiling_text": "{}",
+        "profiling_json": {
+            "periodic_probe_samples": _sample_entries([10, 10, 10, 18, 18, 18, 18, 10, 10, 10])
+        },
+        "tool_calls_used": 0,
+        "stop_reason": "screen_budget_reached",
+        "stopped_intentionally": True,
+    }
+    artifacts = [baseline, short_artifact]
+
+    async def _fake_profile(*args: object, **kwargs: object) -> dict[str, Any]:
+        _ = args
+        artifact = artifacts.pop(0)
+        run_calls.append({"stop_after_seconds": kwargs.get("stop_after_seconds")})
+        callback = kwargs.get("live_output_callback")
+        if callable(callback):
+            for line in str(artifact.get("stdout", "")).splitlines(True):
+                callback("stdout", line)
+        return artifact
+
+    def _duplicate_candidates(*args: object, **kwargs: object) -> list[dict[str, Any]]:
+        _ = args
+        _ = kwargs
+        return [
+            {
+                "cmd": ["echo", "hi"],
+                "env_overrides": {"OMP_PROC_BIND": "close"},
+                "label": "OMP_PROC_BIND=close",
+            },
+            {
+                "cmd": ["echo", "hi"],
+                "env_overrides": {"OMP_PROC_BIND": "close"},
+                "label": "OMP_PROC_BIND=close",
+            },
+            {
+                "cmd": ["echo", "hi"],
+                "env_overrides": {"OMP_WAIT_POLICY": "ACTIVE"},
+                "label": "OMP_WAIT_POLICY=ACTIVE",
+            },
+        ]
+
+    with runner.isolated_filesystem():
+        with (
+            patch("syspilot.quick_mode.FixedBudgetState", _RecordingFixedBudgetState),
+            patch("syspilot.cli.TuneEventEmitter", _CaptureEmitter),
+            patch("syspilot.cli.SysPilotAgent", _DummyQuickAgent),
+            patch("syspilot.cli._register_default_skills", _noop),
+            patch("syspilot.cli._register_profiling_tools", _noop),
+            patch("syspilot.cli._register_tuning_tools", _noop),
+            patch(
+                "syspilot.cli._build_contract_context_bundle",
+                lambda *args, **kwargs: structured_bundle,
+            ),
+            patch("syspilot.cli._run_live_profiling_pipeline", _fake_profile),
+            patch("syspilot.cli._build_spawn_candidates", _duplicate_candidates),
+        ):
+            result = runner.invoke(
+                cli,
+                [
+                    "tune",
+                    "--quick-mode",
+                    "--fixed-budget",
+                    "2",
+                    "--ui-mode",
+                    "plain",
+                    "--command",
+                    "echo hi",
+                    "--contract",
+                    "demo",
+                    "--max-iterations",
+                    "3",
+                    "--timeout",
+                    "5",
+                ],
+            )
+
+        run_dir = Path("artifacts") / "quick_tune_runs" / "quick-test-run"
+        report = json.loads((run_dir / "quick_report.json").read_text(encoding="utf-8"))
+
+        assert result.exit_code == 0
+        assert report["conclusion"] == "budget_exhausted"
+        assert report["checked_window_ids"] == ["sig-w2"]
+        assert len(report["short_results"]) == 1
+        assert len(run_calls) == 2
+        budget_state = _RecordingFixedBudgetState.instances[-1]
+        assert budget_state.used == 2
+        assert [item.kind for item in budget_state.consumptions] == [
+            "quick_short_candidate",
+            "quick_short_candidate",
+        ]
+        assert "Skipping duplicate materialized candidate" in result.output
 
 
 def test_quick_mode_continues_after_significant_full_improvement() -> None:
@@ -1201,7 +2214,9 @@ def test_quick_mode_continues_after_significant_full_improvement() -> None:
         "stopped_intentionally": False,
     }
 
-    def _short_artifact(label: str, probe_name: str, values: Sequence[float | int]) -> dict[str, Any]:
+    def _short_artifact(
+        label: str, probe_name: str, values: Sequence[float | int]
+    ) -> dict[str, Any]:
         return {
             "pid": 1100,
             "launch_command": ["echo", "hi"],
@@ -1211,13 +2226,17 @@ def test_quick_mode_continues_after_significant_full_improvement() -> None:
             "returncode": -15,
             "timed_out": False,
             "profiling_text": "{}",
-            "profiling_json": {"periodic_probe_samples": _sample_entries(values, probe_name=probe_name)},
+            "profiling_json": {
+                "periodic_probe_samples": _sample_entries(values, probe_name=probe_name)
+            },
             "tool_calls_used": 0,
             "stop_reason": "screen_budget_reached",
             "stopped_intentionally": True,
         }
 
-    def _full_artifact(label: str, throughput: float, probe_name: str, values: Sequence[float | int]) -> dict[str, Any]:
+    def _full_artifact(
+        label: str, throughput: float, probe_name: str, values: Sequence[float | int]
+    ) -> dict[str, Any]:
         return {
             "pid": 2100,
             "launch_command": ["echo", "hi"],
@@ -1227,7 +2246,9 @@ def test_quick_mode_continues_after_significant_full_improvement() -> None:
             "returncode": 0,
             "timed_out": False,
             "profiling_text": "{}",
-            "profiling_json": {"periodic_probe_samples": _sample_entries(values, probe_name=probe_name)},
+            "profiling_json": {
+                "periodic_probe_samples": _sample_entries(values, probe_name=probe_name)
+            },
             "tool_calls_used": 0,
             "stop_reason": "completed",
             "stopped_intentionally": False,
@@ -1235,10 +2256,18 @@ def test_quick_mode_continues_after_significant_full_improvement() -> None:
 
     artifacts = [
         baseline,
-        _short_artifact("rss-short-1", "process.memory.rss", [10, 10, 10, 16, 16, 16, 16, 10, 10, 10]),
-        _short_artifact("rss-short-2", "process.memory.rss", [10, 10, 10, 18, 18, 18, 18, 10, 10, 10]),
-        _short_artifact("rss-short-3", "process.memory.rss", [10, 10, 10, 19, 19, 19, 19, 10, 10, 10]),
-        _full_artifact("rss-full", 110.0, "process.memory.rss", [10, 10, 10, 18, 18, 18, 18, 10, 10, 10]),
+        _short_artifact(
+            "rss-short-1", "process.memory.rss", [10, 10, 10, 16, 16, 16, 16, 10, 10, 10]
+        ),
+        _short_artifact(
+            "rss-short-2", "process.memory.rss", [10, 10, 10, 18, 18, 18, 18, 10, 10, 10]
+        ),
+        _short_artifact(
+            "rss-short-3", "process.memory.rss", [10, 10, 10, 19, 19, 19, 19, 10, 10, 10]
+        ),
+        _full_artifact(
+            "rss-full", 110.0, "process.memory.rss", [10, 10, 10, 18, 18, 18, 18, 10, 10, 10]
+        ),
         _short_artifact("queue-short-1", "queue.depth", [5, 5, 5, 5, 5, 10, 10, 10, 10, 5]),
         _short_artifact("queue-short-2", "queue.depth", [5, 5, 5, 5, 5, 8, 8, 8, 8, 5]),
         _short_artifact("queue-short-3", "queue.depth", [5, 5, 5, 5, 5, 7, 7, 7, 7, 5]),
@@ -1256,7 +2285,9 @@ def test_quick_mode_continues_after_significant_full_improvement() -> None:
                 callback("stderr", line)
         return artifact
 
-    async def _fake_extract_metrics(agent: SysPilotAgent, output: str, context: str) -> dict[str, Any]:
+    async def _fake_extract_metrics(
+        agent: SysPilotAgent, output: str, context: str
+    ) -> dict[str, Any]:
         _ = agent
         _ = context
         for line in output.splitlines():
@@ -1271,7 +2302,10 @@ def test_quick_mode_continues_after_significant_full_improvement() -> None:
             patch("syspilot.cli._register_default_skills", _noop),
             patch("syspilot.cli._register_profiling_tools", _noop),
             patch("syspilot.cli._register_tuning_tools", _noop),
-            patch("syspilot.cli._build_contract_context_bundle", lambda *args, **kwargs: structured_bundle),
+            patch(
+                "syspilot.cli._build_contract_context_bundle",
+                lambda *args, **kwargs: structured_bundle,
+            ),
             patch("syspilot.cli._run_live_profiling_pipeline", _fake_profile),
             patch("syspilot.cli._extract_metrics_from_output", _fake_extract_metrics),
         ):
@@ -1302,12 +2336,222 @@ def test_quick_mode_continues_after_significant_full_improvement() -> None:
         assert result.exit_code == 0
         assert len(report["checked_window_ids"]) == 2
         assert len(report["full_results"]) == 2
-        assert [group["signal_name"] for group in report["signal_windows"]] == ["rss_mb", "queue_depth"]
+        assert [group["signal_name"] for group in report["signal_windows"]] == [
+            "rss_mb",
+            "queue_depth",
+        ]
         assert report["full_results"][0]["objective_speedup_ratio"] == 1.1
         assert report["full_results"][1]["objective_speedup_ratio"] == 1.3
         assert "1.30x (better)" in result.output
         assert report["selected_candidate_id"] == 6
         assert "QUEUE_VAR_1=1" in report["selected_candidate_label"]
+
+
+def test_fixed_budget_quick_no_action_reprompts_empty_actions_then_candidate() -> None:
+    runner = CliRunner()
+    _RecordingFixedBudgetState.instances.clear()
+
+    class _EmptyActionsThenCandidateAgent(_DummyQuickAgent):
+        instances: list[_EmptyActionsThenCandidateAgent] = []
+
+        def __init__(self, config: object) -> None:
+            super().__init__(config)
+            self.calls = 0
+            self.prompts: list[str] = []
+            type(self).instances.append(self)
+
+        async def step(self, prompt: str) -> SimpleNamespace:
+            self.prompts.append(prompt)
+            self.calls += 1
+            if self.calls == 1:
+                return SimpleNamespace(
+                    content=json.dumps(
+                        {
+                            "summary": "no action yet",
+                            "manual_citation": "",
+                            "evidence": ["signal"],
+                            "actions": [],
+                        }
+                    )
+                )
+            return SimpleNamespace(
+                content=json.dumps(
+                    {
+                        "summary": "screen one candidate",
+                        "manual_citation": "rule",
+                        "evidence": ["signal"],
+                        "actions": [
+                            {
+                                "config_type": "env_var",
+                                "parameter": "OMP_NUM_THREADS",
+                                "new_value": "1",
+                                "reason": "reduce contention",
+                                "manual_citation": "rule",
+                            }
+                        ],
+                    }
+                )
+            )
+
+    structured_bundle = _single_signal_structured_bundle(
+        candidate_controls=("OMP_NUM_THREADS", "OMP_PROC_BIND")
+    )
+    artifacts = [_quick_baseline_artifact(), _quick_completed_short_artifact()]
+
+    async def _fake_profile(*args: object, **kwargs: object) -> dict[str, Any]:
+        _ = args
+        artifact = artifacts.pop(0)
+        callback = kwargs.get("live_output_callback")
+        if callable(callback):
+            for line in str(artifact.get("stdout", "")).splitlines(True):
+                callback("stdout", line)
+        return artifact
+
+    with runner.isolated_filesystem():
+        with (
+            patch("syspilot.quick_mode.FixedBudgetState", _RecordingFixedBudgetState),
+            patch("syspilot.cli.TuneEventEmitter", _CaptureEmitter),
+            patch("syspilot.cli.SysPilotAgent", _EmptyActionsThenCandidateAgent),
+            patch("syspilot.cli._register_default_skills", _noop),
+            patch("syspilot.cli._register_profiling_tools", _noop),
+            patch("syspilot.cli._register_tuning_tools", _noop),
+            patch(
+                "syspilot.cli._build_contract_context_bundle",
+                lambda *args, **kwargs: structured_bundle,
+            ),
+            patch("syspilot.cli._run_live_profiling_pipeline", _fake_profile),
+        ):
+            result = runner.invoke(
+                cli,
+                [
+                    "tune",
+                    "--quick-mode",
+                    "--fixed-budget",
+                    "1",
+                    "--ui-mode",
+                    "plain",
+                    "--command",
+                    "echo hi",
+                    "--contract",
+                    "demo",
+                    "--exclude-config",
+                    "OMP_WAIT_POLICY",
+                    "--max-iterations",
+                    "1",
+                    "--timeout",
+                    "5",
+                ],
+            )
+
+        run_dir = Path("artifacts") / "quick_tune_runs" / "quick-test-run"
+        report = json.loads((run_dir / "quick_report.json").read_text(encoding="utf-8"))
+
+        assert result.exit_code == 0
+        assert report["checked_window_ids"] == [report["abnormal_windows"][0]["window_id"]]
+        assert report["full_results"] == []
+        budget_state = _RecordingFixedBudgetState.instances[-1]
+        assert budget_state.used == 1
+        assert budget_state.no_action_reprompts_used == 1
+        agent = _EmptyActionsThenCandidateAgent.instances[-1]
+        assert len(agent.prompts) == 2
+        retry_prompt = agent.prompts[1]
+        assert "remaining fixed candidate budget: 1" in retry_prompt
+        assert "retry reason: previous recommendation returned no concrete actions" in retry_prompt
+        assert "successful prior configs:" in retry_prompt
+        assert "(none yet)" in retry_prompt
+        assert "recommendation returned no concrete actions" in retry_prompt
+        assert "untouched candidate controls for this window:" in retry_prompt
+        assert "OMP_NUM_THREADS" in retry_prompt
+        assert "OMP_PROC_BIND" in retry_prompt
+        assert "protected immutable controls:" in retry_prompt
+        assert "OMP_WAIT_POLICY" in retry_prompt
+        assert "propose finer-grained variants of" in retry_prompt
+        assert "Re-prompting the same ranked window" in result.output
+
+
+def test_fixed_budget_quick_no_action_reprompts_invalid_parse_then_candidate() -> None:
+    runner = CliRunner()
+    _RecordingFixedBudgetState.instances.clear()
+
+    class _InvalidParseThenCandidateAgent(_DummyQuickAgent):
+        instances: list[_InvalidParseThenCandidateAgent] = []
+
+        def __init__(self, config: object) -> None:
+            super().__init__(config)
+            self.calls = 0
+            type(self).instances.append(self)
+
+        async def step(self, prompt: str) -> SimpleNamespace:
+            _ = prompt
+            self.calls += 1
+            if self.calls == 1:
+                return SimpleNamespace(content="not-json")
+            return SimpleNamespace(
+                content=json.dumps(
+                    {
+                        "summary": "screen one candidate",
+                        "manual_citation": "rule",
+                        "evidence": ["signal"],
+                        "actions": [
+                            {
+                                "config_type": "env_var",
+                                "parameter": "OMP_NUM_THREADS",
+                                "new_value": "1",
+                                "reason": "reduce contention",
+                                "manual_citation": "rule",
+                            }
+                        ],
+                    }
+                )
+            )
+
+    structured_bundle = _single_signal_structured_bundle()
+    artifacts = [_quick_baseline_artifact(), _quick_completed_short_artifact()]
+
+    async def _fake_profile(*args: object, **kwargs: object) -> dict[str, Any]:
+        _ = args
+        _ = kwargs
+        return artifacts.pop(0)
+
+    with runner.isolated_filesystem():
+        with (
+            patch("syspilot.quick_mode.FixedBudgetState", _RecordingFixedBudgetState),
+            patch("syspilot.cli.TuneEventEmitter", _CaptureEmitter),
+            patch("syspilot.cli.SysPilotAgent", _InvalidParseThenCandidateAgent),
+            patch("syspilot.cli._register_default_skills", _noop),
+            patch("syspilot.cli._register_profiling_tools", _noop),
+            patch("syspilot.cli._register_tuning_tools", _noop),
+            patch(
+                "syspilot.cli._build_contract_context_bundle",
+                lambda *args, **kwargs: structured_bundle,
+            ),
+            patch("syspilot.cli._run_live_profiling_pipeline", _fake_profile),
+        ):
+            result = runner.invoke(
+                cli,
+                [
+                    "tune",
+                    "--quick-mode",
+                    "--fixed-budget",
+                    "1",
+                    "--ui-mode",
+                    "plain",
+                    "--command",
+                    "echo hi",
+                    "--contract",
+                    "demo",
+                    "--max-iterations",
+                    "1",
+                    "--timeout",
+                    "5",
+                ],
+            )
+
+        budget_state = _RecordingFixedBudgetState.instances[-1]
+        assert result.exit_code == 0
+        assert budget_state.used == 1
+        assert budget_state.no_action_reprompts_used == 1
+        assert _InvalidParseThenCandidateAgent.instances[-1].calls == 2
 
 
 def test_rank_abnormal_windows_reports_missing_virtual_probe() -> None:
@@ -1391,7 +2635,9 @@ def test_quick_mode_preserves_report_when_recommendation_provider_fails() -> Non
         "returncode": 0,
         "timed_out": False,
         "profiling_text": "{}",
-        "profiling_json": {"periodic_probe_samples": _sample_entries([10, 10, 10, 20, 20, 20, 20, 10, 10, 10])},
+        "profiling_json": {
+            "periodic_probe_samples": _sample_entries([10, 10, 10, 20, 20, 20, 20, 10, 10, 10])
+        },
         "tool_calls_used": 0,
         "stop_reason": "completed",
         "stopped_intentionally": False,
@@ -1409,7 +2655,10 @@ def test_quick_mode_preserves_report_when_recommendation_provider_fails() -> Non
             patch("syspilot.cli._register_default_skills", _noop),
             patch("syspilot.cli._register_profiling_tools", _noop),
             patch("syspilot.cli._register_tuning_tools", _noop),
-            patch("syspilot.cli._build_contract_context_bundle", lambda *args, **kwargs: structured_bundle),
+            patch(
+                "syspilot.cli._build_contract_context_bundle",
+                lambda *args, **kwargs: structured_bundle,
+            ),
             patch("syspilot.cli._run_live_profiling_pipeline", _fake_profile),
         ):
             result = runner.invoke(
@@ -1439,3 +2688,480 @@ def test_quick_mode_preserves_report_when_recommendation_provider_fails() -> Non
         assert report["degraded_errors"][0]["phase"] == "recommendation"
         assert "empty_stream" in report["degraded_errors"][0]["message"]
         assert (run_dir / "degraded_errors.jsonl").exists()
+
+
+def test_fixed_budget_quick_provider_fails_without_reprompt_loop() -> None:
+    runner = CliRunner()
+    _RecordingFixedBudgetState.instances.clear()
+
+    class _FixedBudgetProviderFailureAgent(_DummyQuickAgent):
+        instances: list[_FixedBudgetProviderFailureAgent] = []
+
+        def __init__(self, config: object) -> None:
+            super().__init__(config)
+            self.prompts: list[str] = []
+            type(self).instances.append(self)
+
+        async def step(self, prompt: str) -> SimpleNamespace:
+            self.prompts.append(prompt)
+            raise LLMProviderError("empty_stream: upstream stream closed before first payload")
+
+    structured_bundle = _single_signal_structured_bundle()
+    baseline = _quick_baseline_artifact()
+
+    async def _fake_profile(*args: object, **kwargs: object) -> dict[str, Any]:
+        _ = args
+        _ = kwargs
+        return baseline
+
+    with runner.isolated_filesystem():
+        with (
+            patch("syspilot.quick_mode.FixedBudgetState", _RecordingFixedBudgetState),
+            patch("syspilot.cli.TuneEventEmitter", _CaptureEmitter),
+            patch("syspilot.cli.SysPilotAgent", _FixedBudgetProviderFailureAgent),
+            patch("syspilot.cli._register_default_skills", _noop),
+            patch("syspilot.cli._register_profiling_tools", _noop),
+            patch("syspilot.cli._register_tuning_tools", _noop),
+            patch(
+                "syspilot.cli._build_contract_context_bundle",
+                lambda *args, **kwargs: structured_bundle,
+            ),
+            patch("syspilot.cli._run_live_profiling_pipeline", _fake_profile),
+        ):
+            result = runner.invoke(
+                cli,
+                [
+                    "tune",
+                    "--quick-mode",
+                    "--fixed-budget",
+                    "3",
+                    "--ui-mode",
+                    "plain",
+                    "--command",
+                    "echo hi",
+                    "--contract",
+                    "demo",
+                    "--max-iterations",
+                    "2",
+                    "--timeout",
+                    "5",
+                ],
+            )
+
+        run_dir = Path("artifacts") / "quick_tune_runs" / "quick-test-run"
+        report = json.loads((run_dir / "quick_report.json").read_text(encoding="utf-8"))
+
+        assert result.exit_code == 0
+        assert report["conclusion"] == "llm_provider_error"
+        assert report["short_results"] == []
+        assert report["checked_window_ids"] == [report["abnormal_windows"][0]["window_id"]]
+        budget_state = _RecordingFixedBudgetState.instances[-1]
+        assert budget_state.used == 0
+        assert budget_state.no_action_reprompts_used == 0
+        assert len(_FixedBudgetProviderFailureAgent.instances[-1].prompts) == 1
+
+
+def test_fixed_budget_quick_unfillable_no_action_exits_without_spending_budget() -> None:
+    runner = CliRunner()
+    _RecordingFixedBudgetState.instances.clear()
+
+    class _AlwaysEmptyActionsAgent(_DummyQuickAgent):
+        instances: list[_AlwaysEmptyActionsAgent] = []
+
+        def __init__(self, config: object) -> None:
+            super().__init__(config)
+            self.prompts: list[str] = []
+            type(self).instances.append(self)
+
+        async def step(self, prompt: str) -> SimpleNamespace:
+            self.prompts.append(prompt)
+            return SimpleNamespace(
+                content=json.dumps(
+                    {
+                        "summary": "still no action",
+                        "manual_citation": "",
+                        "evidence": ["signal"],
+                        "actions": [],
+                    }
+                )
+            )
+
+    structured_bundle = _single_signal_structured_bundle()
+    baseline = _quick_baseline_artifact()
+
+    async def _fake_profile(*args: object, **kwargs: object) -> dict[str, Any]:
+        _ = args
+        _ = kwargs
+        return baseline
+
+    with runner.isolated_filesystem():
+        with (
+            patch("syspilot.quick_mode.FixedBudgetState", _RecordingFixedBudgetState),
+            patch("syspilot.cli.TuneEventEmitter", _CaptureEmitter),
+            patch("syspilot.cli.SysPilotAgent", _AlwaysEmptyActionsAgent),
+            patch("syspilot.cli._register_default_skills", _noop),
+            patch("syspilot.cli._register_profiling_tools", _noop),
+            patch("syspilot.cli._register_tuning_tools", _noop),
+            patch(
+                "syspilot.cli._build_contract_context_bundle",
+                lambda *args, **kwargs: structured_bundle,
+            ),
+            patch("syspilot.cli._run_live_profiling_pipeline", _fake_profile),
+        ):
+            result = runner.invoke(
+                cli,
+                [
+                    "tune",
+                    "--quick-mode",
+                    "--fixed-budget",
+                    "2",
+                    "--ui-mode",
+                    "plain",
+                    "--command",
+                    "echo hi",
+                    "--contract",
+                    "demo",
+                    "--max-iterations",
+                    "1",
+                    "--timeout",
+                    "5",
+                ],
+            )
+
+        run_dir = Path("artifacts") / "quick_tune_runs" / "quick-test-run"
+        report = json.loads((run_dir / "quick_report.json").read_text(encoding="utf-8"))
+
+        assert result.exit_code == 0
+        assert report["conclusion"] == "unfillable_no_action"
+        assert report["fixed_budget_total"] == 2
+        assert report["fixed_budget_used"] == 0
+        assert report["fixed_budget_remaining"] == 2
+        assert report["fixed_budget_stop_reason"] == "unfillable_no_action"
+        assert report["no_action_reprompts_used"] == 2
+        assert report["short_results"] == []
+        assert report["checked_window_ids"] == [report["abnormal_windows"][0]["window_id"]]
+        assert "Stopped: no valid action after 2 re-prompts" in result.output
+        budget_state = _RecordingFixedBudgetState.instances[-1]
+        assert budget_state.used == 0
+        assert budget_state.no_action_reprompts_used == 2
+        assert len(_AlwaysEmptyActionsAgent.instances[-1].prompts) == 3
+
+
+def test_fixed_budget_quick_candidate_space_exhausted_reports_stop_reason() -> None:
+    runner = CliRunner()
+    _CaptureEmitter.instances.clear()
+    _RecordingFixedBudgetState.instances.clear()
+
+    class _SingleCandidateAgent(_DummyQuickAgent):
+        async def step(self, prompt: str) -> SimpleNamespace:
+            _ = prompt
+            return SimpleNamespace(
+                content=json.dumps(
+                    {
+                        "summary": "screen env candidate",
+                        "manual_citation": "rule",
+                        "evidence": ["signal"],
+                        "actions": [
+                            {
+                                "config_type": "env_var",
+                                "parameter": "OMP_NUM_THREADS",
+                                "new_value": "1",
+                                "reason": "bounded candidate",
+                                "manual_citation": "rule",
+                            }
+                        ],
+                    }
+                )
+            )
+
+    structured_bundle = _single_signal_structured_bundle()
+    artifacts = [
+        _quick_baseline_artifact(stdout="baseline\n"),
+        {
+            "pid": 1001,
+            "launch_command": ["echo", "hi"],
+            "wall_time": 2.0,
+            "stdout": "short\n",
+            "stderr": "",
+            "returncode": -15,
+            "timed_out": False,
+            "profiling_text": "{}",
+            "profiling_json": {
+                "periodic_probe_samples": _sample_entries([10, 10, 10, 18, 18, 18, 18, 10, 10, 10])
+            },
+            "tool_calls_used": 0,
+            "stop_reason": "screen_budget_reached",
+            "stopped_intentionally": True,
+        },
+        {
+            "pid": 1002,
+            "launch_command": ["echo", "hi"],
+            "wall_time": 4.0,
+            "stdout": "full\n",
+            "stderr": "",
+            "returncode": 0,
+            "timed_out": False,
+            "profiling_text": "{}",
+            "profiling_json": {
+                "periodic_probe_samples": _sample_entries([10, 10, 10, 18, 18, 18, 18, 10, 10, 10])
+            },
+            "tool_calls_used": 0,
+            "stop_reason": "completed",
+            "stopped_intentionally": False,
+        },
+    ]
+
+    async def _fake_profile(*args: object, **kwargs: object) -> dict[str, Any]:
+        _ = args
+        callback = kwargs.get("live_output_callback")
+        artifact = artifacts.pop(0)
+        if callable(callback):
+            for line in str(artifact.get("stdout", "")).splitlines(True):
+                callback("stdout", line)
+        return artifact
+
+    with runner.isolated_filesystem():
+        with (
+            patch("syspilot.quick_mode.FixedBudgetState", _RecordingFixedBudgetState),
+            patch("syspilot.cli.TuneEventEmitter", _CaptureEmitter),
+            patch("syspilot.cli.SysPilotAgent", _SingleCandidateAgent),
+            patch("syspilot.cli._register_default_skills", _noop),
+            patch("syspilot.cli._register_profiling_tools", _noop),
+            patch("syspilot.cli._register_tuning_tools", _noop),
+            patch(
+                "syspilot.cli._build_contract_context_bundle",
+                lambda *args, **kwargs: structured_bundle,
+            ),
+            patch("syspilot.cli._run_live_profiling_pipeline", _fake_profile),
+        ):
+            result = runner.invoke(
+                cli,
+                [
+                    "tune",
+                    "--quick-mode",
+                    "--fixed-budget",
+                    "3",
+                    "--ui-mode",
+                    "plain",
+                    "--command",
+                    "echo hi",
+                    "--contract",
+                    "demo",
+                    "--max-iterations",
+                    "1",
+                    "--timeout",
+                    "5",
+                ],
+            )
+
+        assert result.exit_code == 0
+        run_dir = Path("artifacts") / "quick_tune_runs" / "quick-test-run"
+        report = json.loads((run_dir / "quick_report.json").read_text(encoding="utf-8"))
+        assert report["fixed_budget_total"] == 3
+        assert report["fixed_budget_used"] == 2
+        assert report["fixed_budget_remaining"] == 1
+        assert report["fixed_budget_stop_reason"] == "candidate_space_exhausted"
+        assert report["checked_window_ids"] == [report["abnormal_windows"][0]["window_id"]]
+        assert "Stopped: candidate space exhausted before budget" in result.output
+        comparison_payload = cast(
+            dict[str, Any],
+            next(
+                record["payload"]
+                for record in _CaptureEmitter.instances[-1].events
+                if record["event"] == "result.comparison"
+            ),
+        )
+        assert comparison_payload["fixed_budget_stop_reason"] == "candidate_space_exhausted"
+        finished_payload = cast(
+            dict[str, Any],
+            next(
+                record["payload"]
+                for record in _CaptureEmitter.instances[-1].events
+                if record["event"] == "run.finished"
+            ),
+        )
+        assert finished_payload["fixed_budget_stop_reason"] == "candidate_space_exhausted"
+
+
+def test_fixed_budget_quick_no_action_reprompt_cap_is_per_window_not_global() -> None:
+    runner = CliRunner()
+    _RecordingFixedBudgetState.instances.clear()
+
+    class _TwoWindowRepromptAgent(_DummyQuickAgent):
+        instances: list[_TwoWindowRepromptAgent] = []
+
+        def __init__(self, config: object) -> None:
+            super().__init__(config)
+            self.prompts: list[str] = []
+            self.calls = 0
+            type(self).instances.append(self)
+
+        async def step(self, prompt: str) -> SimpleNamespace:
+            self.prompts.append(prompt)
+            self.calls += 1
+            if self.calls in (1, 3):
+                return SimpleNamespace(
+                    content=json.dumps(
+                        {
+                            "summary": "no action yet",
+                            "manual_citation": "",
+                            "evidence": ["signal"],
+                            "actions": [],
+                        }
+                    )
+                )
+            parameter = "OMP_NUM_THREADS" if self.calls == 2 else "QUEUE_VAR_1"
+            return SimpleNamespace(
+                content=json.dumps(
+                    {
+                        "summary": f"screen {parameter}",
+                        "manual_citation": "rule",
+                        "evidence": ["signal"],
+                        "actions": [
+                            {
+                                "config_type": "env_var",
+                                "parameter": parameter,
+                                "new_value": "1",
+                                "reason": "reduce contention",
+                                "manual_citation": "rule",
+                            }
+                        ],
+                    }
+                )
+            )
+
+    structured_bundle = {
+        "profile_first": [
+            {
+                "signal_ref": "demo.sig",
+                "role": "resource_signal",
+                "hypothesis_name": "demo-hypothesis-a",
+                "candidate_controls": ["OMP_NUM_THREADS"],
+                "signal": {
+                    "id": "sig",
+                    "metric": "rss_mb",
+                    "virtual_probe": "process.memory.rss",
+                    "expected_direction_when_mitigated": "decrease",
+                    "role": "resource_signal",
+                },
+            },
+            {
+                "signal_ref": "demo.queue",
+                "role": "resource_signal",
+                "hypothesis_name": "demo-hypothesis-b",
+                "candidate_controls": ["QUEUE_VAR_1"],
+                "signal": {
+                    "id": "queue",
+                    "metric": "queue_depth",
+                    "virtual_probe": "queue.depth",
+                    "expected_direction_when_mitigated": "decrease",
+                    "role": "resource_signal",
+                },
+            },
+        ],
+        "hypothesis_profiles": [
+            {
+                "hypothesis_id": "demo-hypothesis-a",
+                "validation_signals": [
+                    {
+                        "ref": "demo.sig",
+                        "role": "resource_signal",
+                        "candidate_controls": ["OMP_NUM_THREADS"],
+                        "signal": {
+                            "id": "sig",
+                            "metric": "rss_mb",
+                            "virtual_probe": "process.memory.rss",
+                            "expected_direction_when_mitigated": "decrease",
+                            "role": "resource_signal",
+                        },
+                    }
+                ],
+            },
+            {
+                "hypothesis_id": "demo-hypothesis-b",
+                "validation_signals": [
+                    {
+                        "ref": "demo.queue",
+                        "role": "resource_signal",
+                        "candidate_controls": ["QUEUE_VAR_1"],
+                        "signal": {
+                            "id": "queue",
+                            "metric": "queue_depth",
+                            "virtual_probe": "queue.depth",
+                            "expected_direction_when_mitigated": "decrease",
+                            "role": "resource_signal",
+                        },
+                    }
+                ],
+            },
+        ],
+    }
+    baseline = _quick_baseline_artifact(stdout="baseline\n")
+    baseline["profiling_json"] = {
+        "periodic_probe_samples": _multi_probe_sample_entries(
+            {
+                "process.memory.rss": [10, 10, 10, 20, 20, 20, 20, 10, 10, 10],
+                "queue.depth": [5, 5, 5, 15, 15, 15, 15, 5, 5, 5],
+            }
+        )
+    }
+    artifacts = [
+        baseline,
+        _quick_completed_short_artifact(probe_name="process.memory.rss", stdout="first\n"),
+        _quick_completed_short_artifact(probe_name="queue.depth", stdout="second\n"),
+    ]
+
+    async def _fake_profile(*args: object, **kwargs: object) -> dict[str, Any]:
+        _ = args
+        callback = kwargs.get("live_output_callback")
+        artifact = artifacts.pop(0)
+        if callable(callback):
+            for line in str(artifact.get("stdout", "")).splitlines(True):
+                callback("stdout", line)
+        return artifact
+
+    with runner.isolated_filesystem():
+        with (
+            patch("syspilot.quick_mode.FixedBudgetState", _RecordingFixedBudgetState),
+            patch("syspilot.cli.TuneEventEmitter", _CaptureEmitter),
+            patch("syspilot.cli.SysPilotAgent", _TwoWindowRepromptAgent),
+            patch("syspilot.cli._register_default_skills", _noop),
+            patch("syspilot.cli._register_profiling_tools", _noop),
+            patch("syspilot.cli._register_tuning_tools", _noop),
+            patch(
+                "syspilot.cli._build_contract_context_bundle",
+                lambda *args, **kwargs: structured_bundle,
+            ),
+            patch("syspilot.cli._run_live_profiling_pipeline", _fake_profile),
+        ):
+            result = runner.invoke(
+                cli,
+                [
+                    "tune",
+                    "--quick-mode",
+                    "--fixed-budget",
+                    "2",
+                    "--ui-mode",
+                    "plain",
+                    "--command",
+                    "echo hi",
+                    "--contract",
+                    "demo",
+                    "--max-iterations",
+                    "1",
+                    "--timeout",
+                    "5",
+                ],
+            )
+
+        run_dir = Path("artifacts") / "quick_tune_runs" / "quick-test-run"
+        report = json.loads((run_dir / "quick_report.json").read_text(encoding="utf-8"))
+
+        assert result.exit_code == 0
+        assert len(report["checked_window_ids"]) == 2
+        assert len(report["short_results"]) == 2
+        budget_state = _RecordingFixedBudgetState.instances[-1]
+        assert budget_state.used == 2
+        assert budget_state.no_action_reprompts_used == 2
+        agent = _TwoWindowRepromptAgent.instances[-1]
+        assert len(agent.prompts) == 4

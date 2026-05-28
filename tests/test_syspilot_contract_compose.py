@@ -3,7 +3,11 @@ from typing import cast
 
 from syspilot_contract.checker import dump_contract_yaml
 from syspilot_contract.compose_contracts import compose_contracts, derive_conflict_hypotheses
-from syspilot_contract.integration import build_agent_context_bundle, write_contract_bundle
+from syspilot_contract.integration import (
+    build_agent_context_bundle,
+    resolve_library_contract_inputs,
+    write_contract_bundle,
+)
 from syspilot_contract.query_store import ContractStore
 from syspilot_contract.schemas import LibraryContract
 
@@ -301,6 +305,36 @@ def test_contract_context_bundle_exposes_conflict_oriented_context(tmp_path: Pat
     assert context["candidate_actions"]
     assert context["conflicts"]
     assert context["validation"]
+
+
+def test_contract_context_bundle_accepts_hyphenated_contract_alias(tmp_path: Path) -> None:
+    artifact_root = tmp_path / "artifacts"
+    contract_root = tmp_path / "contracts"
+    pytorch_cudnn = _compute_contract("pytorch_cudnn", "BENCHMARK_TORCH_BATCH_SIZE", "torch")
+    write_contract_bundle("pytorch_cudnn", pytorch_cudnn, artifact_root, contract_root)
+
+    context = build_agent_context_bundle(
+        ["pytorch-cudnn"],
+        goal="improve throughput",
+        symptom="gpu contention",
+        contract_root=contract_root,
+        max_items_per_section=3,
+    )
+
+    assert context["relevant_components"]
+    assert context["profile_first"]
+
+
+def test_resolve_library_contract_inputs_accepts_hyphenated_alias(tmp_path: Path) -> None:
+    artifact_root = tmp_path / "artifacts"
+    contract_root = tmp_path / "contracts"
+    pytorch_cudnn = _compute_contract("pytorch_cudnn", "BENCHMARK_TORCH_BATCH_SIZE", "torch")
+    write_contract_bundle("pytorch_cudnn", pytorch_cudnn, artifact_root, contract_root)
+
+    loaded = resolve_library_contract_inputs(["pytorch-cudnn"], contract_root)
+
+    assert len(loaded) == 1
+    assert loaded[0].contract == "pytorch_cudnn"
 
 
 def test_duplicate_library_contracts_get_distinct_instances_and_context(tmp_path: Path) -> None:

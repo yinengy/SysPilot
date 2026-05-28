@@ -5,6 +5,7 @@ import csv
 import json
 import math
 import shlex
+import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -16,6 +17,8 @@ from rich.markup import escape as rich_escape
 
 from syspilot.core.agent import SysPilotAgent
 from syspilot.core.llm import LLMError
+from syspilot.fixed_budget import FixedBudgetState
+from syspilot.fixed_goal import fixed_goal_payload, fixed_goal_reached
 from syspilot.prompt_budget import contract_context_json_for_prompt, profiling_json_for_prompt
 from syspilot.ui.output_sink import OutputSink, PlainOutputSink, TuneUIMode, make_output_sink
 
@@ -238,7 +241,9 @@ class QuickModeReport:
 RunExecutor = Callable[..., Awaitable[dict[str, Any]]]
 ParseActions = Callable[[str], dict[str, Any]]
 BuildCandidates = Callable[..., list[dict[str, Any]]]
-ExtractHypothesisProfiles = Callable[[dict[str, object] | None, list[str] | None], list[dict[str, Any]]]
+ExtractHypothesisProfiles = Callable[
+    [dict[str, object] | None, list[str] | None], list[dict[str, Any]]
+]
 RecommendationActionDisplay = Callable[[list[dict[str, Any]]], str]
 ExtractInlineEnvAssignments = Callable[[list[str]], tuple[list[str], dict[str, str]]]
 ExtractMetricsFromOutput = Callable[[SysPilotAgent, str, str], Awaitable[dict[str, Any]]]
@@ -250,6 +255,24 @@ ComputeObjectiveChangePct = Callable[[float, float, str], float]
 ObjectiveDisplayName = Callable[[str | None], str]
 FormatMetricValue = Callable[[float | None], str]
 TuneEventEmitterProtocol = Any
+
+
+def _fixed_budget_payload(
+    fixed_budget_state: FixedBudgetState,
+    *,
+    stop_reason: str = "",
+) -> dict[str, object]:
+    if not fixed_budget_state.enabled:
+        return {}
+    payload = fixed_budget_state.to_payload()
+    return {
+        "fixed_budget": payload,
+        "fixed_budget_total": payload["total"],
+        "fixed_budget_used": payload["used"],
+        "fixed_budget_remaining": payload["remaining"],
+        "fixed_budget_stop_reason": stop_reason,
+        "no_action_reprompts_used": payload["no_action_reprompts_used"],
+    }
 
 
 def _render_excluded_config_names(names: Sequence[str]) -> str:
@@ -340,7 +363,9 @@ def _record_degraded_error(
 
 def _is_llm_degraded_error(entry: dict[str, str]) -> bool:
     error_text = f"{entry.get('error_type', '')} {entry.get('message', '')}".lower()
-    return any(marker in error_text for marker in ("llm", "provider", "openai", "stream", "timeout"))
+    return any(
+        marker in error_text for marker in ("llm", "provider", "openai", "stream", "timeout")
+    )
 
 
 def _render_spawn_manual_hints(manuals: Sequence[str]) -> str:
@@ -432,7 +457,13 @@ def _extract_signal_specs(
     specs: list[QuickSignalSpec] = []
     semantic_index: dict[tuple[str, str, str], int] = {}
 
-    def _add(ref: str, signal: dict[str, Any], role: str, hypothesis_name: str, candidate_controls: list[str]) -> None:
+    def _add(
+        ref: str,
+        signal: dict[str, Any],
+        role: str,
+        hypothesis_name: str,
+        candidate_controls: list[str],
+    ) -> None:
         direction = str(signal.get("expected_direction_when_mitigated", "")).strip()
         virtual_probe = str(signal.get("virtual_probe", "")).strip()
         metric = str(signal.get("metric", "")).strip()
@@ -484,14 +515,17 @@ def _extract_signal_specs(
                     signal,
                     str(entry.get("role", signal.get("role", "resource_signal"))).strip(),
                     str(entry.get("hypothesis_name", entry.get("hypothesis_id", ""))).strip(),
-                    _string_list(entry.get("candidate_controls")) or _string_list(signal.get("candidate_controls")),
+                    _string_list(entry.get("candidate_controls"))
+                    or _string_list(signal.get("candidate_controls")),
                 )
 
     for profile in hypothesis_profiles:
         raw_signals = profile.get("validation_signals", [])
         if not isinstance(raw_signals, list):
             continue
-        hypothesis_name = str(profile.get("hypothesis_name", profile.get("hypothesis_id", ""))).strip()
+        hypothesis_name = str(
+            profile.get("hypothesis_name", profile.get("hypothesis_id", ""))
+        ).strip()
         for entry in raw_signals:
             if not isinstance(entry, dict):
                 continue
@@ -503,7 +537,8 @@ def _extract_signal_specs(
                 signal,
                 str(entry.get("role", signal.get("role", "resource_signal"))).strip(),
                 hypothesis_name,
-                _string_list(entry.get("candidate_controls")) or _string_list(signal.get("candidate_controls")),
+                _string_list(entry.get("candidate_controls"))
+                or _string_list(signal.get("candidate_controls")),
             )
     return specs
 
@@ -525,7 +560,9 @@ def _extract_probe_value(probe_result: dict[str, Any]) -> tuple[float | None, st
     return None, unit, status
 
 
-def _extract_signal_points(artifact: dict[str, Any], spec: QuickSignalSpec) -> list[SampledSignalPoint]:
+def _extract_signal_points(
+    artifact: dict[str, Any], spec: QuickSignalSpec
+) -> list[SampledSignalPoint]:
     profiling_json = artifact.get("profiling_json", {})
     if not isinstance(profiling_json, dict):
         return []
@@ -593,7 +630,11 @@ def _signal_sample_diagnostics(
         value, unit, probe_status = _extract_probe_value(probe_result)
         if probe_status != "observed":
             unavailable_count += 1
-            raw_detail = probe_result.get("error") or probe_result.get("message") or probe_result.get("reason")
+            raw_detail = (
+                probe_result.get("error")
+                or probe_result.get("message")
+                or probe_result.get("reason")
+            )
             if raw_detail and not last_unavailable_detail:
                 last_unavailable_detail = str(raw_detail)
         if value is None:
@@ -610,25 +651,38 @@ def _signal_sample_diagnostics(
         )
 
     if points:
-        return points, True, f"captured {len(points)} numeric sample(s) for virtual probe {spec.virtual_probe}"
+        return (
+            points,
+            True,
+            f"captured {len(points)} numeric sample(s) for virtual probe {spec.virtual_probe}",
+        )
     if probe_seen_count == 0:
         return (
             [],
             False,
-            f"periodic samples did not include virtual probe {spec.virtual_probe!r}; check the LPCL signal virtual_probe and toolbox/probes script mapping",
+            (
+                f"periodic samples did not include virtual probe {spec.virtual_probe!r}; "
+                "check the LPCL signal virtual_probe and toolbox/probes script mapping"
+            ),
         )
     if unavailable_count:
         detail = f": {last_unavailable_detail}" if last_unavailable_detail else ""
         return (
             [],
             True,
-            f"virtual probe {spec.virtual_probe!r} reported unavailable in {unavailable_count}/{probe_seen_count} sample(s){detail}",
+            (
+                f"virtual probe {spec.virtual_probe!r} reported unavailable in "
+                f"{unavailable_count}/{probe_seen_count} sample(s){detail}"
+            ),
         )
     if nonnumeric_count:
         return (
             [],
             True,
-            f"virtual probe {spec.virtual_probe!r} produced {nonnumeric_count} nonnumeric sample result(s)",
+            (
+                f"virtual probe {spec.virtual_probe!r} produced {nonnumeric_count} "
+                "nonnumeric sample result(s)"
+            ),
         )
     return (
         [],
@@ -658,7 +712,10 @@ def _select_non_overlapping_windows(
     selected: list[QuickBaselineWindow] = []
     for candidate in candidates:
         overlaps = any(
-            not (candidate.end_offset_s < item.start_offset_s or candidate.start_offset_s > item.end_offset_s)
+            not (
+                candidate.end_offset_s < item.start_offset_s
+                or candidate.start_offset_s > item.end_offset_s
+            )
             for item in selected
         )
         if overlaps:
@@ -708,7 +765,9 @@ def _rank_windows_for_signal(
     global_max = max(values)
     global_mean = _mean(values)
     value_range = max(global_max - global_min, 1e-9)
-    global_directional_delta_sum = _directional_delta_sum(values, spec.expected_direction_when_mitigated)
+    global_directional_delta_sum = _directional_delta_sum(
+        values, spec.expected_direction_when_mitigated
+    )
     candidates: list[QuickBaselineWindow] = []
 
     for idx in range(0, len(points) - window_samples + 1):
@@ -739,14 +798,16 @@ def _rank_windows_for_signal(
             abnormality = window_mean - global_mean
             severity = max(abnormality / value_range, 0.0) * 100.0
             reason = (
-                f"window directional burst {directional_delta_sum:.4f} with mean {window_mean:.4f} is above "
+                f"window directional burst {directional_delta_sum:.4f} with mean "
+                f"{window_mean:.4f} is above "
                 f"global mean {global_mean:.4f}; burst windows outrank later plateaus when present"
             )
         else:
             abnormality = global_mean - window_mean
             severity = max(abnormality / value_range, 0.0) * 100.0
             reason = (
-                f"window directional burst {directional_delta_sum:.4f} with mean {window_mean:.4f} is below "
+                f"window directional burst {directional_delta_sum:.4f} with mean "
+                f"{window_mean:.4f} is below "
                 f"global mean {global_mean:.4f}; burst windows outrank later plateaus when present"
             )
         candidates.append(
@@ -819,8 +880,9 @@ def rank_abnormal_windows(
         if len(points) < defaults.min_signal_samples:
             if points:
                 diagnostic_note = (
-                    f"only {len(points)} numeric sample(s) for virtual probe {spec.virtual_probe!r}; "
-                    f"need at least {defaults.min_signal_samples} (increase workload duration or lower quick sample interval)"
+                    f"only {len(points)} numeric sample(s) for virtual probe "
+                    f"{spec.virtual_probe!r}; need at least {defaults.min_signal_samples} "
+                    "(increase workload duration or lower quick sample interval)"
                 )
             usefulness.append(
                 QuickSignalUsefulness(
@@ -880,7 +942,8 @@ def _window_points_in_range(
     return [
         point
         for point in points
-        if point.time_offset_s + 1e-9 >= start_offset_s and point.time_offset_s - 1e-9 <= end_offset_s
+        if point.time_offset_s + 1e-9 >= start_offset_s
+        and point.time_offset_s - 1e-9 <= end_offset_s
     ]
 
 
@@ -1114,7 +1177,9 @@ def select_promotions(
     max_full_runs_per_group: int | None = None,
 ) -> list[QuickPromotionDecision]:
     ratio = full_run_ratio if full_run_ratio is not None else promotion_fraction
-    cap = max_full_runs_per_group if max_full_runs_per_group is not None else max_promoted_candidates
+    cap = (
+        max_full_runs_per_group if max_full_runs_per_group is not None else max_promoted_candidates
+    )
     ratio = 0.20 if ratio is None else ratio
     cap = 3 if cap is None else cap
 
@@ -1146,7 +1211,11 @@ def select_promotions(
     decisions: list[QuickPromotionDecision] = []
     for result in short_results:
         if result.candidate_id in promoted_ids:
-            rank = next(index + 1 for index, item in enumerate(usable) if item.candidate_id == result.candidate_id)
+            rank = next(
+                index + 1
+                for index, item in enumerate(usable)
+                if item.candidate_id == result.candidate_id
+            )
             decisions.append(
                 QuickPromotionDecision(
                     candidate_id=result.candidate_id,
@@ -1192,7 +1261,9 @@ def classify_signal_usefulness(
     defaults: QuickModeDefaults,
 ) -> QuickSignalUsefulness:
     signal_short = [item for item in short_results if item.signal_ref == target_spec.signal_ref]
-    numeric_short = [item for item in signal_short if item.target_signal_improvement_pct is not None]
+    numeric_short = [
+        item for item in signal_short if item.target_signal_improvement_pct is not None
+    ]
     if not numeric_short:
         return QuickSignalUsefulness(
             signal_ref=target_spec.signal_ref,
@@ -1200,7 +1271,9 @@ def classify_signal_usefulness(
             status="unavailable",
             notes="screening samples never produced a numeric target signal",
         )
-    max_abs_short = max(abs(float(item.target_signal_improvement_pct or 0.0)) for item in numeric_short)
+    max_abs_short = max(
+        abs(float(item.target_signal_improvement_pct or 0.0)) for item in numeric_short
+    )
     if max_abs_short < defaults.neutral_change_pct:
         return QuickSignalUsefulness(
             signal_ref=target_spec.signal_ref,
@@ -1227,7 +1300,9 @@ def classify_signal_usefulness(
             notes="full validation lacked end-to-end objective data",
         )
 
-    best_short = max(numeric_short, key=lambda item: float(item.target_signal_improvement_pct or float("-inf")))
+    best_short = max(
+        numeric_short, key=lambda item: float(item.target_signal_improvement_pct or float("-inf"))
+    )
     best_objective = max(
         full_with_objective,
         key=lambda item: float(item.objective_improvement_pct or float("-inf")),
@@ -1246,7 +1321,10 @@ def classify_signal_usefulness(
             signal_ref=target_spec.signal_ref,
             signal_name=target_spec.metric,
             status="neutral",
-            notes="validated candidates changed the signal but left the full-run objective near neutral",
+            notes=(
+                "validated candidates changed the signal but left the full-run "
+                "objective near neutral"
+            ),
         )
     if best_objective.candidate_id == best_short.candidate_id:
         return QuickSignalUsefulness(
@@ -1345,7 +1423,9 @@ def _persist_run_artifacts(
     env_overrides: dict[str, str],
     artifact: dict[str, Any],
 ) -> tuple[QuickRunMetadata, list[dict[str, Any]]]:
-    finished_at = _coerce_artifact_datetime(artifact.get("finished_at")) or datetime.now(timezone.utc)
+    finished_at = _coerce_artifact_datetime(artifact.get("finished_at")) or datetime.now(
+        timezone.utc
+    )
     run_started = _coerce_artifact_datetime(artifact.get("started_at")) or (
         finished_at - timedelta(seconds=max(float(artifact.get("wall_time", 0.0)), 0.0))
     )
@@ -1407,11 +1487,185 @@ def _candidate_signature(plan: dict[str, Any]) -> str:
     )
 
 
+def _candidate_plan_guard_reason(plan: dict[str, Any]) -> str | None:
+    cmd = plan.get("cmd")
+    if (
+        not isinstance(cmd, list)
+        or not cmd
+        or not all(isinstance(token, str) and token for token in cmd)
+    ):
+        return "candidate plan command is empty or invalid"
+    env_overrides = plan.get("env_overrides", {})
+    if not isinstance(env_overrides, dict) or not all(
+        isinstance(key, str) and isinstance(value, str) for key, value in env_overrides.items()
+    ):
+        return "candidate plan environment overrides are invalid"
+    return None
+
+
+def _candidate_plan_label(plan: dict[str, Any], *, fallback: str) -> str:
+    label = str(plan.get("label") or "").strip()
+    return label or fallback
+
+
 def _summarize_abnormal_window(window: QuickBaselineWindow) -> str:
     return (
-        f"{window.signal_name} [{window.window_id}; {window.start_offset_s:.1f}s, {window.end_offset_s:.1f}s] "
+        f"{window.signal_name} [{window.window_id}; {window.start_offset_s:.1f}s, "
+        f"{window.end_offset_s:.1f}s] "
         f"severity={window.severity:.1f}% reason={window.reason}"
     )
+
+
+def _ordered_unique(items: Sequence[str]) -> list[str]:
+    return list(dict.fromkeys(item for item in items if item))
+
+
+def _render_prompt_list(items: Sequence[str], *, empty: str = "(none)") -> str:
+    unique_items = _ordered_unique(items)
+    if not unique_items:
+        return empty
+    return "\n".join(f"- {item}" for item in unique_items)
+
+
+def _recommendation_action_controls(actions: Sequence[dict[str, Any]]) -> list[str]:
+    controls: list[str] = []
+    for action in actions:
+        config_type = str(action.get("config_type", "")).strip()
+        parameter = str(action.get("parameter", "")).strip()
+        if config_type == "env_var" and parameter:
+            controls.append(parameter)
+        elif config_type:
+            controls.append(config_type)
+    return _ordered_unique(controls)
+
+
+def _successful_prior_config_summaries(
+    short_results: Sequence[QuickShortResult],
+    full_results: Sequence[QuickShortResult],
+) -> list[str]:
+    summaries: list[str] = []
+    for result in full_results:
+        if result.objective_value is None:
+            continue
+        summaries.append(
+            f"{result.candidate_label} "
+            f"(full validation {_format_objective_speedup(result.objective_speedup_ratio)})"
+        )
+    for result in short_results:
+        if not _result_is_auto_validated(result):
+            continue
+        summaries.append(
+            f"{result.candidate_label} "
+            f"(completed short run {_format_objective_speedup(result.objective_speedup_ratio)})"
+        )
+    return _ordered_unique(summaries)
+
+
+def _build_quick_recommendation_prompt(
+    *,
+    cmd_parts: Sequence[str],
+    inline_env_overrides: dict[str, str],
+    excluded_config_content: str,
+    excluded_config_list: Sequence[str],
+    window: QuickBaselineWindow,
+    max_iterations: int,
+    baseline_profiling_json: dict[str, Any],
+    contract_content: str,
+    manual_hint_content: str,
+    fixed_budget_remaining: int | None,
+    successful_prior_configs: Sequence[str],
+    skipped_rejected_candidates: Sequence[str],
+    untouched_controls: Sequence[str],
+    retry_reason: str,
+) -> str:
+    return f"""Analyze this workload for quick screening mode and propose candidate actions.
+
+## Command
+{" ".join(cmd_parts)}
+
+## Current Environment Overrides
+{json.dumps(inline_env_overrides, indent=2, sort_keys=True) if inline_env_overrides else "(none)"}
+
+## Immutable Controls
+{excluded_config_content}
+
+## Ranked Abnormal Window
+- signal: {window.signal_name}
+- ref: {window.signal_ref}
+- hypothesis: {window.hypothesis_name or "(unknown)"}
+- expected direction: {window.expected_direction}
+- severity: {window.severity:.1f}
+- window: {window.start_offset_s:.2f}s -> {window.end_offset_s:.2f}s
+- reason: {window.reason}
+- candidate controls: {
+            ", ".join(window.candidate_controls) if window.candidate_controls else "(not declared)"
+        }
+
+## Fixed-Budget Retry Context
+- remaining fixed candidate budget: {
+            fixed_budget_remaining if fixed_budget_remaining is not None else "(not enabled)"
+        }
+- retry reason: {retry_reason or "first attempt for this window"}
+- successful prior configs:
+{_render_prompt_list(successful_prior_configs, empty="(none yet)")}
+- skipped or rejected candidates for this window:
+{_render_prompt_list(skipped_rejected_candidates, empty="(none yet)")}
+- untouched candidate controls for this window:
+{_render_prompt_list(untouched_controls, empty="(unknown or fully explored)")}
+- protected immutable controls:
+{_render_prompt_list(excluded_config_list, empty="(none)")}
+
+## Rules
+- Short-run ranking must use only target-signal improvement inside the matching window.
+- Do not optimize directly for wall time or the primary objective in the short screen.
+- Keep only the exact immutable controls listed above unchanged; do not treat same-library
+  or related controls as immutable unless their exact names are listed.
+- Keep workload-defining arguments fixed.
+- If this window is being retried under a fixed budget, propose finer-grained variants of
+  earlier ideas or use untouched candidate controls where supported by evidence.
+- Do not repeat skipped or rejected candidates exactly.
+- Return JSON only.
+- Provide up to {max_iterations} ordered actions.
+
+## Baseline Profiling JSON
+{profiling_json_for_prompt(baseline_profiling_json)}
+
+## Loaded Contract Context
+{contract_content if contract_content else "(No contract context provided)"}
+
+## Application Manual Hints
+{manual_hint_content if manual_hint_content else "(No application manual hints provided)"}
+
+## JSON Schema
+{{
+  "summary": "short decision summary",
+  "manual_citation": "optional concrete rule from loaded manual(s), or empty when\n"
+  "    grounded only in runtime evidence",
+  "evidence": ["concise evidence item", "..."],
+  "hypothesis_refs": ["optional hypothesis ids to prioritize next profiling round"],
+  "actions": [
+    {{
+      "config_type": "numactl | env_var | command_prefix | command",
+      "parameter": "required only for env_var",
+      "new_value": "string or token list; for command use full rewritten command",
+      "reason": "why this action follows from evidence",
+      "manual_citation": "optional manual/contract rule supporting this action"
+    }}
+  ]
+}}"""
+
+
+def _maybe_reprompt_same_window(
+    fixed_budget_state: FixedBudgetState,
+    same_window_no_action_reprompts: int,
+) -> tuple[bool, bool]:
+    if not fixed_budget_state.enabled:
+        return False, False
+    if not fixed_budget_state.can_consume():
+        return False, False
+    if fixed_budget_state.record_no_action_reprompt(same_window_no_action_reprompts):
+        return True, False
+    return False, True
 
 
 def _build_signal_window_groups(
@@ -1446,7 +1700,8 @@ def _format_signal_window_group(group: QuickSignalWindowGroup) -> str:
     for window in group.windows:
         status = "checked" if window.checked else "ranked"
         windows.append(
-            f"{window.window_id} ({window.start_offset_s:.1f}s-{window.end_offset_s:.1f}s, {status})"
+            f"{window.window_id} ({window.start_offset_s:.1f}s-"
+            f"{window.end_offset_s:.1f}s, {status})"
         )
     return "; ".join(windows) if windows else "(none)"
 
@@ -1470,6 +1725,8 @@ def _conclusion_from_results(
     full_results: list[QuickShortResult],
     selected_result: QuickShortResult | None,
     budget_exhausted: bool,
+    fixed_budget_exhausted: bool,
+    unfillable_no_action: bool,
     defaults: QuickModeDefaults,
     signal_usefulness: list[QuickSignalUsefulness] | None = None,
     degraded_errors: list[dict[str, str]] | None = None,
@@ -1479,34 +1736,69 @@ def _conclusion_from_results(
     if not abnormal_windows:
         unavailable_summary = _summarize_unavailable_signals(signal_usefulness or [])
         if unavailable_summary != "no periodic probe samples were captured during the baseline run":
-            return "no_valid_signal_windows", f"baseline analysis found no useful ranked abnormal signal windows; {unavailable_summary}"
-        return "no_valid_signal_windows", "baseline analysis found no useful ranked abnormal signal windows"
+            return (
+                "no_valid_signal_windows",
+                "baseline analysis found no useful ranked abnormal signal windows; "
+                f"{unavailable_summary}",
+            )
+        return (
+            "no_valid_signal_windows",
+            "baseline analysis found no useful ranked abnormal signal windows",
+        )
     if (
         selected_result is not None
         and selected_result.objective_improvement_pct is not None
         and selected_result.objective_improvement_pct >= defaults.significant_improvement_pct
     ):
-        return "significant_improvement_found", "a validated candidate met the significant full-run improvement threshold"
+        return (
+            "significant_improvement_found",
+            "a validated candidate met the significant full-run improvement threshold",
+        )
     if degraded_errors:
         llm_errors = [entry for entry in degraded_errors if _is_llm_degraded_error(entry)]
         if llm_errors:
             first = llm_errors[0]
             return (
                 "llm_provider_error",
-                "quick mode preserved partial evidence, but an LLM/provider failure blocked complete candidate search: "
-                f"{first.get('phase', 'unknown phase')} {first.get('error_type', '')}: {first.get('message', '')}",
+                "quick mode preserved partial evidence, but an LLM/provider failure "
+                "blocked complete candidate search: "
+                f"{first.get('phase', 'unknown phase')} "
+                f"{first.get('error_type', '')}: {first.get('message', '')}",
             )
         first = degraded_errors[0]
         return (
             "quick_mode_degraded",
-            "quick mode preserved partial evidence, but a nonfatal internal error blocked complete candidate search: "
-            f"{first.get('phase', 'unknown phase')} {first.get('error_type', '')}: {first.get('message', '')}",
+            "quick mode preserved partial evidence, but a nonfatal internal error "
+            "blocked complete candidate search: "
+            f"{first.get('phase', 'unknown phase')} "
+            f"{first.get('error_type', '')}: {first.get('message', '')}",
+        )
+    if unfillable_no_action:
+        return (
+            "unfillable_no_action",
+            "fixed-budget quick mode exhausted same-window re-prompts without "
+            "finding a concrete executable candidate",
+        )
+    if fixed_budget_exhausted and len(checked_window_ids) < len(abnormal_windows):
+        return (
+            "budget_exhausted",
+            "fixed candidate budget was exhausted before all ranked signal windows were checked",
         )
     if budget_exhausted and len(checked_window_ids) < len(abnormal_windows):
-        return "budget_exhausted", "quick-mode run budgets were exhausted before all ranked signal windows were checked"
-    if any((item.target_signal_improvement_pct or 0.0) >= defaults.neutral_change_pct for item in short_results):
+        return (
+            "budget_exhausted",
+            "quick-mode run budgets were exhausted before all ranked signal windows were checked",
+        )
+    if any(
+        (item.target_signal_improvement_pct or 0.0) >= defaults.neutral_change_pct
+        for item in short_results
+    ):
         if not any(bool(item.objective_improved) for item in full_results):
-            return "signal_improved_but_no_full_speedup", "short-run proxy signals improved, but no validated candidate improved the full-run objective"
+            return (
+                "signal_improved_but_no_full_speedup",
+                "short-run proxy signals improved, but no validated candidate "
+                "improved the full-run objective",
+            )
     return "safe_rejection", "validated candidates did not deliver a useful end-to-end improvement"
 
 
@@ -1550,6 +1842,8 @@ async def run_quick_tune_loop_async(
     command: str,
     contracts: Sequence[str],
     manual_hints: Sequence[str],
+    fixed_budget: int | None,
+    fixed_goal: float | None,
     max_iterations: int,
     timeout: int,
     primary_objective: str | None,
@@ -1577,9 +1871,25 @@ async def run_quick_tune_loop_async(
     defaults: QuickModeDefaults | None = None,
     excluded_config_names: Sequence[str] | None = None,
 ) -> None:
+    tune_started_at = time.time()
+    baseline_config_find_wall_time_s = 0.0
+    result_find_wall_times: dict[str, float] = {}
+
+    def _elapsed_payload(config_find_wall_time_s: float) -> dict[str, float]:
+        return {
+            "total_wall_time_s": round(time.time() - tune_started_at, 6),
+            "config_find_wall_time_s": round(config_find_wall_time_s, 6),
+        }
+
     if sink is None:
         sink = make_output_sink(ui_mode=TuneUIMode.PLAIN, console=Console())
     resolved_defaults = defaults or QuickModeDefaults()
+    fixed_budget_state = FixedBudgetState(total=fixed_budget)
+    if fixed_budget_state.enabled:
+        fixed_budget_state.max_no_action_reprompts = min(
+            fixed_budget_state.max_no_action_reprompts,
+            cast(int, fixed_budget_state.total),
+        )
 
     cmd_parts = shlex.split(command)
     if not cmd_parts:
@@ -1588,10 +1898,14 @@ async def run_quick_tune_loop_async(
 
     cmd_parts, inline_env_overrides = extract_inline_env_assignments(cmd_parts)
     excluded_config_list = list(excluded_config_names or [])
-    hypothesis_profiles = [item for item in (initial_hypothesis_profiles or []) if isinstance(item, dict)]
+    hypothesis_profiles = [
+        item for item in (initial_hypothesis_profiles or []) if isinstance(item, dict)
+    ]
     signal_specs = _extract_signal_specs(structured_context_bundle, hypothesis_profiles)
     if not signal_specs:
-        sink.print("[red]Quick mode needs contract signals with numeric directional virtual probes[/red]")
+        sink.print(
+            "[red]Quick mode needs contract signals with numeric directional virtual probes[/red]"
+        )
         raise SystemExit(1)
 
     run_id = str(getattr(event_emitter, "run_id", "quick-run"))
@@ -1604,12 +1918,14 @@ async def run_quick_tune_loop_async(
         "manual_hints": list(manual_hints),
         "timeout_s": timeout,
         "max_iterations": max_iterations,
+        "fixed_goal_threshold": fixed_goal,
         "primary_objective_query": primary_objective or "",
         "primary_objective_mode": primary_objective_mode or "",
         "workdir": workdir,
         "memory_high": memory_high,
         "excluded_config_names": excluded_config_list,
         "defaults": asdict(resolved_defaults),
+        **_fixed_budget_payload(fixed_budget_state),
     }
     _write_json(artifact_dir / "metadata.json", metadata)
 
@@ -1623,6 +1939,7 @@ async def run_quick_tune_loop_async(
             "workdir": workdir or "",
             "memory_high": memory_high or "",
             "max_iterations": max_iterations,
+            "fixed_goal_threshold": fixed_goal,
             "timeout_s": timeout,
             "loaded_contracts": list(contracts),
             "manual_hints": list(manual_hints),
@@ -1630,6 +1947,7 @@ async def run_quick_tune_loop_async(
             "primary_objective_query": primary_objective or "",
             "primary_objective_mode": primary_objective_mode or "",
             "artifact_dir": str(artifact_dir),
+            **_fixed_budget_payload(fixed_budget_state),
         },
     )
 
@@ -1647,7 +1965,11 @@ async def run_quick_tune_loop_async(
     )
 
     sink.print("\n[bold cyan]Quick Phase 1: Baseline Run with Periodic Signal Sampling[/bold cyan]")
-    _emit_tune_event(event_emitter, "phase.started", {"mode": "spawn", "quick_mode": True, "phase": "spawn.quick_baseline"})
+    _emit_tune_event(
+        event_emitter,
+        "phase.started",
+        {"mode": "spawn", "quick_mode": True, "phase": "spawn.quick_baseline"},
+    )
     baseline_artifact = await run_executor(
         agent,
         cmd_parts,
@@ -1687,7 +2009,9 @@ async def run_quick_tune_loop_async(
             "phase": "spawn.quick_baseline",
             "returncode": baseline_artifact.get("returncode", 0),
             "wall_time_s": baseline_artifact.get("wall_time", 0.0),
-            **_event_output_payload(str(baseline_artifact.get("stdout", "")), str(baseline_artifact.get("stderr", ""))),
+            **_event_output_payload(
+                str(baseline_artifact.get("stdout", "")), str(baseline_artifact.get("stderr", ""))
+            ),
         },
     )
 
@@ -1704,35 +2028,106 @@ async def run_quick_tune_loop_async(
         )
         resolved_metric = resolve_primary_objective_metric(baseline_metrics, primary_objective)
         if resolved_metric is None:
+            fixed_budget_stop_reason = "hard_failure" if fixed_budget_state.enabled else ""
             sink.print(
                 "[red]Baseline output did not resolve primary objective query "
                 f"'{primary_objective}' to a numeric metric[/red]"
             )
-            _emit_tune_event(event_emitter, "run.finished", {"mode": "spawn", "quick_mode": True, "status": "failed", "failure_reason": "missing_primary_objective"})
+            _emit_tune_event(
+                event_emitter,
+                "run.finished",
+                {
+                    "mode": "spawn",
+                    "quick_mode": True,
+                    "status": "failed",
+                    "failure_reason": "missing_primary_objective",
+                    **_elapsed_payload(baseline_config_find_wall_time_s),
+                    **_fixed_budget_payload(
+                        fixed_budget_state,
+                        stop_reason=fixed_budget_stop_reason,
+                    ),
+                    **fixed_goal_payload(
+                        threshold=fixed_goal,
+                        value=None,
+                        objective_mode="minimize",
+                        stop_reason="hard_failure" if fixed_goal is not None else "",
+                    ),
+                },
+            )
             raise SystemExit(1)
         baseline_objective_metric = resolved_metric
-        baseline_objective_mode = primary_objective_mode or infer_primary_objective_mode(resolved_metric) or ""
+        baseline_objective_mode = (
+            primary_objective_mode or infer_primary_objective_mode(resolved_metric) or ""
+        )
         if not baseline_objective_mode:
+            fixed_budget_stop_reason = "hard_failure" if fixed_budget_state.enabled else ""
             sink.print(
                 "[red]Could not infer --primary-objective-mode after resolving "
-                f"'{primary_objective}' to '{baseline_objective_metric}'. Please specify --primary-objective-mode.[/red]"
+                f"'{primary_objective}' to '{baseline_objective_metric}'. Please "
+                "specify --primary-objective-mode.[/red]"
             )
-            _emit_tune_event(event_emitter, "run.finished", {"mode": "spawn", "quick_mode": True, "status": "failed", "failure_reason": "missing_primary_objective_mode"})
+            _emit_tune_event(
+                event_emitter,
+                "run.finished",
+                {
+                    "mode": "spawn",
+                    "quick_mode": True,
+                    "status": "failed",
+                    "failure_reason": "missing_primary_objective_mode",
+                    **_elapsed_payload(baseline_config_find_wall_time_s),
+                    **_fixed_budget_payload(
+                        fixed_budget_state,
+                        stop_reason=fixed_budget_stop_reason,
+                    ),
+                    **fixed_goal_payload(
+                        threshold=fixed_goal,
+                        value=None,
+                        objective_mode="minimize",
+                        stop_reason="hard_failure" if fixed_goal is not None else "",
+                    ),
+                },
+            )
             raise SystemExit(1)
-        baseline_objective_value = extract_primary_objective_value(baseline_metrics, baseline_objective_metric)
+        baseline_objective_value = extract_primary_objective_value(
+            baseline_metrics, baseline_objective_metric
+        )
         if baseline_objective_value is None:
+            fixed_budget_stop_reason = "hard_failure" if fixed_budget_state.enabled else ""
             sink.print(
                 "[red]Baseline output did not produce numeric primary objective "
                 f"'{primary_objective}'[/red]"
             )
-            _emit_tune_event(event_emitter, "run.finished", {"mode": "spawn", "quick_mode": True, "status": "failed", "failure_reason": "missing_primary_objective"})
+            _emit_tune_event(
+                event_emitter,
+                "run.finished",
+                {
+                    "mode": "spawn",
+                    "quick_mode": True,
+                    "status": "failed",
+                    "failure_reason": "missing_primary_objective",
+                    **_elapsed_payload(baseline_config_find_wall_time_s),
+                    **_fixed_budget_payload(
+                        fixed_budget_state,
+                        stop_reason=fixed_budget_stop_reason,
+                    ),
+                    **fixed_goal_payload(
+                        threshold=fixed_goal,
+                        value=None,
+                        objective_mode="minimize",
+                        stop_reason="hard_failure" if fixed_goal is not None else "",
+                    ),
+                },
+            )
             raise SystemExit(1)
         sink.print(
-            f"  Resolved primary objective metric: {baseline_objective_metric} ({baseline_objective_mode})"
+            "  Resolved primary objective metric: "
+            f"{baseline_objective_metric} ({baseline_objective_mode})"
         )
         sink.print(
-            f"  Baseline {objective_display_name(primary_objective)}: {format_metric_value(baseline_objective_value)}"
+            f"  Baseline {objective_display_name(primary_objective)}: "
+            f"{format_metric_value(baseline_objective_value)}"
         )
+    baseline_config_find_wall_time_s = time.time() - tune_started_at
 
     ranked_windows, initial_usefulness, profiling_available = rank_abnormal_windows(
         signal_specs,
@@ -1775,6 +2170,8 @@ async def run_quick_tune_loop_async(
             full_results=[],
             selected_result=None,
             budget_exhausted=False,
+            fixed_budget_exhausted=False,
+            unfillable_no_action=False,
             defaults=resolved_defaults,
             signal_usefulness=initial_usefulness,
         )
@@ -1802,13 +2199,43 @@ async def run_quick_tune_loop_async(
             artifact_dir=str(artifact_dir),
             degraded_errors=[],
         )
-        _write_json(artifact_dir / "quick_report.json", report)
+        report_payload = asdict(report)
+        report_payload.update(_elapsed_payload(baseline_config_find_wall_time_s))
+        report_payload.update(_fixed_budget_payload(fixed_budget_state))
+        report_payload.update(
+            fixed_goal_payload(
+                threshold=fixed_goal,
+                value=baseline_objective_value,
+                objective_mode=baseline_objective_mode,
+            )
+        )
+        _write_json(artifact_dir / "quick_report.json", report_payload)
         sink.print("[yellow]Quick mode found no useful ranked abnormal signal windows.[/yellow]")
-        _emit_tune_event(event_emitter, "run.finished", {"mode": "spawn", "quick_mode": True, "status": conclusion, "artifact_dir": str(artifact_dir)})
+        _emit_tune_event(
+            event_emitter,
+            "run.finished",
+            {
+                "mode": "spawn",
+                "quick_mode": True,
+                "status": conclusion,
+                "artifact_dir": str(artifact_dir),
+                **_elapsed_payload(baseline_config_find_wall_time_s),
+                **_fixed_budget_payload(fixed_budget_state),
+                **fixed_goal_payload(
+                    threshold=fixed_goal,
+                    value=baseline_objective_value,
+                    objective_mode=baseline_objective_mode,
+                ),
+            },
+        )
         return
 
     sink.print("\n[bold cyan]Quick Phase 2: Ranked Signal Screening[/bold cyan]")
-    _emit_tune_event(event_emitter, "phase.started", {"mode": "spawn", "quick_mode": True, "phase": "spawn.quick_screen"})
+    _emit_tune_event(
+        event_emitter,
+        "phase.started",
+        {"mode": "spawn", "quick_mode": True, "phase": "spawn.quick_screen"},
+    )
 
     short_results: list[QuickShortResult] = []
     full_results: list[QuickShortResult] = []
@@ -1819,16 +2246,80 @@ async def run_quick_tune_loop_async(
     short_budget_used = 0
     full_budget_used = 0
     budget_exhausted = False
+    fixed_budget_exhausted = False
+    max_iterations_exhausted = False
+    max_iteration_trials_used = 0
+    unfillable_no_action = False
+    candidate_space_exhausted = False
     degraded_errors: list[dict[str, str]] = []
 
+    fixed_goal_stop_reason = ""
+
+    def _max_iteration_trials_remaining() -> int:
+        return max(0, max_iterations - max_iteration_trials_used)
+
+    def _select_best_validated_result(
+        candidates: Sequence[QuickShortResult],
+    ) -> QuickShortResult | None:
+        if primary_objective:
+            objective_candidates = [item for item in candidates if item.objective_value is not None]
+            if not objective_candidates:
+                return None
+            selected = objective_candidates[0]
+            for candidate in objective_candidates[1:]:
+                assert selected.objective_value is not None
+                assert candidate.objective_value is not None
+                compare_result = compare_objective_values(
+                    candidate.objective_value,
+                    selected.objective_value,
+                    baseline_objective_mode,
+                )
+                if compare_result > 0 or (
+                    compare_result == 0 and candidate.wall_time_s < selected.wall_time_s
+                ):
+                    selected = candidate
+            return selected
+        if candidates:
+            return min(candidates, key=lambda item: item.wall_time_s)
+        return None
+
+    def _fixed_goal_value(result: QuickShortResult | None) -> float | None:
+        if result is None:
+            return baseline_objective_value
+        if primary_objective:
+            return result.objective_value
+        return result.wall_time_s
+
+    def _fixed_goal_is_reached(result: QuickShortResult | None) -> bool:
+        return fixed_goal_reached(
+            _fixed_goal_value(result),
+            fixed_goal,
+            baseline_objective_mode,
+        )
+
     for window_index, window in enumerate(ranked_windows, start=1):
-        if short_budget_used >= resolved_defaults.max_total_short_runs or full_budget_used >= resolved_defaults.max_total_full_runs:
+        if fixed_goal is not None and _fixed_goal_is_reached(None):
+            fixed_goal_stop_reason = "fixed_goal_reached"
+            break
+        if _max_iteration_trials_remaining() == 0:
+            max_iterations_exhausted = True
+            if fixed_goal is not None:
+                fixed_goal_stop_reason = "max_iterations_exhausted"
+            break
+        if (
+            short_budget_used >= resolved_defaults.max_total_short_runs
+            or full_budget_used >= resolved_defaults.max_total_full_runs
+        ):
             budget_exhausted = True
+            break
+        if fixed_budget_state.enabled and not fixed_budget_state.can_consume():
+            fixed_budget_exhausted = True
             break
         checked_window_ids.append(window.window_id)
         target_spec = signal_spec_map[window.signal_ref]
         sink.print(
-            f"  Screening window {window_index}/{len(ranked_windows)}: {_summarize_abnormal_window(window)}"
+            f"  Screening window {window_index}/{len(ranked_windows)}: "
+            f"{_summarize_abnormal_window(window)}"
         )
         _emit_tune_event(
             event_emitter,
@@ -1844,247 +2335,391 @@ async def run_quick_tune_loop_async(
             },
         )
 
-        contract_content = contract_context_json_for_prompt(structured_context_bundle) if structured_context_bundle else ""
+        contract_content = (
+            contract_context_json_for_prompt(structured_context_bundle)
+            if structured_context_bundle
+            else ""
+        )
         manual_hint_content = _render_spawn_manual_hints(manual_hints)
         excluded_config_content = _render_excluded_config_names(excluded_config_list)
-        prompt = f"""Analyze this workload for quick screening mode and propose candidate actions.
+        group_short_results: list[QuickShortResult] = []
+        skipped_rejected_candidates: list[str] = []
+        attempted_controls: set[str] = set()
+        retry_reason = ""
+        candidate_hypothesis_profiles = hypothesis_profiles
+        screen_budget_s = window.end_offset_s
+        provider_failed = False
+        same_window_no_action_reprompts = 0
 
-## Command
-{' '.join(cmd_parts)}
-
-## Current Environment Overrides
-{json.dumps(inline_env_overrides, indent=2, sort_keys=True) if inline_env_overrides else '(none)'}
-
-## Immutable Controls
-{excluded_config_content}
-
-## Ranked Abnormal Window
-- signal: {window.signal_name}
-- ref: {window.signal_ref}
-- hypothesis: {window.hypothesis_name or '(unknown)'}
-- expected direction: {window.expected_direction}
-- severity: {window.severity:.1f}
-- window: {window.start_offset_s:.2f}s -> {window.end_offset_s:.2f}s
-- reason: {window.reason}
-- candidate controls: {', '.join(window.candidate_controls) if window.candidate_controls else '(not declared)'}
-
-## Rules
-- Short-run ranking must use only target-signal improvement inside the matching window.
-- Do not optimize directly for wall time or the primary objective in the short screen.
-- Keep only the exact immutable controls listed above unchanged; do not treat same-library or related controls as immutable unless their exact names are listed.
-- Keep workload-defining arguments fixed.
-- Return JSON only.
-- Provide up to {max_iterations} ordered actions.
-
-## Baseline Profiling JSON
-{profiling_json_for_prompt(baseline_artifact.get('profiling_json', {}))}
-
-## Loaded Contract Context
-{contract_content if contract_content else '(No contract context provided)'}
-
-## Application Manual Hints
-{manual_hint_content if manual_hint_content else '(No application manual hints provided)'}
-
-## JSON Schema
-{{
-  "summary": "short decision summary",
-  "manual_citation": "one concrete rule from loaded manual(s)",
-  "evidence": ["concise evidence item", "..."],
-  "hypothesis_refs": ["optional hypothesis ids to prioritize next profiling round"],
-  "actions": [
-    {{
-      "config_type": "numactl | env_var | command_prefix | command",
-      "parameter": "required only for env_var",
-      "new_value": "string or token list; for command use full rewritten command",
-      "reason": "why this action follows from evidence",
-      "manual_citation": "manual rule supporting this action"
-    }}
-  ]
-}}"""
-        try:
-            response = await _agent_step_for_prompt(agent, prompt)
-        except LLMError as exc:
-            _record_degraded_error(
-                degraded_errors,
-                phase="recommendation",
-                window_id=window.window_id,
-                signal_ref=window.signal_ref,
-                error_type=exc.__class__.__name__,
-                message=str(exc),
+        while True:
+            prompt = _build_quick_recommendation_prompt(
+                cmd_parts=cmd_parts,
+                inline_env_overrides=inline_env_overrides,
+                excluded_config_content=excluded_config_content,
+                excluded_config_list=excluded_config_list,
+                window=window,
+                max_iterations=_max_iteration_trials_remaining(),
+                baseline_profiling_json=cast(
+                    dict[str, Any], baseline_artifact.get("profiling_json", {})
+                ),
+                contract_content=contract_content,
+                manual_hint_content=manual_hint_content,
+                fixed_budget_remaining=fixed_budget_state.remaining,
+                successful_prior_configs=_successful_prior_config_summaries(
+                    short_results, full_results
+                ),
+                skipped_rejected_candidates=skipped_rejected_candidates,
+                untouched_controls=[
+                    control
+                    for control in window.candidate_controls
+                    if control not in attempted_controls and control not in excluded_config_list
+                ],
+                retry_reason=retry_reason,
             )
-            _append_jsonl(artifact_dir / "degraded_errors.jsonl", degraded_errors[-1])
-            sink.print(
-                "    [yellow]Window recommendation failed because the LLM provider returned an error; "
-                "preserving collected evidence and continuing.[/yellow]"
-            )
+            try:
+                response = await _agent_step_for_prompt(agent, prompt)
+            except LLMError as exc:
+                _record_degraded_error(
+                    degraded_errors,
+                    phase="recommendation",
+                    window_id=window.window_id,
+                    signal_ref=window.signal_ref,
+                    error_type=exc.__class__.__name__,
+                    message=str(exc),
+                )
+                _append_jsonl(artifact_dir / "degraded_errors.jsonl", degraded_errors[-1])
+                sink.print(
+                    "    [yellow]Window recommendation failed because the LLM provider returned "
+                    "an error; preserving collected evidence and continuing.[/yellow]"
+                )
+                _emit_tune_event(
+                    event_emitter,
+                    "recommendation.failed",
+                    {
+                        "mode": "spawn",
+                        "quick_mode": True,
+                        "phase": "spawn.quick_screen",
+                        "window_id": window.window_id,
+                        "signal_ref": window.signal_ref,
+                        "error_type": exc.__class__.__name__,
+                        "message": str(exc),
+                    },
+                )
+                provider_failed = True
+                break
+
+            recommendation = parse_spawn_actions(response.content)
+            if not recommendation.get("valid", False):
+                error_text = str(recommendation.get("error", "")).strip() or "unknown parse error"
+                sink.print(
+                    "    [yellow]Window recommendation was not actionable: "
+                    f"{error_text}[/yellow]"
+                )
+                skipped_rejected_candidates.append(f"invalid recommendation: {error_text}")
+                retry_reason = f"previous recommendation was not actionable: {error_text}"
+                should_reprompt, exhausted_reprompts = _maybe_reprompt_same_window(
+                    fixed_budget_state,
+                    same_window_no_action_reprompts,
+                )
+                if should_reprompt:
+                    same_window_no_action_reprompts += 1
+                    sink.print(
+                        "    [yellow]Re-prompting the same ranked window because fixed budget "
+                        "remains "
+                        "and no concrete candidate was produced.[/yellow]"
+                    )
+                    continue
+                if exhausted_reprompts:
+                    unfillable_no_action = True
+                break
+
+            actions = recommendation.get("actions", [])
+            if not isinstance(actions, list) or not actions:
+                sink.print(
+                    "    [yellow]Window recommendation returned no concrete actions; nothing "
+                    "executable to screen.[/yellow]"
+                )
+                skipped_rejected_candidates.append("recommendation returned no concrete actions")
+                retry_reason = "previous recommendation returned no concrete actions"
+                should_reprompt, exhausted_reprompts = _maybe_reprompt_same_window(
+                    fixed_budget_state,
+                    same_window_no_action_reprompts,
+                )
+                if should_reprompt:
+                    same_window_no_action_reprompts += 1
+                    sink.print(
+                        "    [yellow]Re-prompting the same ranked window because fixed budget "
+                        "remains "
+                        "and no concrete candidate was produced.[/yellow]"
+                    )
+                    continue
+                if exhausted_reprompts:
+                    unfillable_no_action = True
+                break
+
+            attempted_controls.update(_recommendation_action_controls(actions))
             _emit_tune_event(
                 event_emitter,
-                "recommendation.failed",
+                "recommendation.ready",
                 {
                     "mode": "spawn",
                     "quick_mode": True,
                     "phase": "spawn.quick_screen",
                     "window_id": window.window_id,
-                    "signal_ref": window.signal_ref,
-                    "error_type": exc.__class__.__name__,
-                    "message": str(exc),
+                    "summary": recommendation.get("summary", ""),
+                    "next_action": recommendation_next_action_display(actions),
                 },
             )
-            continue
-        recommendation = parse_spawn_actions(response.content)
-        if not recommendation.get("valid", False):
-            sink.print(f"    [yellow]Window recommendation was not actionable: {recommendation.get('error', '')}[/yellow]")
-            continue
-        _emit_tune_event(
-            event_emitter,
-            "recommendation.ready",
-            {
-                "mode": "spawn",
-                "quick_mode": True,
-                "phase": "spawn.quick_screen",
-                "window_id": window.window_id,
-                "summary": recommendation.get("summary", ""),
-                "next_action": recommendation_next_action_display(recommendation["actions"]),
-            },
-        )
-        candidate_hypothesis_profiles = extract_hypothesis_profiles(
-            structured_context_bundle,
-            recommendation.get("hypothesis_refs", []),
-        )
-        if not candidate_hypothesis_profiles:
-            candidate_hypothesis_profiles = hypothesis_profiles
-        candidate_plans = build_spawn_candidates(
-            cmd_parts,
-            recommendation["actions"],
-            max_iterations,
-            inline_env_overrides,
-            excluded_config_list,
-        )
-        candidate_plans = [plan for plan in candidate_plans if _candidate_signature(plan) not in used_signatures]
-        if not candidate_plans:
-            sink.print("    [yellow]No new executable candidate plans remained for this window[/yellow]")
-            continue
-
-        group_short_results: list[QuickShortResult] = []
-        screen_budget_s = window.end_offset_s
-        for plan in candidate_plans:
-            if short_budget_used >= resolved_defaults.max_total_short_runs:
-                budget_exhausted = True
+            candidate_hypothesis_profiles = extract_hypothesis_profiles(
+                structured_context_bundle,
+                recommendation.get("hypothesis_refs", []),
+            )
+            if not candidate_hypothesis_profiles:
+                candidate_hypothesis_profiles = hypothesis_profiles
+            candidate_plan_limit = _max_iteration_trials_remaining()
+            if fixed_budget_state.enabled:
+                candidate_plan_limit = min(
+                    candidate_plan_limit,
+                    fixed_budget_state.remaining or 0,
+                )
+            candidate_plans = build_spawn_candidates(
+                cmd_parts,
+                actions,
+                candidate_plan_limit,
+                inline_env_overrides,
+                excluded_config_list,
+            )
+            if not candidate_plans:
+                sink.print(
+                    "    [yellow]No new executable candidate plans remained for this "
+                    "window[/yellow]"
+                )
+                skipped_rejected_candidates.append(
+                    "recommendation materialized no executable candidate plans"
+                )
+                retry_reason = "previous recommendation produced no executable candidate plans"
+                should_reprompt, exhausted_reprompts = _maybe_reprompt_same_window(
+                    fixed_budget_state,
+                    same_window_no_action_reprompts,
+                )
+                if should_reprompt:
+                    same_window_no_action_reprompts += 1
+                    sink.print(
+                        "    [yellow]Re-prompting the same ranked window because fixed budget "
+                        "remains "
+                        "and no concrete candidate was produced.[/yellow]"
+                    )
+                    continue
+                if exhausted_reprompts:
+                    candidate_space_exhausted = True
                 break
-            short_budget_used += 1
-            candidate_id = len(short_results) + 1
-            config_id = f"short-{candidate_id}"
-            used_signatures.add(_candidate_signature(plan))
-            sink.print(f"    Quick screen {candidate_id}: {plan['label']}")
-            artifact = await _run_candidate(
-                run_executor=run_executor,
-                agent=agent,
-                plan=plan,
-                timeout=timeout,
-                workdir=workdir,
-                memory_high=memory_high,
-                hypothesis_profiles=candidate_hypothesis_profiles,
-                sink=sink,
-                sample_interval_sec=resolved_defaults.sample_interval_sec,
-                stop_after_seconds=screen_budget_s,
-                run_kind="short",
-            )
-            run_metadata, _ = _persist_run_artifacts(
-                artifact_dir=artifact_dir,
-                run_id=run_id,
-                config_id=config_id,
-                run_kind="short",
-                candidate_id=candidate_id,
-                candidate_label=str(plan["label"]),
-                signal_ref=window.signal_ref,
-                signal_name=window.signal_name,
-                window_id=window.window_id,
-                command=list(plan["cmd"]),
-                env_overrides=dict(plan["env_overrides"]),
-                artifact=artifact,
-            )
-            points = _extract_signal_points(artifact, target_spec)
-            result = _materialize_result(
-                candidate_id=candidate_id,
-                candidate_label=str(plan["label"]),
-                config_id=config_id,
-                signal_ref=window.signal_ref,
-                signal_name=window.signal_name,
-                window_id=window.window_id,
-                command=list(plan["cmd"]),
-                env_overrides=dict(plan["env_overrides"]),
-                run_kind="short",
-                artifact=artifact,
-                metadata=run_metadata,
-                target_points=points,
-                baseline_window=window,
-                defaults=resolved_defaults,
-            )
-            if _result_completed_naturally(result):
-                degraded_count_before = len(degraded_errors)
-                await _populate_result_objective(
-                    result=result,
-                    agent=agent,
-                    artifact=artifact,
-                    primary_objective=primary_objective,
-                    baseline_objective_metric=baseline_objective_metric,
-                    baseline_objective_mode=baseline_objective_mode,
-                    extract_metrics_from_output=extract_metrics_from_output,
-                    extract_primary_objective_value=extract_primary_objective_value,
-                    compute_objective_change_pct=compute_objective_change_pct,
-                    baseline_objective_value=baseline_objective_value,
-                    baseline_wall_time=baseline_wall_time,
-                    context=(
-                        "candidate completed during quick screen with actions: "
-                        f"{result.candidate_label}; primary objective query: {primary_objective}"
-                    ),
-                    degraded_errors=degraded_errors,
-                    error_phase="short_objective_extraction",
-                )
-                if len(degraded_errors) > degraded_count_before:
-                    _append_jsonl(artifact_dir / "degraded_errors.jsonl", degraded_errors[-1])
-            short_results.append(result)
-            group_short_results.append(result)
-            _emit_tune_event(
-                event_emitter,
-                "candidate.evaluated",
-                {
-                    "mode": "spawn",
-                    "quick_mode": True,
-                    "phase": "spawn.quick_screen",
-                    "candidate_id": result.candidate_id,
-                    "label": result.candidate_label,
-                    "window_id": result.window_id,
-                    "signal_ref": result.signal_ref,
-                    "signal_name": result.signal_name,
-                    "verdict": result.status,
-                    "target_signal_improvement_pct": result.target_signal_improvement_pct,
-                    "stop_reason": result.stop_reason,
-                    "stopped_intentionally": result.stopped_intentionally,
-                    "primary_objective_metric": result.objective_metric,
-                    "primary_objective_value": result.objective_value,
-                    "primary_objective_improvement_pct": result.objective_improvement_pct,
-                    "primary_objective_speedup_ratio": result.objective_speedup_ratio,
-                },
-            )
-            if result.target_signal_improvement_pct is not None:
-                sink.print(
-                    f"      {result.signal_name}: {format_metric_value(result.target_signal_mean)} ({result.target_signal_improvement_pct:+.1f}% vs baseline window)"
-                )
-            else:
-                sink.print("      [yellow]Target signal unavailable during this short screen[/yellow]")
-            if _result_is_auto_validated(result):
-                sink.print(
-                    "      Completed before the quick-screen budget; using this run as validated objective evidence."
-                )
-                sink.print(
-                    "      Completed-run objective: "
-                    f"{format_metric_value(result.objective_value)} ({_format_objective_speedup(result.objective_speedup_ratio)})"
-                )
-            if result.stop_reason == "screen_budget_reached":
-                sink.print("      [dim]Stopped intentionally at the quick-screen budget.[/dim]")
 
-        if budget_exhausted and not group_short_results:
+            if fixed_budget_state.enabled:
+                remaining_budget = fixed_budget_state.remaining or 0
+                if remaining_budget <= 0:
+                    fixed_budget_exhausted = True
+                    break
+                if len(candidate_plans) > remaining_budget:
+                    candidate_plans = candidate_plans[:remaining_budget]
+                    fixed_budget_exhausted = True
+
+            materialized_without_execution = 0
+            for plan in candidate_plans:
+                if short_budget_used >= resolved_defaults.max_total_short_runs:
+                    budget_exhausted = True
+                    break
+                if _max_iteration_trials_remaining() == 0:
+                    max_iterations_exhausted = True
+                    break
+                max_iteration_trials_used += 1
+                candidate_label = _candidate_plan_label(plan, fallback="(candidate)")
+                if fixed_budget_state.enabled:
+                    consumed = fixed_budget_state.consume(
+                        kind="quick_short_candidate",
+                        label=candidate_label,
+                        reason=f"materialized short-screen candidate for {window.window_id}",
+                    )
+                    if not consumed:
+                        fixed_budget_exhausted = True
+                        break
+                guard_reason = _candidate_plan_guard_reason(plan)
+                if guard_reason is not None:
+                    materialized_without_execution += 1
+                    skipped_rejected_candidates.append(f"{candidate_label}: {guard_reason}")
+                    sink.print(
+                        f"    [yellow]Skipping materialized candidate: {guard_reason}[/yellow]"
+                    )
+                    continue
+                signature = _candidate_signature(plan)
+                if signature in used_signatures:
+                    materialized_without_execution += 1
+                    skipped_rejected_candidates.append(
+                        f"{candidate_label}: duplicate candidate plan"
+                    )
+                    sink.print(
+                        "    [yellow]Skipping duplicate materialized candidate: "
+                        f"{candidate_label}[/yellow]"
+                    )
+                    continue
+                short_budget_used += 1
+                candidate_id = len(short_results) + 1
+                config_id = f"short-{candidate_id}"
+                used_signatures.add(signature)
+                attempted_controls.update(plan.get("env_overrides", {}).keys())
+                sink.print(f"    Quick screen {candidate_id}: {candidate_label}")
+                artifact = await _run_candidate(
+                    run_executor=run_executor,
+                    agent=agent,
+                    plan=plan,
+                    timeout=timeout,
+                    workdir=workdir,
+                    memory_high=memory_high,
+                    hypothesis_profiles=candidate_hypothesis_profiles,
+                    sink=sink,
+                    sample_interval_sec=resolved_defaults.sample_interval_sec,
+                    stop_after_seconds=screen_budget_s,
+                    run_kind="short",
+                )
+                run_metadata, _ = _persist_run_artifacts(
+                    artifact_dir=artifact_dir,
+                    run_id=run_id,
+                    config_id=config_id,
+                    run_kind="short",
+                    candidate_id=candidate_id,
+                    candidate_label=candidate_label,
+                    signal_ref=window.signal_ref,
+                    signal_name=window.signal_name,
+                    window_id=window.window_id,
+                    command=list(plan["cmd"]),
+                    env_overrides=dict(plan["env_overrides"]),
+                    artifact=artifact,
+                )
+                points = _extract_signal_points(artifact, target_spec)
+                result = _materialize_result(
+                    candidate_id=candidate_id,
+                    candidate_label=candidate_label,
+                    config_id=config_id,
+                    signal_ref=window.signal_ref,
+                    signal_name=window.signal_name,
+                    window_id=window.window_id,
+                    command=list(plan["cmd"]),
+                    env_overrides=dict(plan["env_overrides"]),
+                    run_kind="short",
+                    artifact=artifact,
+                    metadata=run_metadata,
+                    target_points=points,
+                    baseline_window=window,
+                    defaults=resolved_defaults,
+                )
+                if _result_completed_naturally(result):
+                    degraded_count_before = len(degraded_errors)
+                    await _populate_result_objective(
+                        result=result,
+                        agent=agent,
+                        artifact=artifact,
+                        primary_objective=primary_objective,
+                        baseline_objective_metric=baseline_objective_metric,
+                        baseline_objective_mode=baseline_objective_mode,
+                        extract_metrics_from_output=extract_metrics_from_output,
+                        extract_primary_objective_value=extract_primary_objective_value,
+                        compute_objective_change_pct=compute_objective_change_pct,
+                        baseline_objective_value=baseline_objective_value,
+                        baseline_wall_time=baseline_wall_time,
+                        context=(
+                            "candidate completed during quick screen with actions: "
+                            f"{result.candidate_label}; primary objective query: "
+                            f"{primary_objective}"
+                        ),
+                        degraded_errors=degraded_errors,
+                        error_phase="short_objective_extraction",
+                    )
+                    if len(degraded_errors) > degraded_count_before:
+                        _append_jsonl(artifact_dir / "degraded_errors.jsonl", degraded_errors[-1])
+                short_results.append(result)
+                result_find_wall_times[result.config_id] = time.time() - tune_started_at
+                group_short_results.append(result)
+                _emit_tune_event(
+                    event_emitter,
+                    "candidate.evaluated",
+                    {
+                        "mode": "spawn",
+                        "quick_mode": True,
+                        "phase": "spawn.quick_screen",
+                        "candidate_id": result.candidate_id,
+                        "label": result.candidate_label,
+                        "window_id": result.window_id,
+                        "signal_ref": result.signal_ref,
+                        "signal_name": result.signal_name,
+                        "verdict": result.status,
+                        "target_signal_improvement_pct": result.target_signal_improvement_pct,
+                        "stop_reason": result.stop_reason,
+                        "stopped_intentionally": result.stopped_intentionally,
+                        "primary_objective_metric": result.objective_metric,
+                        "primary_objective_value": result.objective_value,
+                        "primary_objective_improvement_pct": result.objective_improvement_pct,
+                        "primary_objective_speedup_ratio": result.objective_speedup_ratio,
+                    },
+                )
+                if result.target_signal_improvement_pct is not None:
+                    sink.print(
+                        f"      {result.signal_name}: "
+                        f"{format_metric_value(result.target_signal_mean)} "
+                        f"({result.target_signal_improvement_pct:+.1f}% vs baseline window)"
+                    )
+                else:
+                    sink.print(
+                        "      [yellow]Target signal unavailable during this short screen[/yellow]"
+                    )
+                if _result_is_auto_validated(result):
+                    sink.print(
+                        "      Completed before the quick-screen budget; using this run "
+                        "as validated objective evidence."
+                    )
+                    sink.print(
+                        "      Completed-run objective: "
+                        f"{format_metric_value(result.objective_value)} "
+                        f"({_format_objective_speedup(result.objective_speedup_ratio)})"
+                    )
+                if result.stop_reason == "screen_budget_reached":
+                    sink.print(
+                        "      [dim]Stopped intentionally at the quick-screen budget.[/dim]"
+                    )
+
+            if (
+                group_short_results
+                or budget_exhausted
+                or fixed_budget_exhausted
+                or max_iterations_exhausted
+            ):
+                break
+            if materialized_without_execution > 0:
+                retry_reason = (
+                    "all materialized candidate plans were skipped before execution; propose "
+                    "finer-grained variants or untouched controls"
+                )
+                should_reprompt, exhausted_reprompts = _maybe_reprompt_same_window(
+                    fixed_budget_state,
+                    same_window_no_action_reprompts,
+                )
+                if should_reprompt:
+                    same_window_no_action_reprompts += 1
+                    sink.print(
+                        "    [yellow]All materialized candidates were skipped before execution; "
+                        "re-prompting the same ranked window while fixed budget remains.[/yellow]"
+                    )
+                    continue
+                if exhausted_reprompts:
+                    candidate_space_exhausted = True
+            break
+
+        if provider_failed:
+            continue
+        if unfillable_no_action:
+            break
+
+        if (
+            budget_exhausted or fixed_budget_exhausted or max_iterations_exhausted
+        ) and not group_short_results:
             break
 
         group_promotions = select_promotions(
@@ -2093,23 +2728,46 @@ async def run_quick_tune_loop_async(
             max_full_runs_per_group=resolved_defaults.max_full_runs_per_group,
         )
         promotions.extend(group_promotions)
-        for decision in group_promotions:
-            _append_jsonl(artifact_dir / "promotion_decisions.jsonl", decision)
+        for recorded_promotion in group_promotions:
+            _append_jsonl(artifact_dir / "promotion_decisions.jsonl", recorded_promotion)
 
         for result in group_short_results:
-            decision = next((item for item in group_promotions if item.candidate_id == result.candidate_id), None)
-            if decision is None or not decision.promoted:
+            matched_promotion = next(
+                (item for item in group_promotions if item.candidate_id == result.candidate_id),
+                None,
+            )
+            if matched_promotion is None or not matched_promotion.promoted:
                 continue
+            if fixed_budget_state.enabled and not fixed_budget_state.can_consume():
+                fixed_budget_exhausted = True
+                break
+            if _max_iteration_trials_remaining() == 0:
+                max_iterations_exhausted = True
+                break
             if full_budget_used >= resolved_defaults.max_total_full_runs:
                 budget_exhausted = True
                 break
+            max_iteration_trials_used += 1
+            if fixed_budget_state.enabled:
+                consumed = fixed_budget_state.consume(
+                    kind="quick_full_candidate",
+                    label=result.candidate_label,
+                    reason=f"promoted full validation for {result.window_id}",
+                )
+                if not consumed:
+                    fixed_budget_exhausted = True
+                    break
             full_budget_used += 1
             config_id = f"full-{result.candidate_id}"
             sink.print(f"    Full validation: {result.candidate_label}")
             artifact = await _run_candidate(
                 run_executor=run_executor,
                 agent=agent,
-                plan={"cmd": result.command, "env_overrides": result.env_overrides, "label": result.candidate_label},
+                plan={
+                    "cmd": result.command,
+                    "env_overrides": result.env_overrides,
+                    "label": result.candidate_label,
+                },
                 timeout=timeout,
                 workdir=workdir,
                 memory_high=memory_high,
@@ -2173,13 +2831,17 @@ async def run_quick_tune_loop_async(
             if len(degraded_errors) > degraded_count_before:
                 _append_jsonl(artifact_dir / "degraded_errors.jsonl", degraded_errors[-1])
             full_results.append(full_result)
+            result_find_wall_times[full_result.config_id] = time.time() - tune_started_at
             if full_result.target_signal_improvement_pct is not None:
                 sink.print(
-                    f"      Full-window {full_result.signal_name}: {format_metric_value(full_result.target_signal_mean)} ({full_result.target_signal_improvement_pct:+.1f}% vs baseline window)"
+                    f"      Full-window {full_result.signal_name}: "
+                    f"{format_metric_value(full_result.target_signal_mean)} "
+                    f"({full_result.target_signal_improvement_pct:+.1f}% vs baseline window)"
                 )
             sink.print(
                 "      Full-run objective: "
-                f"{format_metric_value(full_result.objective_value)} ({_format_objective_speedup(full_result.objective_speedup_ratio)})"
+                f"{format_metric_value(full_result.objective_value)} "
+                f"({_format_objective_speedup(full_result.objective_speedup_ratio)})"
             )
             _emit_tune_event(
                 event_emitter,
@@ -2204,7 +2866,28 @@ async def run_quick_tune_loop_async(
                 },
             )
 
-    _emit_tune_event(event_emitter, "phase.finished", {"mode": "spawn", "quick_mode": True, "phase": "spawn.quick_screen", "status": "completed"})
+        validated_results_for_goal_by_candidate: dict[int, QuickShortResult] = {
+            item.candidate_id: item for item in short_results if _result_is_auto_validated(item)
+        }
+        for item in full_results:
+            validated_results_for_goal_by_candidate[item.candidate_id] = item
+        goal_candidate = _select_best_validated_result(
+            list(validated_results_for_goal_by_candidate.values())
+        )
+        if fixed_goal is not None and _fixed_goal_is_reached(goal_candidate):
+            fixed_goal_stop_reason = "fixed_goal_reached"
+            sink.print(
+                "    Stopped: fixed goal reached "
+                f"({format_metric_value(_fixed_goal_value(goal_candidate))} target, "
+                f"threshold {format_metric_value(fixed_goal)})"
+            )
+            break
+
+    _emit_tune_event(
+        event_emitter,
+        "phase.finished",
+        {"mode": "spawn", "quick_mode": True, "phase": "spawn.quick_screen", "status": "completed"},
+    )
 
     validated_results_by_candidate: dict[int, QuickShortResult] = {
         item.candidate_id: item for item in short_results if _result_is_auto_validated(item)
@@ -2213,9 +2896,15 @@ async def run_quick_tune_loop_async(
         validated_results_by_candidate[item.candidate_id] = item
     validated_results = list(validated_results_by_candidate.values())
 
-    grouped_usefulness: dict[str, QuickSignalUsefulness] = {entry.signal_ref: entry for entry in initial_usefulness}
+    grouped_usefulness: dict[str, QuickSignalUsefulness] = {
+        entry.signal_ref: entry for entry in initial_usefulness
+    }
     for spec in signal_specs:
-        checked_for_signal = [window_id for window_id in checked_window_ids if window_id.startswith(f"{spec.signal_id}-")]
+        checked_for_signal = [
+            window_id
+            for window_id in checked_window_ids
+            if window_id.startswith(f"{spec.signal_id}-")
+        ]
         if not checked_for_signal:
             continue
         grouped_usefulness[spec.signal_ref] = classify_signal_usefulness(
@@ -2226,26 +2915,20 @@ async def run_quick_tune_loop_async(
         )
     signal_usefulness = list(grouped_usefulness.values())
 
-    selected_result: QuickShortResult | None = None
     final_selection_basis = baseline_objective_metric if primary_objective else "wall_time"
-    if primary_objective:
-        candidates = [item for item in validated_results if item.objective_value is not None]
-        if candidates:
-            selected_result = candidates[0]
-            for candidate in candidates[1:]:
-                assert selected_result.objective_value is not None
-                assert candidate.objective_value is not None
-                compare_result = compare_objective_values(
-                    candidate.objective_value,
-                    selected_result.objective_value,
-                    baseline_objective_mode,
-                )
-                if compare_result > 0 or (
-                    compare_result == 0 and candidate.wall_time_s < selected_result.wall_time_s
-                ):
-                    selected_result = candidate
-    elif validated_results:
-        selected_result = min(validated_results, key=lambda item: item.wall_time_s)
+    selected_result = _select_best_validated_result(validated_results)
+    config_find_wall_time_s = baseline_config_find_wall_time_s
+    if selected_result is not None:
+        config_find_wall_time_s = result_find_wall_times.get(
+            selected_result.config_id,
+            baseline_config_find_wall_time_s,
+        )
+    if (
+        fixed_goal is not None
+        and fixed_goal_stop_reason == ""
+        and _fixed_goal_is_reached(selected_result)
+    ):
+        fixed_goal_stop_reason = "fixed_goal_reached"
 
     conclusion, conclusion_reason = _conclusion_from_results(
         profiling_available=profiling_available,
@@ -2255,6 +2938,8 @@ async def run_quick_tune_loop_async(
         full_results=validated_results,
         selected_result=selected_result,
         budget_exhausted=budget_exhausted,
+        fixed_budget_exhausted=fixed_budget_exhausted,
+        unfillable_no_action=unfillable_no_action,
         defaults=resolved_defaults,
         signal_usefulness=signal_usefulness,
         degraded_errors=degraded_errors,
@@ -2285,7 +2970,49 @@ async def run_quick_tune_loop_async(
         artifact_dir=str(artifact_dir),
         degraded_errors=degraded_errors,
     )
-    _write_json(artifact_dir / "quick_report.json", report)
+    fixed_budget_stop_reason = ""
+    if fixed_budget_state.enabled:
+        if unfillable_no_action:
+            fixed_budget_stop_reason = "unfillable_no_action"
+        elif fixed_budget_exhausted:
+            fixed_budget_stop_reason = "fixed_budget_exhausted"
+        elif not degraded_errors and (
+            candidate_space_exhausted or len(checked_window_ids) == len(ranked_windows)
+        ):
+            fixed_budget_stop_reason = "candidate_space_exhausted"
+
+    max_iterations_stop_reason = (
+        "max_iterations_exhausted" if max_iterations_exhausted else ""
+    )
+
+    if fixed_goal is not None and fixed_goal_stop_reason == "" and not _fixed_goal_is_reached(
+        selected_result
+    ):
+        fixed_goal_stop_reason = "max_iterations_exhausted" if max_iterations_exhausted else ""
+
+    report_payload = asdict(report)
+    report_payload.update(_elapsed_payload(config_find_wall_time_s))
+    report_payload.update(
+        {
+            "max_iteration_trials_used": max_iteration_trials_used,
+            "max_iterations_stop_reason": max_iterations_stop_reason,
+        }
+    )
+    report_payload.update(
+        _fixed_budget_payload(
+            fixed_budget_state,
+            stop_reason=fixed_budget_stop_reason,
+        )
+    )
+    report_payload.update(
+        fixed_goal_payload(
+            threshold=fixed_goal,
+            value=_fixed_goal_value(selected_result),
+            objective_mode=baseline_objective_mode,
+            stop_reason=fixed_goal_stop_reason,
+        )
+    )
+    _write_json(artifact_dir / "quick_report.json", report_payload)
 
     sink.table(
         title="Quick Mode Signal/Window Map",
@@ -2297,7 +3024,13 @@ async def run_quick_tune_loop_async(
     )
     sink.table(
         title="Quick Mode Abnormal Windows",
-        columns=[("Signal", "green"), ("Window ID", "white"), ("Window", "white"), ("Severity", "yellow"), ("Reason", "cyan")],
+        columns=[
+            ("Signal", "green"),
+            ("Window ID", "white"),
+            ("Window", "white"),
+            ("Severity", "yellow"),
+            ("Reason", "cyan"),
+        ],
         rows=[
             [
                 window.signal_name,
@@ -2311,14 +3044,23 @@ async def run_quick_tune_loop_async(
     )
     sink.table(
         title="Quick Mode Short Screens",
-        columns=[("Signal", "green"), ("Window ID", "white"), ("Candidate", "white"), ("Screen Time", "magenta"), ("Signal Change", "yellow"), ("Status", "cyan")],
+        columns=[
+            ("Signal", "green"),
+            ("Window ID", "white"),
+            ("Candidate", "white"),
+            ("Screen Time", "magenta"),
+            ("Signal Change", "yellow"),
+            ("Status", "cyan"),
+        ],
         rows=[
             [
                 result.signal_name,
                 result.window_id,
                 result.candidate_label,
                 f"{result.wall_time_s:.2f}s",
-                f"{result.target_signal_improvement_pct:+.1f}%" if result.target_signal_improvement_pct is not None else "-",
+                f"{result.target_signal_improvement_pct:+.1f}%"
+                if result.target_signal_improvement_pct is not None
+                else "-",
                 result.status,
             ]
             for result in short_results
@@ -2326,15 +3068,33 @@ async def run_quick_tune_loop_async(
     )
     sink.table(
         title="Quick Mode Promotions",
-        columns=[("Signal", "green"), ("Window ID", "white"), ("Candidate", "white"), ("Promoted", "yellow"), ("Reason", "cyan")],
+        columns=[
+            ("Signal", "green"),
+            ("Window ID", "white"),
+            ("Candidate", "white"),
+            ("Promoted", "yellow"),
+            ("Reason", "cyan"),
+        ],
         rows=[
-            [decision.signal_name, decision.window_id, decision.candidate_label, "yes" if decision.promoted else "no", decision.reason]
+            [
+                decision.signal_name,
+                decision.window_id,
+                decision.candidate_label,
+                "yes" if decision.promoted else "no",
+                decision.reason,
+            ]
             for decision in promotions
         ],
     )
     sink.table(
         title="Quick Mode Full Validation",
-        columns=[("Signal", "green"), ("Window ID", "white"), ("Candidate", "white"), ("Objective", "magenta"), ("Objective Ratio", "yellow")],
+        columns=[
+            ("Signal", "green"),
+            ("Window ID", "white"),
+            ("Candidate", "white"),
+            ("Objective", "magenta"),
+            ("Objective Ratio", "yellow"),
+        ],
         rows=[
             [
                 result.signal_name,
@@ -2365,6 +3125,40 @@ async def run_quick_tune_loop_async(
             f"  [yellow]Degraded errors preserved in report: {len(degraded_errors)} "
             f"(see {artifact_dir / 'degraded_errors.jsonl'})[/yellow]"
         )
+    if fixed_budget_stop_reason == "fixed_budget_exhausted":
+        sink.print(
+            "  Stopped: fixed budget exhausted after "
+            f"{fixed_budget_state.used}/{fixed_budget_state.total} candidate attempts"
+        )
+    elif fixed_budget_stop_reason == "candidate_space_exhausted":
+        sink.print("  Stopped: candidate space exhausted before budget")
+    elif fixed_budget_stop_reason == "unfillable_no_action":
+        sink.print(
+            "  Stopped: no valid action after "
+            f"{fixed_budget_state.no_action_reprompts_used} re-prompts"
+        )
+    if fixed_goal_stop_reason == "fixed_goal_reached":
+        sink.print(
+            "  Stopped: fixed goal reached "
+            f"({format_metric_value(_fixed_goal_value(selected_result))} target, "
+            f"threshold {format_metric_value(fixed_goal)})"
+        )
+    elif fixed_goal_stop_reason == "max_iterations_exhausted":
+        sink.print(
+            "  Stopped: max iterations exhausted before fixed goal "
+            f"({format_metric_value(_fixed_goal_value(selected_result))} target, "
+            f"threshold {format_metric_value(fixed_goal)})"
+        )
+    elif max_iterations_stop_reason == "max_iterations_exhausted":
+        sink.print(
+            "  Stopped: max candidate trial limit exhausted after "
+            f"{max_iteration_trials_used}/{max_iterations} candidate attempts"
+        )
+    sink.print(
+        f"  Total SysPilot wall time: "
+        f"{_elapsed_payload(config_find_wall_time_s)['total_wall_time_s']:.2f}s"
+    )
+    sink.print(f"  Config find wall time: {config_find_wall_time_s:.2f}s")
     sink.print(f"  Conclusion: {conclusion} — {conclusion_reason}")
 
     _emit_tune_event(
@@ -2378,14 +3172,38 @@ async def run_quick_tune_loop_async(
             "primary_objective_metric": baseline_objective_metric,
             "primary_objective_mode": baseline_objective_mode,
             "baseline_primary_objective": baseline_objective_value,
-            "selected_primary_objective": selected_result.objective_value if selected_result else None,
-            "primary_objective_improvement_pct": selected_result.objective_improvement_pct if selected_result else None,
-            "primary_objective_speedup_ratio": selected_result.objective_speedup_ratio if selected_result else None,
-            "primary_objective_speedup_label": selected_result.objective_speedup_label if selected_result else "",
+            "selected_primary_objective": selected_result.objective_value
+            if selected_result
+            else None,
+            "primary_objective_improvement_pct": selected_result.objective_improvement_pct
+            if selected_result
+            else None,
+            "primary_objective_speedup_ratio": selected_result.objective_speedup_ratio
+            if selected_result
+            else None,
+            "primary_objective_speedup_label": selected_result.objective_speedup_label
+            if selected_result
+            else "",
             "final_selection_basis": final_selection_basis,
             "conclusion": conclusion,
             "artifact_dir": str(artifact_dir),
             "degraded_error_count": len(degraded_errors),
+            "stop_reason": fixed_goal_stop_reason
+            or fixed_budget_stop_reason
+            or max_iterations_stop_reason,
+            "max_iteration_trials_used": max_iteration_trials_used,
+            "max_iterations_stop_reason": max_iterations_stop_reason,
+            **_elapsed_payload(config_find_wall_time_s),
+            **fixed_goal_payload(
+                threshold=fixed_goal,
+                value=_fixed_goal_value(selected_result),
+                objective_mode=baseline_objective_mode,
+                stop_reason=fixed_goal_stop_reason,
+            ),
+            **_fixed_budget_payload(
+                fixed_budget_state,
+                stop_reason=fixed_budget_stop_reason,
+            ),
         },
     )
     _emit_tune_event(
@@ -2400,6 +3218,22 @@ async def run_quick_tune_loop_async(
             "final_selection_basis": final_selection_basis,
             "conclusion": conclusion,
             "degraded_error_count": len(degraded_errors),
+            "stop_reason": fixed_goal_stop_reason
+            or fixed_budget_stop_reason
+            or max_iterations_stop_reason,
+            "max_iteration_trials_used": max_iteration_trials_used,
+            "max_iterations_stop_reason": max_iterations_stop_reason,
+            **_elapsed_payload(config_find_wall_time_s),
+            **fixed_goal_payload(
+                threshold=fixed_goal,
+                value=_fixed_goal_value(selected_result),
+                objective_mode=baseline_objective_mode,
+                stop_reason=fixed_goal_stop_reason,
+            ),
+            **_fixed_budget_payload(
+                fixed_budget_state,
+                stop_reason=fixed_budget_stop_reason,
+            ),
         },
     )
 
@@ -2410,6 +3244,8 @@ def run_quick_tune_loop(
     command: str,
     contracts: Sequence[str],
     manual_hints: Sequence[str],
+    fixed_budget: int | None,
+    fixed_goal: float | None,
     max_iterations: int,
     timeout: int,
     primary_objective: str | None,
@@ -2443,6 +3279,8 @@ def run_quick_tune_loop(
             command=command,
             contracts=contracts,
             manual_hints=manual_hints,
+            fixed_budget=fixed_budget,
+            fixed_goal=fixed_goal,
             max_iterations=max_iterations,
             timeout=timeout,
             primary_objective=primary_objective,

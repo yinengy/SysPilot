@@ -99,6 +99,7 @@ work/*
 
 # OpenCode
 .sisyphus
+.omo
 
 # Artifacts
 CP2K
@@ -108,3 +109,6 @@ experiments/*/*/runs
 experiments/*/*/work
 artifacts
 library_sources/*
+
+# Experiments
+experiments

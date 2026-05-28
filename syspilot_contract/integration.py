@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Literal
+from typing import Literal
 
 from syspilot_contract.checker import (
     assert_valid_contract,
@@ -105,13 +106,15 @@ def resolve_library_contract_inputs(
     contract_root: Path,
 ) -> list[LibraryContract]:
     contracts: list[LibraryContract] = []
+    store: ContractStore | None = None
     for contract_ref in contract_refs:
         candidate = Path(contract_ref).expanduser()
-        loaded = (
-            load_contract(candidate)
-            if candidate.exists()
-            else load_contract(runtime_contract_dir(contract_root, contract_ref) / "contract.yaml")
-        )
+        if candidate.exists():
+            loaded = load_contract(candidate)
+        else:
+            if store is None:
+                store = ContractStore(contract_root)
+            loaded = store.get_contract(contract_ref)
         if not isinstance(loaded, LibraryContract):
             raise TypeError(f"Expected library contract for {contract_ref}")
         contracts.append(loaded)

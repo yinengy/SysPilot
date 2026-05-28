@@ -44,6 +44,17 @@ The current quick-mode configuration surface is:
 | `--quick-max-total-short-runs` | Global short-screen run budget | `12` |
 | `--quick-max-total-full-runs` | Global promoted full-validation budget | `6` |
 
+Quick mode also accepts the top-level tune flags `--max-iterations N`, `--fixed-budget N`, and `--fixed-goal VALUE`. Unlike the `--quick-*` knobs above, `--max-iterations` and fixed budget are shared candidate-attempt caps for standard spawn tuning and quick mode. Fixed goal stops once the best validated optimization target reaches the requested value, or reports the current best when the `--max-iterations` candidate-trial cap is exhausted first. Quick mode requires profiled signal sampling, so `--no-profile` is rejected when combined with `--quick-mode`.
+
+In quick mode, fixed budget counts concrete candidate attempts after they are materialized:
+
+- short candidate screens count
+- promoted full validations count
+- duplicate, invalid, failed, or timed-out candidate attempts still count once materialized
+- the baseline run does not count
+
+This cap controls search cost only. It does not guarantee that quick mode found the globally best configuration before stopping.
+
 Validation rule: `quick_short_measurement_sec >= 3 * quick_sample_interval_sec`.
 
 Primary objective support remains available in quick mode through `--primary-objective` and `--primary-objective-mode`, but those settings only affect baseline objective parsing, naturally completed short runs, promoted full validations, and final winner selection. They do **not** affect short-run ranking.
@@ -130,6 +141,8 @@ The prompt explicitly constrains the LLM to quick-mode rules:
 
 Candidate actions are then materialized through the existing spawn candidate builder, and duplicate executable plans are removed before execution.
 
+When `--fixed-budget` is enabled, malformed or no-action recommendation replies do not consume candidate budget because they did not produce a concrete candidate. Instead, quick mode uses a bounded same-window re-prompt path that asks for finer-grained actions, untouched controls, or a machine-readable stop reason. If that bounded retry path still cannot materialize a candidate, quick mode stops explicitly instead of pretending budget was spent.
+
 ### 4. Short Candidate Screening
 
 Short screens are the core quick-mode optimization step.
@@ -162,6 +175,8 @@ Promotions are constrained by both:
 - per-window-group cap: `--quick-max-full-runs-per-group`
 - global cap: `--quick-max-total-full-runs`
 
+If `--fixed-budget` is also set, both promoted full validations and short screens still spend from that shared top-level candidate-attempt cap. The quick-mode `--quick-max-total-short-runs` and `--quick-max-total-full-runs` knobs remain separate internal limits. In other words, fixed budget answers "how many candidate attempts can this tune run spend overall", while the quick-mode knobs answer "how many short screens or promoted full runs may quick mode schedule inside that total".
+
 Promoted candidates are rerun as full validations. Those runs are where quick mode returns to end-to-end optimization semantics:
 
 - if `--primary-objective` is configured, full validations are compared on the resolved objective value, with wall time only as a tie-breaker
@@ -172,6 +187,8 @@ Operator-facing quick-mode output now reports these full-run comparisons as spee
 Final winner selection comes from the validated objective pool: promoted full validations plus any short screens that naturally completed the entire workload before the quick-screen stop budget.
 
 Quick mode no longer stops when the first full validation crosses the significant-improvement threshold. It keeps screening the remaining ranked windows until ranked-window exhaustion or the configured short/full run budgets are reached, then selects the best validated candidate from the full-validation pool.
+
+When fixed budget is active, quick mode also stops when that shared candidate-attempt cap is exhausted, even if some ranked windows or quick internal budgets remain.
 
 ## Decision Rules
 

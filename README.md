@@ -93,8 +93,17 @@ syspilot tune --command "./benchmark -t 4" --contract numactl --manual "parent p
 # Keep selected controls unchanged while tuning
 syspilot tune --command "./benchmark -t 4" --contract numactl --exclude-config OMP_NUM_THREADS
 
+# Skip profiling and ask the LLM to reason from raw stdout/stderr only
+syspilot tune --command "./benchmark -t 4" --no-profile
+
 # Optional: constrain spawn-mode runs with a MemoryHigh scope
 syspilot tune --command "./benchmark -t 4" --contract numactl --memory-high 1536M
+
+# Cap candidate search cost at 8 attempted candidate trials, baseline run not included
+syspilot tune --command "./benchmark -t 4" --contract numactl --fixed-budget 8
+
+# Continue until the optimization target reaches a fixed goal, or candidate-trial cap is exhausted
+syspilot tune --command "./benchmark -t 4" --contract numactl --primary-objective "throughput" --fixed-goal 1231.1 --max-iterations 8
 
 # Run quick screening mode with periodic contract-signal sampling
 syspilot tune --command "./benchmark -t 4" --contract numactl --quick-mode
@@ -143,18 +152,27 @@ syspilot tune \
   --ui-mode tui \
   --workdir /path/to/working/dir \
   --contract numactl \
-  --max-iterations 5
+  --max-iterations 5 \
+  --fixed-budget 12
 ```
 
 **Features:**
 - Runs initial baseline benchmark automatically
+- By default, collects profiling evidence for baseline and candidate runs. Use `--no-profile` when you want SysPilot to skip profiler/probe collection and ask the LLM to reason from raw program stdout/stderr instead.
 - Runs iterative loop: re-profile current config -> generate new actions -> run candidate(s) -> accept best improvement
 - `--quick-mode` switches to a fast-screening workflow: one full baseline run with periodic contract-signal sampling, offline abnormal-window detection, short candidate screens that stop at the matched baseline window budget, then capped full validation of the best short screens
 - Uses process-tree-aware profiling (manager + heavy child workers) to avoid parent-only blind spots
-- Stops by convergence (non-improving iteration patience) or `--max-iterations`
+- By default, stops by convergence (non-improving iteration patience) or `--max-iterations`; `--max-iterations` defaults to 20 materialized candidate trial attempts and does not count the baseline run.
+- `--fixed-budget N` adds an authoritative cap on candidate attempts. It limits search cost, not outcome quality, and does not guarantee the best possible configuration.
+- `--fixed-goal VALUE` keeps tuning until the selected optimization target reaches the requested value, or until the `--max-iterations` candidate-trial cap is exhausted. Maximize objectives stop at `>= VALUE`; minimize objectives such as wall time stop at `<= VALUE`.
+- Baseline profiling does not consume fixed budget. Concrete candidate attempts do, including duplicate, invalid, failed, or timed-out attempts once they are materialized.
+- In fixed-budget mode, SysPilot keeps searching past normal convergence or no-action stops while budget remains. `--max-iterations` uses the same materialized candidate-attempt counting method as fixed budget, so the effective trial cap is the smaller remaining value when both are set.
+- No-action or malformed recommendation replies do not spend trial budget. They use a bounded re-prompt allowance that asks for finer-grained or untouched options, and SysPilot stops with an explicit no-valid-action reason if that allowance is exhausted.
 - Compares baseline vs best-found configuration side-by-side
 - Final summaries identify the round and per-round trial that found the reported best configuration, plus cumulative candidate trial runs and full-process round/trial/profiled-run totals
+- Final summaries also report total SysPilot wall time and config-find wall time, so operators can distinguish full tuning cost from the time needed to discover the reported best configuration.
 - `--contract <name[,name...]>` loads library contract context for spawn-mode tune. Repeat the option or use comma-separated values when multiple libraries are involved.
+- Contract names are resolved through the contract store, so punctuation aliases such as `pytorch-cudnn` and `pytorch_cudnn` resolve to the same contract when the bundle exists.
 - When multiple contracts are present, SysPilot synthesizes contract-guided hypotheses and uses them to steer profiling and candidate selection.
 - `--manual <hint[,hint...]>` adds application-specific natural-language hints directly to the tuning prompt. Manual hints never generate LPCL hypotheses.
 - `--contract` and `--manual` are orthogonal and can be used together in the same tune run.
@@ -184,13 +202,18 @@ syspilot tune \
   --command "/path/to/app --args" \
   --contract numactl \
   --quick-mode \
-  --max-iterations 6
+  --max-iterations 6 \
+  --fixed-budget 12
 ```
 
 Quick mode currently:
 
 - keeps the default tune workflow unchanged unless `--quick-mode` is explicitly enabled
+- requires profiling/sampling; `--no-profile` is intentionally rejected with `--quick-mode`
 - runs one full sampled baseline, ranks abnormal windows across useful contract signals offline, and checks them under internal short/full run budgets
+- `--fixed-budget N`, when set, caps total candidate attempts across quick-mode short screens and promoted full validations. It is a search-cost cap, not a promise that quick mode found the best available configuration.
+- `--fixed-goal VALUE`, when set, stops quick mode once the best validated target reaches the goal, or reports the current best when the `--max-iterations` candidate-trial cap is exhausted first.
+- Quick mode keeps its own internal `--quick-max-total-short-runs` and `--quick-max-total-full-runs` caps. Those shape short-screen and promoted-full-validation counts, while `--fixed-budget` is a separate top-level cap on total candidate attempts.
 - screens candidates only until the exact ranked baseline window end offset for the currently ranked window, so short runs compare the same relative sampled slice
 - ranks short runs only on target-signal directional improvement in that matched window
 - ranks baseline abnormal windows with a direction-aware burst preference so onset windows beat later plateau-only windows when they describe the same anomaly
@@ -198,6 +221,7 @@ Quick mode currently:
 - promotes only a capped fraction of short-screen winners to full validation within each checked signal/window group
 - uses `--primary-objective` for full validation and final winner selection when configured, otherwise falls back to wall time
 - keeps evaluating ranked windows within the configured short/full run budgets instead of stopping at the first validated improvement
+- under `--fixed-budget`, bounded no-action re-prompts can ask for finer-grained or untouched options without consuming trial budget, but exhausted re-prompts still stop the run explicitly
 - emits distinct quick baseline, short screen, and full validation phases for plain output and event consumers
 - suppresses known wrapper footer summaries like `RUN_LABEL=` / `RESULT_JSON=` from the live plain-output stream only for short screens, while still preserving the full captured stdout/stderr inside quick-mode artifacts
 - exposes quick-mode budgets and thresholds via `--quick-*` flags when you need to retune sampling cadence, screening budgets, or promotion caps

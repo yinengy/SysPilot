@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass, field
-from datetime import datetime
+from dataclasses import dataclass
 from typing import Any
 
 from syspilot.profiling.manager import ProfilingManager
@@ -27,7 +26,7 @@ class TuningEngine:
         self,
         profiling_manager: ProfilingManager,
         tuner: ApplicationTuner,
-        max_iterations: int = 5,
+        max_iterations: int = 20,
         settle_seconds: float = 2.0,
         convergence_threshold: float = 1.0,
         regression_threshold: float = 5.0,
@@ -85,7 +84,8 @@ class TuningEngine:
         rolled_back = False
         if improvement < -self.regression_threshold:
             logger.warning(
-                f"Iteration {iteration_num}: regression of {improvement:.1f}% detected, rolling back"
+                f"Iteration {iteration_num}: regression of {improvement:.1f}% detected, "
+                "rolling back"
             )
             for action in reversed(actions):
                 if action.applied:

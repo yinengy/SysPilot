@@ -84,7 +84,7 @@ class LLMConfig:
                 raise FileNotFoundError(f"LLM config not found at {path}")
             import json
 
-            with open(p, "r") as f:
+            with open(p) as f:
                 return cls.from_dict(json.load(f))
 
         # Search default locations
@@ -102,7 +102,7 @@ class LLMConfig:
                 import json
 
                 try:
-                    with open(p, "r") as f:
+                    with open(p) as f:
                         return cls.from_dict(json.load(f))
                 except Exception:
                     continue
@@ -152,7 +152,7 @@ class TuningConfig:
     auto_tune: bool = False  # Require confirmation by default
     backup_configs: bool = True
     dry_run: bool = True  # Show changes without applying
-    max_tuning_iterations: int = 5
+    max_tuning_iterations: int = 20
 
 
 @dataclass

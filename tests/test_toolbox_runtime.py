@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping, Sequence
 from unittest.mock import patch
 
 from syspilot.toolbox_runtime import (
@@ -11,21 +12,52 @@ from syspilot.toolbox_runtime import (
     start_toolbox_probe_sessions,
 )
 from toolbox.probes.benchmark.completion_count import collect as collect_completion_count_probe
-from toolbox.probes.benchmark.log.message_passing_report import collect as collect_message_passing_report_probe
+from toolbox.probes.benchmark.log.message_passing_report import (
+    collect as collect_message_passing_report_probe,
+)
 from toolbox.probes.benchmark.log.section_presence import collect as collect_section_presence_probe
 from toolbox.probes.benchmark.log.timing_report import collect as collect_timing_report_probe
-from toolbox.probes.cp2k.log.message_passing_summary import collect as collect_cp2k_message_passing_summary_probe
-from toolbox.probes.cp2k.log.rank_max_self_time import collect as collect_cp2k_rank_max_self_time_probe
-from toolbox.probes.cp2k.log.timing_summary import collect as collect_cp2k_timing_summary_probe
 from toolbox.probes.benchmark.throughput import collect as collect_throughput_probe
+from toolbox.probes.cp2k.log.message_passing_summary import (
+    collect as collect_cp2k_message_passing_summary_probe,
+)
+from toolbox.probes.cp2k.log.rank_max_self_time import (
+    collect as collect_cp2k_rank_max_self_time_probe,
+)
+from toolbox.probes.cp2k.log.timing_summary import collect as collect_cp2k_timing_summary_probe
+from toolbox.probes.gpu.nvidia._nvidia_smi import NvidiaSmiOutput, parse_pmon_rows
+from toolbox.probes.gpu.nvidia.device.memory_pressure import (
+    collect as collect_gpu_device_memory_pressure_probe,
+)
+from toolbox.probes.gpu.nvidia.device.sm_utilization import (
+    collect as collect_gpu_device_sm_utilization_probe,
+)
+from toolbox.probes.gpu.nvidia.process.memory_usage import (
+    collect as collect_gpu_process_memory_usage_probe,
+)
+from toolbox.probes.gpu.nvidia.process.sm_utilization import (
+    collect as collect_gpu_process_sm_utilization_probe,
+)
 from toolbox.probes.process.cpu.thread_count import collect as collect_process_thread_count_probe
 from toolbox.probes.process.io.syscall_rate import collect as collect_process_io_syscall_rate_probe
-from toolbox.probes.runtime.api.openblas_get_config import collect as collect_openblas_get_config_probe
-from toolbox.probes.runtime.api.openblas_get_corename import collect as collect_openblas_get_corename_probe
-from toolbox.probes.runtime.api.openblas_get_num_procs import collect as collect_openblas_get_num_procs_probe
-from toolbox.probes.runtime.api.openblas_get_num_threads import collect as collect_openblas_get_num_threads_probe
-from toolbox.probes.runtime.api.openblas_get_parallel import collect as collect_openblas_get_parallel_probe
-from toolbox.probes.runtime.launch.mpi_process_count import collect as collect_mpi_process_count_probe
+from toolbox.probes.runtime.api.openblas_get_config import (
+    collect as collect_openblas_get_config_probe,
+)
+from toolbox.probes.runtime.api.openblas_get_corename import (
+    collect as collect_openblas_get_corename_probe,
+)
+from toolbox.probes.runtime.api.openblas_get_num_procs import (
+    collect as collect_openblas_get_num_procs_probe,
+)
+from toolbox.probes.runtime.api.openblas_get_num_threads import (
+    collect as collect_openblas_get_num_threads_probe,
+)
+from toolbox.probes.runtime.api.openblas_get_parallel import (
+    collect as collect_openblas_get_parallel_probe,
+)
+from toolbox.probes.runtime.launch.mpi_process_count import (
+    collect as collect_mpi_process_count_probe,
+)
 from toolbox.probes.threadpoolctl.threadpool_info import collect as collect_threadpool_info_probe
 
 
@@ -47,6 +79,10 @@ def test_resolve_toolbox_probe_reports_repo_scripts() -> None:
     openblas_get_num_procs = resolve_toolbox_probe("runtime.api.openblas_get_num_procs")
     openblas_get_config = resolve_toolbox_probe("runtime.api.openblas_get_config")
     openblas_get_corename = resolve_toolbox_probe("runtime.api.openblas_get_corename")
+    gpu_device_sm = resolve_toolbox_probe("gpu.nvidia.device.sm_utilization")
+    gpu_device_memory = resolve_toolbox_probe("gpu.nvidia.device.memory_pressure")
+    gpu_process_memory = resolve_toolbox_probe("gpu.nvidia.process.memory_usage")
+    gpu_process_sm = resolve_toolbox_probe("gpu.nvidia.process.sm_utilization")
     missing = resolve_toolbox_probe("missing.probe.example")
 
     assert available["availability"] == "available"
@@ -114,6 +150,22 @@ def test_resolve_toolbox_probe_reports_repo_scripts() -> None:
     assert openblas_get_corename["availability"] == "available"
     assert str(openblas_get_corename.get("script_path", "")).endswith(
         "toolbox/probes/runtime/api/openblas_get_corename.py"
+    )
+    assert gpu_device_sm["availability"] == "available"
+    assert str(gpu_device_sm.get("script_path", "")).endswith(
+        "toolbox/probes/gpu/nvidia/device/sm_utilization.py"
+    )
+    assert gpu_device_memory["availability"] == "available"
+    assert str(gpu_device_memory.get("script_path", "")).endswith(
+        "toolbox/probes/gpu/nvidia/device/memory_pressure.py"
+    )
+    assert gpu_process_memory["availability"] == "available"
+    assert str(gpu_process_memory.get("script_path", "")).endswith(
+        "toolbox/probes/gpu/nvidia/process/memory_usage.py"
+    )
+    assert gpu_process_sm["availability"] == "available"
+    assert str(gpu_process_sm.get("script_path", "")).endswith(
+        "toolbox/probes/gpu/nvidia/process/sm_utilization.py"
     )
     assert missing["availability"] == "unavailable"
 
@@ -285,6 +337,125 @@ def test_completion_count_probe_reads_libcontentbench_json_rows() -> None:
     flat = result["flat"]
     assert isinstance(flat, dict)
     assert flat["benchmark.completion_count"] == 1
+
+
+def test_gpu_device_sm_utilization_probe_parses_nvidia_smi_rows() -> None:
+    output = NvidiaSmiOutput(
+        True,
+        "nvidia_smi",
+        "GPU-aaa, 0, Tesla P100, 87, 42\nGPU-bbb, 1, Tesla P100, 13, 9",
+    )
+
+    with patch(
+        "toolbox.probes.gpu.nvidia._nvidia_smi.run_nvidia_smi",
+        return_value=output,
+    ):
+        result = collect_gpu_device_sm_utilization_probe({})
+
+    assert result["observed"] is True
+    assert result["value"] == 87.0
+    assert result["unit"] == "percent"
+    flat = result["flat"]
+    structured = result["structured"]
+    assert isinstance(flat, Mapping)
+    assert isinstance(structured, Mapping)
+    assert flat["gpu.nvidia.device.sm_utilization_pct"] == 87.0
+    assert flat["gpu.nvidia.device.sm_utilization_avg_pct"] == 50.0
+    assert structured["attribution_quality"] == "device_exact"
+
+
+def test_gpu_device_memory_pressure_probe_reports_max_and_bytes() -> None:
+    output = NvidiaSmiOutput(
+        True,
+        "nvidia_smi",
+        "GPU-aaa, 0, Tesla P100, 4096, 16384, 12288\nGPU-bbb, 1, Tesla P100, 8192, 16384, 8192",
+    )
+
+    with patch(
+        "toolbox.probes.gpu.nvidia._nvidia_smi.run_nvidia_smi",
+        return_value=output,
+    ):
+        result = collect_gpu_device_memory_pressure_probe({})
+
+    assert result["observed"] is True
+    assert result["value"] == 50.0
+    assert result["unit"] == "percent"
+    flat = result["flat"]
+    assert isinstance(flat, Mapping)
+    assert flat["gpu.nvidia.device.memory_pressure_pct"] == 50.0
+    assert flat["gpu.nvidia.device.memory_pressure_aggregate_pct"] == 37.5
+    assert flat["gpu.nvidia.device.memory_used_bytes"] == 12884901888
+
+
+def test_gpu_process_memory_usage_probe_filters_target_pids() -> None:
+    output = NvidiaSmiOutput(
+        True,
+        "nvidia_smi",
+        "1234, python, GPU-aaa, 256\n5678, python, GPU-aaa, 1024",
+    )
+
+    with patch(
+        "toolbox.probes.gpu.nvidia._nvidia_smi.run_nvidia_smi",
+        return_value=output,
+    ):
+        result = collect_gpu_process_memory_usage_probe(
+            {"primary_pid": 1234, "target_pids": [1234]}
+        )
+
+    assert result["observed"] is True
+    assert result["value"] == 268435456
+    assert result["unit"] == "bytes"
+    flat = result["flat"]
+    structured = result["structured"]
+    assert isinstance(flat, Mapping)
+    assert isinstance(structured, Mapping)
+    assert flat["gpu.nvidia.process.memory_used_bytes"] == 268435456
+    processes = structured["processes"]
+    assert isinstance(processes, Sequence)
+    assert len(processes) == 1
+    process = processes[0]
+    assert isinstance(process, Mapping)
+    assert process["pid"] == 1234
+    assert process["attribution_quality"] == "process_exact"
+
+
+def test_gpu_process_sm_utilization_probe_parses_pmon_rows() -> None:
+    pmon_output = """
+    # gpu        pid  type    sm   mem   enc   dec   command
+        0       1234     C    31     7     -     -   python
+        0       5678     C    12     3     -     -   python
+    """
+    assert parse_pmon_rows(pmon_output)[0]["sm_utilization_pct"] == 31.0
+
+    with patch(
+        "toolbox.probes.gpu.nvidia._nvidia_smi.run_nvidia_smi",
+        return_value=NvidiaSmiOutput(True, "nvidia_smi", pmon_output),
+    ):
+        result = collect_gpu_process_sm_utilization_probe(
+            {"primary_pid": 1234, "target_pids": [1234, 5678]}
+        )
+
+    assert result["observed"] is True
+    assert result["value"] == 43.0
+    assert result["unit"] == "percent"
+    flat = result["flat"]
+    structured = result["structured"]
+    assert isinstance(flat, Mapping)
+    assert isinstance(structured, Mapping)
+    assert flat["gpu.nvidia.process.sm_utilization_pct"] == 43.0
+    assert structured["attribution_quality"] == "process_best_effort"
+
+
+def test_gpu_probe_reports_unavailable_when_nvidia_smi_missing() -> None:
+    with patch(
+        "toolbox.probes.gpu.nvidia._nvidia_smi.run_nvidia_smi",
+        return_value=NvidiaSmiOutput(False, "os_missing", "", "nvidia-smi not found"),
+    ):
+        result = collect_gpu_device_sm_utilization_probe({})
+
+    assert result["observed"] is False
+    assert result["source"] == "os_missing"
+    assert result["error"] == "nvidia-smi not found"
 
 
 def test_process_thread_count_probe_reads_libcontentbench_sampler_summary() -> None:

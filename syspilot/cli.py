@@ -23,8 +23,8 @@ from rich.markup import escape as rich_escape
 from rich.table import Table
 
 from syspilot import __version__
-from syspilot.core.config import SysPilotConfig, LLMConfig
 from syspilot.core.agent import SysPilotAgent
+from syspilot.core.config import LLMConfig, SysPilotConfig
 from syspilot.core.llm import LLMError
 from syspilot.core.openai_auth import (
     build_authorization_url,
@@ -36,29 +36,31 @@ from syspilot.core.openai_auth import (
     syspilot_openai_auth_file,
     wait_for_callback_code,
 )
+from syspilot.fixed_budget import FixedBudgetState
+from syspilot.fixed_goal import fixed_goal_payload, fixed_goal_reached
 from syspilot.profiling import ProfilingManager
 from syspilot.prompt_budget import contract_context_json_for_prompt, profiling_json_for_prompt
 from syspilot.quick_mode import QuickModeDefaults
-from syspilot.spawn_runtime import execute_profiled_spawn_run
 from syspilot.skills import SkillRegistry
-from syspilot.ui.events import is_critical_event
+from syspilot.skills.builtin import (
+    DataProcessorSkill,
+    DynamicScriptSkill,
+    PerfAnalyzerSkill,
+    StraceAnalyzerSkill,
+)
+from syspilot.skills.ebpf import EBPFSkill
+from syspilot.spawn_runtime import execute_profiled_spawn_run, execute_unprofiled_spawn_run
 from syspilot.toolbox_runtime import (
     finish_toolbox_probe_sessions,
     sample_toolbox_probe_sessions,
     start_toolbox_probe_sessions,
 )
-from syspilot.skills.builtin import (
-    DynamicScriptSkill,
-    StraceAnalyzerSkill,
-    PerfAnalyzerSkill,
-    DataProcessorSkill,
-)
-from syspilot.skills.ebpf import EBPFSkill
 from syspilot.tuning import ApplicationTuner
-from syspilot.utils import setup_logging
 from syspilot.ui.emitter import TuneEventEmitter
+from syspilot.ui.events import is_critical_event
 from syspilot.ui.output_sink import OutputSink, SwitchableOutputSink, TuneUIMode, make_output_sink
 from syspilot.ui.tui_sidecar import TuneTuiOrchestrator, should_wait_for_user_on_close
+from syspilot.utils import setup_logging
 
 console = Console()
 logger = logging.getLogger(__name__)
@@ -405,7 +407,8 @@ def manuals() -> None:
 
     if not manual_dir:
         console.print(
-            "[yellow]No manuals directory found (checked source tree and ~/.syspilot/manual)[/yellow]"
+            "[yellow]No manuals directory found (checked source tree and "
+            "~/.syspilot/manual)[/yellow]"
         )
         return
 
@@ -430,9 +433,13 @@ def manuals() -> None:
         table.add_row(manual_name, str(manuals_map[manual_name]))
 
     console.print(table)
-    console.print("\n[dim]Use --manual/-m for spawn-mode application hints or agent/manual tooling[/dim]")
     console.print(
-        "[dim]Example: syspilot tune --command \"./benchmark\" --contract numactl --manual \"worker pool expands after warmup\"[/dim]"
+        "\n[dim]Use --manual/-m for spawn-mode application hints or "
+        "agent/manual tooling[/dim]"
+    )
+    console.print(
+        "[dim]Example: syspilot tune --command \"./benchmark\" --contract "
+        "numactl --manual \"worker pool expands after warmup\"[/dim]"
     )
 
 
@@ -501,7 +508,15 @@ def _resolve_contract_path(contract_ref: str, contract_root: Path | None = None)
     candidate = Path(contract_ref).expanduser()
     if candidate.exists():
         return candidate
-    return _resolve_contract_root(contract_root) / contract_ref / "contract.yaml"
+    root = _resolve_contract_root(contract_root)
+    direct = root / contract_ref / "contract.yaml"
+    if direct.exists():
+        return direct
+    normalized_ref = _slugify_manual_id(contract_ref)
+    normalized = root / normalized_ref / "contract.yaml"
+    if normalized.exists():
+        return normalized
+    return direct
 
 
 def _has_structured_context(bundle: dict[str, object]) -> bool:
@@ -1199,7 +1214,17 @@ def skills() -> None:
 @click.option(
     "--memory-high",
     type=str,
-    help="If set in spawn mode, launch the command via systemd-run --user --scope -p MemoryHigh=...",
+    help=(
+        "If set in spawn mode, launch the command via systemd-run --user "
+        "--scope -p MemoryHigh=..."
+    ),
+)
+@click.option(
+    "--profile/--no-profile",
+    "profile_enabled",
+    default=True,
+    show_default=True,
+    help="Enable profiling evidence collection; --no-profile uses raw command output only.",
 )
 @click.option(
     "--contract",
@@ -1214,7 +1239,8 @@ def skills() -> None:
     "-m",
     multiple=True,
     help=(
-        "Application-specific natural-language tune hint(s). Repeat the option or use comma-separated "
+        "Application-specific natural-language tune hint(s). Repeat the "
+        "option or use comma-separated "
         "values (escape literal commas as \\,)."
     ),
 )
@@ -1222,11 +1248,30 @@ def skills() -> None:
     "--exclude-config",
     multiple=True,
     help=(
-        "Environment variable, command-line parameter, or config control that tune must keep unchanged. "
+        "Environment variable, command-line parameter, or config control "
+        "that tune must keep unchanged. "
         "Repeat the option or use comma-separated values (escape literal commas as \\,)."
     ),
 )
-@click.option("--max-iterations", default=5, help="Maximum tuning iterations")
+@click.option(
+    "--fixed-budget",
+    type=click.IntRange(min=1),
+    help="Positive cap on total candidate trial budget across tune mode.",
+)
+@click.option(
+    "--fixed-goal",
+    type=click.FloatRange(min=0.0, min_open=True),
+    help=(
+        "Positive optimization-target value to reach before stopping. Uses <= for "
+        "minimize objectives and >= for maximize objectives."
+    ),
+)
+@click.option(
+    "--max-iterations",
+    default=20,
+    show_default=True,
+    help="Maximum materialized candidate trial attempts, excluding the baseline run.",
+)
 @click.option("--dry-run/--no-dry-run", default=True, help="Show changes without applying")
 @click.option("--timeout", default=120, help="Timeout per command run in seconds")
 @click.option(
@@ -1341,9 +1386,12 @@ def tune(
     tui_bin: Path | None,
     workdir: Path | None,
     memory_high: str | None,
+    profile_enabled: bool,
     contract: tuple[str, ...],
     manual: tuple[str, ...],
     exclude_config: tuple[str, ...],
+    fixed_budget: int | None,
+    fixed_goal: float | None,
     max_iterations: int,
     dry_run: bool,
     timeout: int,
@@ -1373,6 +1421,9 @@ def tune(
 
     if not command:
         sink.print("[red]Error: --command is required; tune is spawn-mode only[/red]")
+        raise SystemExit(1)
+    if quick_mode and not profile_enabled:
+        sink.print("[red]Error: --no-profile is not supported with --quick-mode[/red]")
         raise SystemExit(1)
 
     resolved_primary_objective: str | None = None
@@ -1453,10 +1504,14 @@ def tune(
 
     if contract_names:
         if _has_structured_context(structured_context_bundle):
-            sink.print(f"[cyan]Using structured contract context: {', '.join(contract_names)}[/cyan]")
+            sink.print(
+                "[cyan]Using structured contract context: "
+                f"{', '.join(contract_names)}[/cyan]"
+            )
         else:
             sink.print(
-                f"[yellow]No structured contract context found for: {', '.join(contract_names)}[/yellow]"
+                "[yellow]No structured contract context found for: "
+                f"{', '.join(contract_names)}[/yellow]"
             )
 
     if manual_hints:
@@ -1470,7 +1525,9 @@ def tune(
 
     if initial_hypothesis_profiles:
         sink.print(
-            f"[cyan]Generated {len(initial_hypothesis_profiles)} contract hypothesis profile(s) at startup[/cyan]"
+            "[cyan]Generated "
+            f"{len(initial_hypothesis_profiles)} contract hypothesis profile(s) "
+            "at startup[/cyan]"
         )
 
     manager = ProfilingManager()
@@ -1504,6 +1561,8 @@ def tune(
                 command=command,
                 contracts=contract_names,
                 manual_hints=manual_hints,
+                fixed_budget=fixed_budget,
+                fixed_goal=fixed_goal,
                 max_iterations=max_iterations,
                 timeout=timeout,
                 primary_objective=resolved_primary_objective,
@@ -1513,7 +1572,9 @@ def tune(
                 sink=sink,
                 event_emitter=event_emitter,
                 structured_context_bundle=(
-                    structured_context_bundle if _has_structured_context(structured_context_bundle) else None
+                    structured_context_bundle
+                    if _has_structured_context(structured_context_bundle)
+                    else None
                 ),
                 initial_hypothesis_profiles=initial_hypothesis_profiles,
                 defaults=quick_mode_defaults,
@@ -1525,15 +1586,22 @@ def tune(
                 command,
                 contract_names,
                 manual_hints,
+                fixed_budget,
+                fixed_goal,
                 max_iterations,
                 timeout,
                 resolved_primary_objective,
                 resolved_primary_objective_mode,
                 workdir,
                 normalized_memory_high,
+                profile_enabled,
                 sink,
                 event_emitter,
-                structured_context_bundle if _has_structured_context(structured_context_bundle) else None,
+                (
+                    structured_context_bundle
+                    if _has_structured_context(structured_context_bundle)
+                    else None
+                ),
                 initial_hypothesis_profiles,
                 excluded_config_names,
             )
@@ -1744,6 +1812,24 @@ def _event_output_payload(
     }
 
 
+def _fixed_budget_event_payload(
+    fixed_budget_state: FixedBudgetState,
+    *,
+    stop_reason: str = "",
+) -> dict[str, object]:
+    if not fixed_budget_state.enabled:
+        return {}
+    payload = fixed_budget_state.to_payload()
+    return {
+        "fixed_budget": payload,
+        "fixed_budget_total": payload["total"],
+        "fixed_budget_used": payload["used"],
+        "fixed_budget_remaining": payload["remaining"],
+        "fixed_budget_stop_reason": stop_reason,
+        "no_action_reprompts_used": payload["no_action_reprompts_used"],
+    }
+
+
 def _profile_run_event_payload(
     *,
     phase: str,
@@ -1782,6 +1868,7 @@ def _emit_profile_artifact_events(
         raw_tools = profiling_json.get("tools_used")
         if isinstance(raw_tools, list):
             profile_tools = [str(tool) for tool in raw_tools if str(tool).strip()]
+    profiling_enabled = bool(profile_json_payload.get("pipeline_used", True))
 
     base_payload = _profile_run_event_payload(
         phase=phase,
@@ -1795,6 +1882,8 @@ def _emit_profile_artifact_events(
         {
             **base_payload,
             "profile_tools": profile_tools,
+            "profiling_enabled": profiling_enabled,
+            "profiling_skipped": not profiling_enabled,
             "profile_json": profile_json_payload,
             "profile_summary": profiling_text,
             "metrics": {
@@ -1811,6 +1900,8 @@ def _emit_profile_artifact_events(
         {
             **base_payload,
             "status": "success" if profiling_artifacts["returncode"] == 0 else "failed",
+            "profiling_enabled": profiling_enabled,
+            "profiling_skipped": not profiling_enabled,
             "returncode": profiling_artifacts["returncode"],
             "wall_time_s": profiling_artifacts["wall_time"],
             **_event_output_payload(
@@ -1852,10 +1943,12 @@ def _print_profile_artifact_summary(
         )
         sink.print(
             "  Cgroup memory envelope: "
-            f"limit={_format_bytes_human(cast(int | None, cgroup_memory.get('effective_limit_bytes')))} "
+            "limit="
+            f"{_format_bytes_human(cast(int | None, cgroup_memory.get('effective_limit_bytes')))} "
             f"current={_format_bytes_human(cast(int | None, cgroup_memory.get('current_bytes')))} "
             f"peak={_format_bytes_human(cast(int | None, cgroup_memory.get('peak_bytes')))} "
-            f"headroom={_format_bytes_human(cast(int | None, cgroup_memory.get('min_headroom_bytes')))} "
+            "headroom="
+            f"{_format_bytes_human(cast(int | None, cgroup_memory.get('min_headroom_bytes')))} "
             f"status={cgroup_memory.get('status', 'unknown')}"
         )
         sink.print(
@@ -1934,13 +2027,15 @@ def _manual_extract_progress_callback(progress: object) -> None:
             )
         else:
             click.echo(
-                f"[extract-evidence] {progress.library_name}: starting {progress.total_chunks} chunks"
+                f"[extract-evidence] {progress.library_name}: starting "
+                f"{progress.total_chunks} chunks"
             )
         return
     if progress.status == "completed":
         click.echo(
             "[extract-evidence] "
-            f"{progress.library_name}: completed {progress.processed_chunks}/{progress.total_chunks} "
+            f"{progress.library_name}: completed "
+            f"{progress.processed_chunks}/{progress.total_chunks} "
             f"chunks, ok={progress.succeeded_chunks}, failed={progress.failed_chunks}, "
             f"elapsed={_format_progress_duration(progress.elapsed_s)}"
         )
@@ -1972,8 +2067,10 @@ def _manual_synthesis_progress_callback(progress: object) -> None:
     click.echo(
         "[synthesize-manual] "
         f"{progress.library_name}/{progress.manual_id} phase={progress.status} "
-        f"evidence={progress.evidence_items} elapsed={_format_progress_duration(progress.elapsed_s)} "
-        f"eta={_format_progress_duration(progress.eta_s)} finish~{_format_progress_finish_time(progress.eta_s)}"
+        f"evidence={progress.evidence_items} "
+        f"elapsed={_format_progress_duration(progress.elapsed_s)} "
+        f"eta={_format_progress_duration(progress.eta_s)} "
+        f"finish~{_format_progress_finish_time(progress.eta_s)}"
     )
 
 
@@ -1985,8 +2082,10 @@ def _manual_composition_progress_callback(progress: object) -> None:
     click.echo(
         "[compose-manuals] "
         f"{progress.app_name}/{progress.manual_id} phase={progress.status} "
-        f"libraries={progress.library_count} elapsed={_format_progress_duration(progress.elapsed_s)} "
-        f"eta={_format_progress_duration(progress.eta_s)} finish~{_format_progress_finish_time(progress.eta_s)}"
+        f"libraries={progress.library_count} "
+        f"elapsed={_format_progress_duration(progress.elapsed_s)} "
+        f"eta={_format_progress_duration(progress.eta_s)} "
+        f"finish~{_format_progress_finish_time(progress.eta_s)}"
     )
 
 
@@ -1998,8 +2097,10 @@ def _contract_synthesis_progress_callback(progress: object) -> None:
     click.echo(
         "[synthesize-contract] "
         f"{progress.library_name}/{progress.contract_id} phase={progress.status} "
-        f"evidence={progress.evidence_items} elapsed={_format_progress_duration(progress.elapsed_s)} "
-        f"eta={_format_progress_duration(progress.eta_s)} finish~{_format_progress_finish_time(progress.eta_s)}"
+        f"evidence={progress.evidence_items} "
+        f"elapsed={_format_progress_duration(progress.elapsed_s)} "
+        f"eta={_format_progress_duration(progress.eta_s)} "
+        f"finish~{_format_progress_finish_time(progress.eta_s)}"
     )
 
 
@@ -2011,8 +2112,10 @@ def _contract_composition_progress_callback(progress: object) -> None:
     click.echo(
         "[compose-contracts] "
         f"{progress.app_name}/{progress.contract_id} phase={progress.status} "
-        f"libraries={progress.library_count} elapsed={_format_progress_duration(progress.elapsed_s)} "
-        f"eta={_format_progress_duration(progress.eta_s)} finish~{_format_progress_finish_time(progress.eta_s)}"
+        f"libraries={progress.library_count} "
+        f"elapsed={_format_progress_duration(progress.elapsed_s)} "
+        f"eta={_format_progress_duration(progress.eta_s)} "
+        f"finish~{_format_progress_finish_time(progress.eta_s)}"
     )
 
 
@@ -2095,7 +2198,11 @@ def _collect_contract_report_env(hypothesis_profiles: list[dict[str, Any]]) -> d
 
 
 def _virtual_probe_search_terms(signal: dict[str, Any], virtual_probe: str) -> list[str]:
-    terms = [virtual_probe, str(signal.get("metric", "")).strip(), str(signal.get("indicates", "")).strip()]
+    terms = [
+        virtual_probe,
+        str(signal.get("metric", "")).strip(),
+        str(signal.get("indicates", "")).strip(),
+    ]
     return [term for term in terms if term]
 
 
@@ -2125,17 +2232,35 @@ def _build_contract_hypothesis_validation_script(
         f"payload = json.loads({json.dumps(payload_json)})\n"
         "plans = payload.get('plans', [])\n"
         "profiling = payload.get('profiling', {})\n"
-        "runtime_output = profiling.get('runtime_output', {}) if isinstance(profiling, dict) else {}\n"
-        "refined_runtime_maps = profiling.get('refined_runtime_maps', {}) if isinstance(profiling, dict) else {}\n"
-        "collect_profile_data = profiling.get('collect_profile_data', {}) if isinstance(profiling, dict) else {}\n"
-        "probe_results = profiling.get('virtual_probe_results', {}) if isinstance(profiling, dict) else {}\n"
-        "cpu_collector = collect_profile_data.get('cpu', {}) if isinstance(collect_profile_data, dict) else {}\n"
+        "runtime_output = profiling.get('runtime_output', {}) if isinstance(\n"
+        "    profiling, dict\n"
+        ") else {}\n"
+        "refined_runtime_maps = profiling.get('refined_runtime_maps', {}) if isinstance(\n"
+        "    profiling, dict\n"
+        ") else {}\n"
+        "collect_profile_data = profiling.get('collect_profile_data', {}) if isinstance(\n"
+        "    profiling, dict\n"
+        ") else {}\n"
+        "probe_results = profiling.get('virtual_probe_results', {}) if isinstance(\n"
+        "    profiling, dict\n"
+        ") else {}\n"
+        "cpu_collector = collect_profile_data.get('cpu', {}) if isinstance(\n"
+        "    collect_profile_data, dict\n"
+        ") else {}\n"
         "cpu_data = cpu_collector.get('data', {}) if isinstance(cpu_collector, dict) else {}\n"
-        "memory_collector = collect_profile_data.get('memory', {}) if isinstance(collect_profile_data, dict) else {}\n"
-        "memory_data = memory_collector.get('data', {}) if isinstance(memory_collector, dict) else {}\n"
+        "memory_collector = collect_profile_data.get('memory', {}) if isinstance(\n"
+        "    collect_profile_data, dict\n"
+        ") else {}\n"
+        "memory_data = memory_collector.get('data', {}) if isinstance(\n"
+        "    memory_collector, dict\n"
+        ") else {}\n"
         "combined_output = str(payload.get('combined_output', ''))\n"
-        "report_env = payload.get('report_env', {}) if isinstance(payload.get('report_env', {}), dict) else {}\n"
-        "active_env = payload.get('active_env', {}) if isinstance(payload.get('active_env', {}), dict) else {}\n"
+        "report_env = payload.get('report_env', {}) if isinstance(\n"
+        "    payload.get('report_env', {}), dict\n"
+        ") else {}\n"
+        "active_env = payload.get('active_env', {}) if isinstance(\n"
+        "    payload.get('active_env', {}), dict\n"
+        ") else {}\n"
         "def _parse_cpu_list(text):\n"
         "    if not isinstance(text, str) or not text.strip():\n"
         "        return None\n"
@@ -2153,7 +2278,9 @@ def _build_contract_hypothesis_validation_script(
         "    return total or None\n"
         "def _signal_result(signal_entry):\n"
         "    signal = signal_entry.get('signal', {}) if isinstance(signal_entry, dict) else {}\n"
-        "    resolved_probe = signal_entry.get('resolved_probe', {}) if isinstance(signal_entry, dict) else {}\n"
+        "    resolved_probe = signal_entry.get('resolved_probe', {}) if isinstance(\n"
+        "        signal_entry, dict\n"
+        "    ) else {}\n"
         "    virtual_probe = str(signal.get('virtual_probe', ''))\n"
         "    result = {\n"
         "        'ref': signal_entry.get('ref'),\n"
@@ -2165,21 +2292,35 @@ def _build_contract_hypothesis_validation_script(
         "        'excerpt': [],\n"
         "    }\n"
         "    lines = combined_output.splitlines()\n"
-        "    probe_result = probe_results.get(virtual_probe, {}) if isinstance(probe_results, dict) else {}\n"
+        "    probe_result = probe_results.get(virtual_probe, {}) if isinstance(\n"
+        "        probe_results, dict\n"
+        "    ) else {}\n"
         "    if isinstance(probe_result, dict) and probe_result:\n"
         "        result['observed'] = bool(probe_result.get('observed', False))\n"
         "        result['source'] = str(probe_result.get('source', 'toolbox_script'))\n"
         "        result['value'] = probe_result.get('value')\n"
         "        excerpt = probe_result.get('excerpt', [])\n"
         "        result['excerpt'] = excerpt[:8] if isinstance(excerpt, list) else []\n"
-        "        if result['observed'] or result['source'] in ('unavailable', 'probe_error', 'os_missing', 'runtime_output_missing'):\n"
+        "        if result['observed'] or result['source'] in (\n"
+        "            'unavailable', 'probe_error', 'os_missing', 'runtime_output_missing'\n"
+        "        ):\n"
         "            return result\n"
-        "    terms = [virtual_probe.lower(), str(signal.get('metric', '')).lower(), str(signal.get('indicates', '')).lower()]\n"
+        "    terms = [\n"
+        "        virtual_probe.lower(),\n"
+        "        str(signal.get('metric', '')).lower(),\n"
+        "        str(signal.get('indicates', '')).lower(),\n"
+        "    ]\n"
         "    searchable_terms = [term for term in terms if term]\n"
-        "    if isinstance(resolved_probe, dict) and resolved_probe.get('availability') == 'unavailable':\n"
+        "    if isinstance(resolved_probe, dict) and resolved_probe.get(\n"
+        "        'availability'\n"
+        "    ) == 'unavailable':\n"
         "        result['source'] = 'unavailable'\n"
         "        return result\n"
-        "    matches = [line.strip() for line in lines if any(term in line.lower() for term in searchable_terms)]\n"
+        "    matches = [\n"
+        "        line.strip()\n"
+        "        for line in lines\n"
+        "        if any(term in line.lower() for term in searchable_terms)\n"
+        "    ]\n"
         "    result['observed'] = bool(matches)\n"
         "    result['source'] = 'runtime_output' if matches else 'unsupported'\n"
         "    result['value'] = matches[:8] if matches else None\n"
@@ -2188,8 +2329,14 @@ def _build_contract_hypothesis_validation_script(
         "profiles = []\n"
         "for plan in plans:\n"
         "    signals = plan.get('validation_signals', []) if isinstance(plan, dict) else []\n"
-        "    signal_results = [_signal_result(signal) for signal in signals if isinstance(signal, dict)]\n"
-        "    findings = [f\"{item['ref']} observed via {item['source']}\" for item in signal_results if item.get('observed')]\n"
+        "    signal_results = [\n"
+        "        _signal_result(signal) for signal in signals if isinstance(signal, dict)\n"
+        "    ]\n"
+        "    findings = [\n"
+        "        f\"{item['ref']} observed via {item['source']}\"\n"
+        "        for item in signal_results\n"
+        "        if item.get('observed')\n"
+        "    ]\n"
         "    missing = [item.get('ref') for item in signal_results if not item.get('observed')]\n"
         "    profiles.append({\n"
         "        'hypothesis_id': plan.get('hypothesis_id'),\n"
@@ -2955,10 +3102,10 @@ def _parse_spawn_actions(response: str) -> dict[str, Any]:
             }
         )
 
-    if normalized_actions and (not manual_citation or not evidence):
+    if normalized_actions and not evidence:
         return {
             "valid": False,
-            "error": "Actionable recommendations require non-empty manual_citation and evidence",
+            "error": "Actionable recommendations require non-empty evidence",
             "summary": summary,
             "manual_citation": manual_citation,
             "evidence": evidence,
@@ -3308,6 +3455,80 @@ def _build_spawn_candidates(
     return candidates
 
 
+def _materialize_spawn_candidate_attempts(
+    base_command: list[str],
+    actions: list[dict[str, Any]],
+    max_attempts: int,
+    base_env_overrides: dict[str, str] | None = None,
+    excluded_config_names: Sequence[str] | None = None,
+) -> list[dict[str, Any]]:
+    if max_attempts < 1:
+        return []
+
+    alternative_action_types = {"command", "command_prefix", "numactl"}
+    shared_actions: list[dict[str, Any]] = []
+    alternative_actions: list[dict[str, Any]] = []
+
+    for action in actions:
+        config_type = str(action.get("config_type", "")).strip().lower()
+        if config_type in alternative_action_types:
+            alternative_actions.append(action)
+        else:
+            shared_actions.append(action)
+
+    candidate_action_sets: list[list[dict[str, Any]]] = []
+    if alternative_actions:
+        candidate_action_sets.extend([shared_actions + [action] for action in alternative_actions])
+    elif shared_actions:
+        candidate_action_sets.extend(
+            [shared_actions[:idx] for idx in range(1, len(shared_actions) + 1)]
+        )
+
+    attempts: list[dict[str, Any]] = []
+    seen_materialized: set[tuple[tuple[str, ...], tuple[tuple[str, str], ...]]] = set()
+    base_env = dict(base_env_overrides or {})
+
+    for action_set in candidate_action_sets:
+        tuned_cmd, env_overrides, applied_actions, skipped_actions = _build_spawn_execution_plan(
+            base_command,
+            action_set,
+            base_env_overrides=base_env_overrides,
+            excluded_config_names=excluded_config_names,
+        )
+        label = ", ".join(applied_actions) if applied_actions else "(none)"
+        key = _command_key(tuned_cmd, env_overrides) if tuned_cmd else None
+        materialized_status = "ready"
+        materialized_reason = "candidate materialized"
+
+        if not tuned_cmd:
+            materialized_status = "rejected"
+            materialized_reason = "candidate materialization produced no executable command"
+        elif tuned_cmd == base_command and env_overrides == base_env:
+            materialized_status = "rejected"
+            materialized_reason = "candidate materialized with no effective change"
+        elif key in seen_materialized:
+            materialized_status = "duplicate"
+            materialized_reason = "candidate duplicated an earlier materialized attempt"
+        else:
+            seen_materialized.add(cast(tuple[tuple[str, ...], tuple[tuple[str, str], ...]], key))
+
+        attempts.append(
+            {
+                "cmd": tuned_cmd,
+                "env_overrides": env_overrides,
+                "label": label,
+                "skipped_actions": skipped_actions,
+                "actions": [dict(action) for action in action_set],
+                "materialized_status": materialized_status,
+                "materialized_reason": materialized_reason,
+            }
+        )
+        if len(attempts) >= max_attempts:
+            break
+
+    return attempts
+
+
 def _discover_related_processes(root_pid: int, max_targets: int = 4) -> dict[str, Any]:
     if max_targets < 1:
         max_targets = 1
@@ -3404,7 +3625,8 @@ async def _extract_metrics_from_output(
     context: str = "",
 ) -> dict[str, Any]:
     literal_metrics = _extract_literal_numeric_metrics(output)
-    prompt = f"""Extract ONLY runtime performance outcome metrics from this program output. Return JSON only.
+    prompt = f"""Extract ONLY runtime performance outcome metrics from this program output.
+Return JSON only.
 
 {f"Context: {context}" if context else ""}
 
@@ -3758,20 +3980,42 @@ def _render_effective_memory_envelope(
     if not isinstance(evidence, dict) or not evidence.get("control_group"):
         return f"## Spawn MemoryHigh Limit\n{memory_high or '(none)'}"
 
-    memory_events = evidence.get("memory_events", {}) if isinstance(evidence.get("memory_events"), dict) else {}
-    memory_pressure = evidence.get("memory_pressure", {}) if isinstance(evidence.get("memory_pressure"), dict) else {}
-    memory_stat = evidence.get("memory_stat", {}) if isinstance(evidence.get("memory_stat"), dict) else {}
-    pressure_some = memory_pressure.get("some", {}) if isinstance(memory_pressure.get("some"), dict) else {}
-    pressure_full = memory_pressure.get("full", {}) if isinstance(memory_pressure.get("full"), dict) else {}
+    memory_events = (
+        evidence.get("memory_events", {})
+        if isinstance(evidence.get("memory_events"), dict)
+        else {}
+    )
+    memory_pressure = (
+        evidence.get("memory_pressure", {})
+        if isinstance(evidence.get("memory_pressure"), dict)
+        else {}
+    )
+    memory_stat = (
+        evidence.get("memory_stat", {})
+        if isinstance(evidence.get("memory_stat"), dict)
+        else {}
+    )
+    pressure_some = (
+        memory_pressure.get("some", {})
+        if isinstance(memory_pressure.get("some"), dict)
+        else {}
+    )
+    pressure_full = (
+        memory_pressure.get("full", {})
+        if isinstance(memory_pressure.get("full"), dict)
+        else {}
+    )
 
     return (
         "## Effective Memory Capacity\n"
         f"Requested MemoryHigh: {evidence.get('requested_memory_high') or '(none)'}\n"
         f"Control group: {evidence.get('control_group') or '(unknown)'}\n"
-        f"Effective limit: {_format_bytes_human(cast(int | None, evidence.get('effective_limit_bytes')))}\n"
+        "Effective limit: "
+        f"{_format_bytes_human(cast(int | None, evidence.get('effective_limit_bytes')))}\n"
         f"Current usage: {_format_bytes_human(cast(int | None, evidence.get('current_bytes')))}\n"
         f"Peak usage: {_format_bytes_human(cast(int | None, evidence.get('peak_bytes')))}\n"
-        f"Minimum headroom: {_format_bytes_human(cast(int | None, evidence.get('min_headroom_bytes')))}\n"
+        "Minimum headroom: "
+        f"{_format_bytes_human(cast(int | None, evidence.get('min_headroom_bytes')))}\n"
         f"Sample count: {evidence.get('sample_count', 0)}\n"
         f"memory.events: high={memory_events.get('high', 0)} max={memory_events.get('max', 0)} "
         f"oom={memory_events.get('oom', 0)} oom_kill={memory_events.get('oom_kill', 0)}\n"
@@ -3782,9 +4026,12 @@ def _render_effective_memory_envelope(
         f"pgsteal={memory_stat.get('pgsteal', 0)} "
         f"workingset_refault_anon={memory_stat.get('workingset_refault_anon', 0)} "
         f"workingset_refault_file={memory_stat.get('workingset_refault_file', 0)}\n"
-        f"Swap current: {_format_bytes_human(cast(int | None, evidence.get('swap_current_bytes')))}\n"
+        "Swap current: "
+        f"{_format_bytes_human(cast(int | None, evidence.get('swap_current_bytes')))}\n"
         f"Status: {evidence.get('status', 'unknown')}\n"
-        "Rule: When this block is present, reason about memory against this cgroup-constrained envelope rather than host total RAM or generic process memory percentages."
+        "Rule: When this block is present, reason about memory against this "
+        "cgroup-constrained envelope rather than host total RAM or generic "
+        "process memory percentages."
     )
 
 
@@ -3800,7 +4047,22 @@ async def _run_live_profiling_pipeline(
     stop_after_seconds: float | None = None,
     intentional_stop_reason: str = "screen_budget_reached",
     periodic_sample_interval_s: float | None = None,
+    skip_profiling: bool = False,
 ) -> dict[str, Any]:
+    if skip_profiling:
+        artifact = await execute_unprofiled_spawn_run(
+            agent,
+            command_parts,
+            timeout,
+            workdir=workdir,
+            memory_high=memory_high,
+            env_overrides=env_overrides,
+            live_output_callback=live_output_callback,
+            wrap_spawn_command_with_memory_high=_wrap_spawn_command_with_memory_high,
+            summarize_spawn_runtime_output=_summarize_spawn_runtime_output,
+        )
+        return artifact.to_dict()
+
     artifact = await execute_profiled_spawn_run(
         agent,
         command_parts,
@@ -3833,20 +4095,39 @@ async def _run_spawn_tune_loop_async(
     command: str,
     contracts: Sequence[str],
     manual_hints: Sequence[str],
+    fixed_budget: int | None,
+    fixed_goal: float | None,
     max_iterations: int,
     timeout: int,
     primary_objective: str | None = None,
     primary_objective_mode: str | None = None,
     workdir: str | None = None,
     memory_high: str | None = None,
+    profiling_enabled: bool = True,
     sink: OutputSink | None = None,
     event_emitter: _TuneEmitter | None = None,
     structured_context_bundle: dict[str, object] | None = None,
     initial_hypothesis_profiles: list[dict[str, Any]] | None = None,
     excluded_config_names: Sequence[str] | None = None,
 ) -> None:
+    tune_started_at = time.time()
+    best_config_find_wall_time_s = 0.0
+
+    def _elapsed_payload() -> dict[str, float]:
+        return {
+            "total_wall_time_s": round(time.time() - tune_started_at, 6),
+            "config_find_wall_time_s": round(best_config_find_wall_time_s, 6),
+        }
+
     if sink is None:
         sink = make_output_sink(ui_mode=TuneUIMode.PLAIN, console=console)
+
+    fixed_budget_state = FixedBudgetState(total=fixed_budget)
+    if fixed_budget_state.enabled:
+        fixed_budget_state.max_no_action_reprompts = min(
+            fixed_budget_state.max_no_action_reprompts,
+            cast(int, fixed_budget_state.total),
+        )
 
     cmd_parts = shlex.split(command)
     if not cmd_parts:
@@ -3858,7 +4139,17 @@ async def _run_spawn_tune_loop_async(
         _emit_tune_event(
             event_emitter,
             "run.finished",
-            {"mode": "spawn", "status": "invalid_input"},
+            {
+                "mode": "spawn",
+                "status": "invalid_input",
+                **_elapsed_payload(),
+                **_fixed_budget_event_payload(fixed_budget_state),
+                **fixed_goal_payload(
+                    threshold=fixed_goal,
+                    value=None,
+                    objective_mode="minimize",
+                ),
+            },
         )
         sink.print("[red]Spawn command is empty after parsing[/red]")
         return
@@ -3877,7 +4168,17 @@ async def _run_spawn_tune_loop_async(
         _emit_tune_event(
             event_emitter,
             "run.finished",
-            {"mode": "spawn", "status": "invalid_input"},
+            {
+                "mode": "spawn",
+                "status": "invalid_input",
+                **_elapsed_payload(),
+                **_fixed_budget_event_payload(fixed_budget_state),
+                **fixed_goal_payload(
+                    threshold=fixed_goal,
+                    value=None,
+                    objective_mode="minimize",
+                ),
+            },
         )
         sink.print("[red]Spawn command contained only inline env assignments[/red]")
         return
@@ -3897,7 +4198,9 @@ async def _run_spawn_tune_loop_async(
             "command": command,
             "workdir": workdir or "",
             "memory_high": memory_high or "",
+            "profiling_enabled": profiling_enabled,
             "max_iterations": max_iterations,
+            "fixed_goal_threshold": fixed_goal,
             "timeout_s": timeout,
             "loaded_contracts": loaded_contract_names,
             "loaded_manuals": loaded_manual_names,
@@ -3908,6 +4211,7 @@ async def _run_spawn_tune_loop_async(
             "primary_objective_query": primary_objective or "",
             "primary_objective_metric": "",
             "primary_objective_mode": primary_objective_mode or "",
+            **_fixed_budget_event_payload(fixed_budget_state),
         },
     )
 
@@ -3918,7 +4222,8 @@ async def _run_spawn_tune_loop_async(
         f"{f' ({primary_objective_mode})' if primary_objective_mode else ''}\n"
         f"Workdir: {workdir or '(current)'}\n"
         f"MemoryHigh: {memory_high or '(none)'}\n"
-        f"Max Iterations: {max_iterations}\n"
+        f"Profiling: {'enabled' if profiling_enabled else 'disabled (raw output only)'}\n"
+        f"Max Candidate Trials: {max_iterations}\n"
         f"Timeout: {timeout}s\n"
         f"Contracts: {len(loaded_contract_names)} loaded\n"
         f"Manual hints: {len(manual_hint_list)} provided",
@@ -3953,7 +4258,9 @@ async def _run_spawn_tune_loop_async(
         item for item in (initial_hypothesis_profiles or []) if isinstance(item, dict)
     ]
 
-    sink.print("\n[bold cyan]Round 0 Step 0: Initial Baseline Run (profiled)[/bold cyan]")
+    evidence_kind = "profiled" if profiling_enabled else "raw-output"
+    run_count_label = "profiled run(s)" if profiling_enabled else "raw-output run(s)"
+    sink.print(f"\n[bold cyan]Round 0 Step 0: Initial Baseline Run ({evidence_kind})[/bold cyan]")
     _emit_tune_event(
         event_emitter,
         "phase.started",
@@ -3962,7 +4269,12 @@ async def _run_spawn_tune_loop_async(
     _emit_tune_event(
         event_emitter,
         "profile.started",
-        {"mode": "spawn", "phase": "spawn.baseline", "run_label": "baseline"},
+        {
+            "mode": "spawn",
+            "phase": "spawn.baseline",
+            "run_label": "baseline",
+            "profiling_enabled": profiling_enabled,
+        },
     )
     _emit_tune_event(
         event_emitter,
@@ -3978,6 +4290,7 @@ async def _run_spawn_tune_loop_async(
         env_overrides=inline_env_overrides,
         hypothesis_profiles=startup_hypothesis_profiles,
         live_output_callback=_plain_live_output_callback,
+        skip_profiling=not profiling_enabled,
     )
     baseline_time = baseline_artifacts["wall_time"]
     baseline_stdout = baseline_artifacts.get("stdout", "")
@@ -3999,7 +4312,11 @@ async def _run_spawn_tune_loop_async(
         phase="spawn.baseline",
     )
     baseline_profiling_text, baseline_profiling_json, baseline_contract_validation = (
-        _print_profile_artifact_summary(sink, baseline_artifacts, prefix="Baseline profiled run")
+        _print_profile_artifact_summary(
+            sink,
+            baseline_artifacts,
+            prefix=f"Baseline {evidence_kind} run",
+        )
     )
     baseline_timed_out = bool(baseline_artifacts.get("timed_out"))
     if baseline_timed_out:
@@ -4015,11 +4332,13 @@ async def _run_spawn_tune_loop_async(
             "status": baseline_status,
             "returncode": baseline_rc,
             "wall_time_s": baseline_time,
-            "profiled_run": True,
+            "profiled_run": profiling_enabled,
+            "profiling_enabled": profiling_enabled,
             **_event_output_payload(baseline_stdout, baseline_stderr),
         },
     )
     if baseline_rc != 0 and not baseline_timed_out:
+        fixed_budget_stop_reason = "hard_failure" if fixed_budget_state.enabled else ""
         _emit_tune_event(
             event_emitter,
             "error",
@@ -4037,7 +4356,22 @@ async def _run_spawn_tune_loop_async(
         _emit_tune_event(
             event_emitter,
             "run.finished",
-            {"mode": "spawn", "status": "failed", "returncode": baseline_rc},
+            {
+                "mode": "spawn",
+                "status": "failed",
+                "returncode": baseline_rc,
+                **_elapsed_payload(),
+                **_fixed_budget_event_payload(
+                    fixed_budget_state,
+                    stop_reason=fixed_budget_stop_reason,
+                ),
+                **fixed_goal_payload(
+                    threshold=fixed_goal,
+                    value=None,
+                    objective_mode="minimize",
+                    stop_reason="hard_failure" if fixed_goal is not None else "",
+                ),
+            },
         )
         sink.print(f"[red]Baseline run failed (rc={baseline_rc})[/red]")
         sink.print(f"[dim]stderr: {baseline_stderr[:500]}[/dim]")
@@ -4085,6 +4419,7 @@ async def _run_spawn_tune_loop_async(
             primary_objective,
         )
         if resolved_primary_objective_metric is None:
+            fixed_budget_stop_reason = "hard_failure" if fixed_budget_state.enabled else ""
             _emit_tune_event(
                 event_emitter,
                 "error",
@@ -4105,6 +4440,17 @@ async def _run_spawn_tune_loop_async(
                     "status": "failed",
                     "returncode": 1,
                     "failure_reason": "missing_primary_objective",
+                    **_elapsed_payload(),
+                    **_fixed_budget_event_payload(
+                        fixed_budget_state,
+                        stop_reason=fixed_budget_stop_reason,
+                    ),
+                    **fixed_goal_payload(
+                        threshold=fixed_goal,
+                        value=None,
+                        objective_mode="minimize",
+                        stop_reason="hard_failure" if fixed_goal is not None else "",
+                    ),
                 },
             )
             sink.print(
@@ -4116,6 +4462,7 @@ async def _run_spawn_tune_loop_async(
             resolved_primary_objective_metric
         )
         if primary_objective_mode is None:
+            fixed_budget_stop_reason = "hard_failure" if fixed_budget_state.enabled else ""
             _emit_tune_event(
                 event_emitter,
                 "error",
@@ -4136,6 +4483,17 @@ async def _run_spawn_tune_loop_async(
                     "status": "failed",
                     "returncode": 1,
                     "failure_reason": "missing_primary_objective_mode",
+                    **_elapsed_payload(),
+                    **_fixed_budget_event_payload(
+                        fixed_budget_state,
+                        stop_reason=fixed_budget_stop_reason,
+                    ),
+                    **fixed_goal_payload(
+                        threshold=fixed_goal,
+                        value=None,
+                        objective_mode="minimize",
+                        stop_reason="hard_failure" if fixed_goal is not None else "",
+                    ),
                 },
             )
             sink.print(
@@ -4149,6 +4507,7 @@ async def _run_spawn_tune_loop_async(
             resolved_primary_objective_metric,
         )
         if baseline_objective_value is None:
+            fixed_budget_stop_reason = "hard_failure" if fixed_budget_state.enabled else ""
             _emit_tune_event(
                 event_emitter,
                 "error",
@@ -4169,6 +4528,17 @@ async def _run_spawn_tune_loop_async(
                     "status": "failed",
                     "returncode": 1,
                     "failure_reason": "missing_primary_objective",
+                    **_elapsed_payload(),
+                    **_fixed_budget_event_payload(
+                        fixed_budget_state,
+                        stop_reason=fixed_budget_stop_reason,
+                    ),
+                    **fixed_goal_payload(
+                        threshold=fixed_goal,
+                        value=None,
+                        objective_mode="minimize",
+                        stop_reason="hard_failure" if fixed_goal is not None else "",
+                    ),
                 },
             )
             sink.print(
@@ -4207,11 +4577,15 @@ async def _run_spawn_tune_loop_async(
     best_found_trial = 0
     best_candidate_trials_to_find = 0
     best_profiled_runs_to_find = 1
+    best_config_find_wall_time_s = time.time() - tune_started_at
 
     seen_trials: set[tuple[tuple[str, ...], tuple[tuple[str, str], ...]]] = {
         _command_key(current_command_parts, current_env_overrides)
     }
     iteration_summaries: list[str] = []
+    fixed_budget_stop_reason = ""
+    fixed_goal_stop_reason = ""
+    max_iterations_stop_reason = ""
     stagnation_iterations = 0
     convergence_patience = 2
     min_improvement_pct = 1.0
@@ -4219,8 +4593,143 @@ async def _run_spawn_tune_loop_async(
     total_rounds_executed = 0
     total_candidate_trials_executed = 0
     total_profiled_runs = 1
+    candidate_outcomes: list[dict[str, Any]] = []
+    attempted_control_names: set[str] = set()
 
-    for iteration in range(1, max_iterations + 1):
+    def _current_fixed_goal_value() -> float | None:
+        if primary_objective:
+            return best_objective_value
+        return best_time
+
+    def _current_fixed_goal_mode() -> str:
+        if primary_objective:
+            return primary_objective_mode or "maximize"
+        return "minimize"
+
+    def _fixed_goal_is_reached() -> bool:
+        return fixed_goal_reached(
+            _current_fixed_goal_value(),
+            fixed_goal,
+            _current_fixed_goal_mode(),
+        )
+
+    def _final_stop_reason() -> str:
+        return fixed_goal_stop_reason or fixed_budget_stop_reason or max_iterations_stop_reason
+
+    def _candidate_trials_remaining() -> int:
+        return max(0, max_iterations - total_candidate_trials_executed)
+
+    def _capture_action_controls(actions: Sequence[dict[str, Any]]) -> None:
+        for action in actions:
+            parameter = action.get("parameter")
+            if isinstance(parameter, str) and parameter.strip():
+                attempted_control_names.add(parameter.strip())
+
+            if action.get("config_type") != "command_prefix":
+                continue
+
+            new_value = action.get("new_value")
+            if not isinstance(new_value, list):
+                continue
+            for token in new_value:
+                if not isinstance(token, str) or "=" not in token:
+                    continue
+                name, _sep, _value = token.partition("=")
+                if name and name != "env":
+                    attempted_control_names.add(name)
+
+    def _append_candidate_outcome(
+        label: str,
+        verdict: str,
+        reason: str,
+        *,
+        wall_time_s: float | None = None,
+    ) -> None:
+        entry: dict[str, Any] = {
+            "label": label,
+            "verdict": verdict,
+            "reason": reason,
+        }
+        if wall_time_s is not None:
+            entry["wall_time_s"] = round(wall_time_s, 6)
+        candidate_outcomes.append(entry)
+        if len(candidate_outcomes) > 12:
+            del candidate_outcomes[:-12]
+
+    def _successful_configs_snapshot() -> list[dict[str, Any]]:
+        snapshots: list[dict[str, Any]] = [
+            {
+                "label": "current accepted config",
+                "command": current_command_parts,
+                "env_overrides": current_env_overrides,
+                "wall_time_s": round(current_time, 6),
+                "primary_objective_value": current_objective_value,
+            }
+        ]
+        if best_label != "(none)":
+            snapshots.append(
+                {
+                    "label": "best accepted config",
+                    "command": best_command_parts,
+                    "env_overrides": best_env_overrides,
+                    "wall_time_s": round(best_time, 6),
+                    "primary_objective_value": best_objective_value,
+                }
+            )
+        return snapshots
+
+    def _build_fixed_budget_no_action_reprompt(
+        base_prompt: str,
+        reason: str,
+        stall_reprompts_used: int,
+    ) -> str:
+        untouched_controls = sorted(
+            set(current_env_overrides.keys())
+            - attempted_control_names
+            - set(excluded_config_list)
+        )
+        return (
+            f"{base_prompt}\n\n"
+            "## Fixed-Budget Re-prompt\n"
+            f"Remaining candidate-attempt budget: {fixed_budget_state.remaining}\n"
+            f"No-action reason: {reason}\n"
+            "No-action re-prompts used for this stall: "
+            f"{stall_reprompts_used}/"
+            f"{fixed_budget_state.max_no_action_reprompts}\n\n"
+            "## Candidate History\n"
+            f"Tried command forms: {json.dumps(tried_commands, indent=2)}\n"
+            f"Evaluated/rejected candidates: {json.dumps(candidate_outcomes[-8:], indent=2)}\n"
+            f"Successful configs: {json.dumps(_successful_configs_snapshot(), indent=2)}\n"
+            f"Untouched current controls (where known): {json.dumps(untouched_controls)}\n"
+            f"Protected/excluded controls: {json.dumps(excluded_config_list)}\n\n"
+            "## Re-prompt Requirements\n"
+            "- Budget is fixed and only materialized concrete candidate attempts consume it.\n"
+            "- Return at least one concrete safe action that can materialize into a new executable "
+            "candidate if such an action exists.\n"
+            "- Do not repeat previously tried or rejected candidates.\n"
+            "- Keep the current command, current environment, immutable controls, and primary "
+            "objective constraints in mind.\n"
+            "- If no safe concrete action can be materialized, return the same JSON schema with "
+            '"summary": "STOP:<machine_readable_reason>", empty "actions", and concise "evidence" '
+            "explaining why no candidate can be formed.\n"
+        )
+
+    iteration = 0
+    while True:
+        if fixed_goal is not None and _fixed_goal_is_reached():
+            fixed_goal_stop_reason = "fixed_goal_reached"
+            break
+        if fixed_budget_state.enabled and fixed_budget_state.remaining == 0:
+            fixed_budget_stop_reason = "fixed_budget_exhausted"
+            break
+        if _candidate_trials_remaining() == 0:
+            if fixed_goal is not None:
+                fixed_goal_stop_reason = "max_iterations_exhausted"
+            else:
+                max_iterations_stop_reason = "max_iterations_exhausted"
+            break
+
+        iteration += 1
         total_rounds_executed = iteration
         _emit_tune_event(
             event_emitter,
@@ -4235,13 +4744,38 @@ async def _run_spawn_tune_loop_async(
         profiling_text, profiling_json, contract_validation = _print_profile_artifact_summary(
             sink,
             current_profile_artifacts,
-            prefix="Current profiled run",
+            prefix=f"Current {evidence_kind} run",
         )
 
         history_text = "\n".join(iteration_summaries[-6:]) if iteration_summaries else "(none)"
         tried_commands = [list(parts) for parts, _ in list(seen_trials)[-12:]]
+        candidate_trials_remaining = _candidate_trials_remaining()
 
         memory_envelope_block = _render_effective_memory_envelope(profiling_json, memory_high)
+        immutable_controls_rule = (
+            "- Keep only the exact immutable controls listed above unchanged; do not treat "
+            "same-library or related controls as immutable unless their exact names are listed."
+        )
+        evidence_heading = (
+            "Refined Profiling Evidence" if profiling_enabled else "Raw Runtime Output Evidence"
+        )
+        evidence_rule = (
+            "- Use only profiling evidence, loaded contract context, and application manual hints."
+            if profiling_enabled
+            else (
+                "- Profiling is disabled by --no-profile; use raw stdout/stderr, loaded "
+                "contract context, and application manual hints."
+            )
+        )
+        profiled_run_rule = (
+            "- The current accepted run was already profiled during execution, and candidate "
+            "runs in this\n"
+            "  iteration will also be profiled during execution."
+            if profiling_enabled
+            else "- The current accepted run was executed without profiling; candidate runs in "
+            "this\n"
+            "  iteration will also skip profiling and rely on raw runtime output."
+        )
 
         prompt = f"""Analyze this spawn-mode workload and propose the next optimization actions.
 
@@ -4274,11 +4808,15 @@ async def _run_spawn_tune_loop_async(
 ## Already Tried Command Forms
 {json.dumps(tried_commands)}
 
-## Refined Profiling Evidence
+## {evidence_heading}
 {profiling_json_for_prompt(profiling_json) if profiling_json else profiling_text[:2500]}
 
 ## Contract Hypothesis Validation
-{profiling_json_for_prompt(contract_validation) if contract_validation else "(No contract-guided validation findings)"}
+{
+    profiling_json_for_prompt(contract_validation)
+    if contract_validation
+    else "(No contract-guided validation findings)"
+}
 
 ## Loaded Contract Context
 {contract_content if contract_content else "(No contract context provided)"}
@@ -4287,22 +4825,26 @@ async def _run_spawn_tune_loop_async(
 {manual_hint_content if manual_hint_content else "(No application manual hints provided)"}
 
 ## Rules
-- Use only profiling evidence, loaded contract context, and application manual hints.
-- Loaded contract context may be a structured JSON context bundle; use the structured bundle first when present.
-- Contract hypothesis validation, when present, is runtime-generated structured evidence. Prefer it over inferring raw DSL semantics yourself.
-- The current accepted run was already profiled during execution, and candidate runs in this iteration will also be profiled during execution.
+{evidence_rule}
+- Loaded contract context may be a structured JSON context bundle; use the structured bundle
+  first when present.
+- Contract hypothesis validation, when present, is runtime-generated structured evidence.
+  Prefer it over inferring raw DSL semantics yourself.
+{profiled_run_rule}
 - Avoid recommending exact commands already tried.
-- Keep only the exact immutable controls listed above unchanged; do not treat same-library or related controls as immutable unless their exact names are listed.
-- Keep workload-defining arguments fixed (model/input/token counts/repetitions/output mode) so comparisons stay fair.
+{immutable_controls_rule}
+- Keep workload-defining arguments fixed (model/input/token counts/repetitions/output mode)
+  so comparisons stay fair.
 - Recommend only options that are valid for the target executable.
 - If evidence is insufficient, return no actions.
 - Return JSON only (no markdown, no prose).
-- Provide up to {max_iterations} candidates ordered best-first.
+- Provide up to {candidate_trials_remaining} candidates ordered best-first.
 
 ## JSON Schema
 {{
   "summary": "short decision summary",
-  "manual_citation": "one concrete rule from loaded manual(s)",
+  "manual_citation": "optional concrete rule from loaded manual(s), or empty when\n"
+  "    grounded only in runtime evidence",
   "evidence": ["concise evidence item", "..."],
   "hypothesis_refs": ["optional hypothesis ids to prioritize next profiling round"],
   "actions": [
@@ -4311,143 +4853,233 @@ async def _run_spawn_tune_loop_async(
       "parameter": "required only for env_var",
       "new_value": "string or token list; for command use full rewritten command",
       "reason": "why this action follows from evidence",
-      "manual_citation": "manual rule supporting this action"
+      "manual_citation": "optional manual/contract rule supporting this action"
     }}
   ]
 }}
 """
 
         recommendation: dict[str, Any]
-        if benchmark_deterministic:
-            analysis_wall_time_s = 0.0
-            recommendation = {
-                "valid": True,
-                "error": "",
-                "summary": "Deterministic benchmark mode: skipped agent analysis.",
-                "manual_citation": "",
-                "evidence": ["SYSPILOT_BENCH_DETERMINISTIC=1"],
-                "hypothesis_refs": [],
-                "actions": [],
-                "skipped_actions": [],
-            }
-            sink.print("\n[dim]Deterministic benchmark mode: no tuning actions generated.[/dim]")
-        else:
-            analysis_started_at = time.time()
-            try:
-                response = await _agent_step_for_prompt(agent, prompt)
-            except LLMError as exc:
-                analysis_wall_time_s = time.time() - analysis_started_at
-                logger.warning("Spawn-mode tuning analysis unavailable: %s", exc)
-                sink.print(f"\n[yellow]Agent tuning analysis unavailable: {exc}[/yellow]")
+        candidate_attempts: list[dict[str, Any]] = []
+        candidate_attempt_limit = candidate_trials_remaining
+        candidate_hypothesis_profiles = startup_hypothesis_profiles
+        stop_due_to_no_action = False
+        continue_after_no_candidates = False
+        no_action_reason = ""
+        no_action_reprompts_this_stall = 0
+        prompt_text = prompt
+        analysis_unavailable = False
+
+        while True:
+            analysis_unavailable = False
+            if benchmark_deterministic:
+                analysis_wall_time_s = 0.0
                 recommendation = {
                     "valid": True,
                     "error": "",
-                    "summary": f"LLM tuning analysis unavailable: {exc}",
+                    "summary": "Deterministic benchmark mode: skipped agent analysis.",
                     "manual_citation": "",
-                    "evidence": [],
+                    "evidence": ["SYSPILOT_BENCH_DETERMINISTIC=1"],
                     "hypothesis_refs": [],
                     "actions": [],
                     "skipped_actions": [],
                 }
+                sink.print(
+                    "\n[dim]Deterministic benchmark mode: no tuning actions generated.[/dim]"
+                )
             else:
-                analysis_wall_time_s = time.time() - analysis_started_at
-                sink.print(f"\n[dim]{response.content}[/dim]")
-                recommendation = _parse_spawn_actions(response.content)
-        if not recommendation["valid"]:
+                analysis_started_at = time.time()
+                try:
+                    response = await _agent_step_for_prompt(agent, prompt_text)
+                except LLMError as exc:
+                    analysis_unavailable = True
+                    analysis_wall_time_s = time.time() - analysis_started_at
+                    logger.warning("Spawn-mode tuning analysis unavailable: %s", exc)
+                    sink.print(f"\n[yellow]Agent tuning analysis unavailable: {exc}[/yellow]")
+                    recommendation = {
+                        "valid": True,
+                        "error": "",
+                        "summary": f"LLM tuning analysis unavailable: {exc}",
+                        "manual_citation": "",
+                        "evidence": [],
+                        "hypothesis_refs": [],
+                        "actions": [],
+                        "skipped_actions": [],
+                    }
+                else:
+                    analysis_wall_time_s = time.time() - analysis_started_at
+                    sink.print(f"\n[dim]{response.content}[/dim]")
+                    recommendation = _parse_spawn_actions(response.content)
+
+            if not recommendation["valid"]:
+                _emit_tune_event(
+                    event_emitter,
+                    "warning.raised",
+                    {
+                        "mode": "spawn",
+                        "iteration": iteration,
+                        "message": recommendation["error"],
+                    },
+                )
+                if fixed_budget_state.enabled and fixed_budget_state.record_no_action_reprompt(
+                    no_action_reprompts_this_stall
+                ):
+                    no_action_reprompts_this_stall += 1
+                    no_action_reason = recommendation["error"]
+                    sink.print(
+                        "\n[yellow]Agent recommendation was not actionable; re-prompting "
+                        "within fixed budget[/yellow]"
+                    )
+                    sink.print(f"  Reason: {no_action_reason}")
+                    prompt_text = _build_fixed_budget_no_action_reprompt(
+                        prompt,
+                        no_action_reason,
+                        no_action_reprompts_this_stall,
+                    )
+                    continue
+
+                _emit_tune_event(
+                    event_emitter,
+                    "phase.finished",
+                    {
+                        "mode": "spawn",
+                        "phase": "spawn.iteration",
+                        "iteration": iteration,
+                        "status": (
+                            "unfillable_no_action"
+                            if fixed_budget_state.enabled
+                            else "no_actionable_recommendation"
+                        ),
+                        **(
+                            {"fixed_budget": fixed_budget_state.to_payload()}
+                            if fixed_budget_state.enabled
+                            else {}
+                        ),
+                    },
+                )
+                sink.print("\n[yellow]Agent recommendation was not actionable[/yellow]")
+                sink.print(f"  Reason: {recommendation['error']}")
+                if fixed_budget_state.enabled:
+                    sink.print(
+                        "  [yellow]Stopped: no valid action after "
+                        f"{fixed_budget_state.no_action_reprompts_used} re-prompts[/yellow]"
+                    )
+                    fixed_budget_stop_reason = "unfillable_no_action"
+                stop_due_to_no_action = True
+                break
+
+            if recommendation["skipped_actions"]:
+                sink.print("  Skipped invalid actions:")
+                for item in recommendation["skipped_actions"]:
+                    sink.print(f"    - {item}")
+
+            summary = recommendation["summary"] or "No actionable tuning recommendation returned."
+            next_action_display = _recommendation_next_action_display(recommendation["actions"])
+            recommendation_payload: dict[str, Any] = {
+                "mode": "spawn",
+                "iteration": iteration,
+                "wall_time_s": analysis_wall_time_s,
+                "summary": summary,
+                "manual_citation": recommendation["manual_citation"],
+                "evidence": recommendation["evidence"][:5],
+                "action_count": len(recommendation["actions"]),
+            }
+            if next_action_display:
+                recommendation_payload["next_action"] = next_action_display
             _emit_tune_event(
                 event_emitter,
-                "warning.raised",
-                {
-                    "mode": "spawn",
-                    "iteration": iteration,
-                    "message": recommendation["error"],
-                },
+                "recommendation.ready",
+                recommendation_payload,
             )
-            _emit_tune_event(
-                event_emitter,
-                "phase.finished",
-                {
-                    "mode": "spawn",
-                    "phase": "spawn.iteration",
-                    "iteration": iteration,
-                    "status": "no_actionable_recommendation",
-                },
+            sink.print(f"  Decision summary: {summary}")
+            if next_action_display:
+                sink.print(f"  Next action: {next_action_display}")
+            if recommendation["manual_citation"]:
+                sink.print(f"  Manual citation: {recommendation['manual_citation']}")
+            if recommendation["evidence"]:
+                for evidence_item in recommendation["evidence"][:5]:
+                    sink.print(f"  Evidence: {evidence_item}")
+            active_hypothesis_refs = recommendation.get("hypothesis_refs", [])
+            if active_hypothesis_refs:
+                sink.print(f"  Next hypothesis focus: {active_hypothesis_refs}")
+
+            if active_hypothesis_refs:
+                candidate_hypothesis_profiles = _extract_hypothesis_profiles(
+                    structured_context_bundle,
+                    active_hypothesis_refs,
+                )
+            else:
+                candidate_hypothesis_profiles = startup_hypothesis_profiles
+
+            actions = recommendation["actions"]
+            if not actions:
+                if (
+                    fixed_budget_state.enabled
+                    and not analysis_unavailable
+                    and fixed_budget_state.record_no_action_reprompt(no_action_reprompts_this_stall)
+                ):
+                    no_action_reprompts_this_stall += 1
+                    no_action_reason = summary
+                    sink.print(
+                        "\n[yellow]Agent recommended no actionable tuning; re-prompting within "
+                        "fixed budget[/yellow]"
+                    )
+                    prompt_text = _build_fixed_budget_no_action_reprompt(
+                        prompt,
+                        no_action_reason,
+                        no_action_reprompts_this_stall,
+                    )
+                    continue
+
+                _emit_tune_event(
+                    event_emitter,
+                    "phase.finished",
+                    {
+                        "mode": "spawn",
+                        "phase": "spawn.iteration",
+                        "iteration": iteration,
+                        "status": (
+                            "unfillable_no_action"
+                            if fixed_budget_state.enabled and not analysis_unavailable
+                            else "no_actions"
+                        ),
+                        **(
+                            {"fixed_budget": fixed_budget_state.to_payload()}
+                            if fixed_budget_state.enabled
+                            else {}
+                        ),
+                    },
+                )
+                sink.print("\n[yellow]Agent recommended no actionable tuning[/yellow]")
+                if fixed_budget_state.enabled and not analysis_unavailable:
+                    sink.print(
+                        "  [yellow]Stopped: no valid action after "
+                        f"{fixed_budget_state.no_action_reprompts_used} re-prompts[/yellow]"
+                    )
+                    fixed_budget_stop_reason = "unfillable_no_action"
+                stop_due_to_no_action = True
+                break
+
+            _capture_action_controls(actions)
+
+            candidate_attempt_limit = _candidate_trials_remaining()
+            if fixed_budget_state.enabled:
+                candidate_attempt_limit = min(
+                    candidate_attempt_limit,
+                    cast(int, fixed_budget_state.remaining),
+                )
+
+            candidate_attempts = _materialize_spawn_candidate_attempts(
+                current_command_parts,
+                actions,
+                max_attempts=candidate_attempt_limit,
+                base_env_overrides=current_env_overrides,
+                excluded_config_names=excluded_config_list,
             )
-            sink.print("\n[yellow]Agent recommendation was not actionable[/yellow]")
-            sink.print(f"  Reason: {recommendation['error']}")
-            break
 
-        if recommendation["skipped_actions"]:
-            sink.print("  Skipped invalid actions:")
-            for item in recommendation["skipped_actions"]:
-                sink.print(f"    - {item}")
+            if candidate_attempts:
+                break
 
-        summary = recommendation["summary"] or "No actionable tuning recommendation returned."
-        next_action_display = _recommendation_next_action_display(recommendation["actions"])
-        recommendation_payload: dict[str, Any] = {
-            "mode": "spawn",
-            "iteration": iteration,
-            "wall_time_s": analysis_wall_time_s,
-            "summary": summary,
-            "manual_citation": recommendation["manual_citation"],
-            "evidence": recommendation["evidence"][:5],
-            "action_count": len(recommendation["actions"]),
-        }
-        if next_action_display:
-            recommendation_payload["next_action"] = next_action_display
-        _emit_tune_event(
-            event_emitter,
-            "recommendation.ready",
-            recommendation_payload,
-        )
-        sink.print(f"  Decision summary: {summary}")
-        if next_action_display:
-            sink.print(f"  Next action: {next_action_display}")
-        if recommendation["manual_citation"]:
-            sink.print(f"  Manual citation: {recommendation['manual_citation']}")
-        if recommendation["evidence"]:
-            for evidence_item in recommendation["evidence"][:5]:
-                sink.print(f"  Evidence: {evidence_item}")
-        active_hypothesis_refs = recommendation.get("hypothesis_refs", [])
-        if active_hypothesis_refs:
-            sink.print(f"  Next hypothesis focus: {active_hypothesis_refs}")
-
-        if active_hypothesis_refs:
-            candidate_hypothesis_profiles = _extract_hypothesis_profiles(
-                structured_context_bundle,
-                active_hypothesis_refs,
-            )
-        else:
-            candidate_hypothesis_profiles = startup_hypothesis_profiles
-
-        actions = recommendation["actions"]
-        if not actions:
-            _emit_tune_event(
-                event_emitter,
-                "phase.finished",
-                {
-                    "mode": "spawn",
-                    "phase": "spawn.iteration",
-                    "iteration": iteration,
-                    "status": "no_actions",
-                },
-            )
-            sink.print("\n[yellow]Agent recommended no actionable tuning[/yellow]")
-            break
-
-        candidate_plans = _build_spawn_candidates(
-            current_command_parts,
-            actions,
-            max_candidates=max_iterations,
-            base_env_overrides=current_env_overrides,
-            excluded_config_names=excluded_config_list,
-        )
-        candidate_plans = [
-            candidate
-            for candidate in candidate_plans
-            if _command_key(candidate["cmd"], candidate["env_overrides"]) not in seen_trials
-        ]
-        if not candidate_plans:
             _emit_tune_event(
                 event_emitter,
                 "phase.progress",
@@ -4461,6 +5093,46 @@ async def _run_spawn_tune_loop_async(
             sink.print(
                 "\n[yellow]No new executable tuning actions remained after validation[/yellow]"
             )
+
+            if fixed_budget_state.enabled and fixed_budget_state.record_no_action_reprompt(
+                no_action_reprompts_this_stall
+            ):
+                no_action_reprompts_this_stall += 1
+                no_action_reason = "no_new_candidates_after_validation"
+                prompt_text = _build_fixed_budget_no_action_reprompt(
+                    prompt,
+                    no_action_reason,
+                    no_action_reprompts_this_stall,
+                )
+                continue
+
+            if fixed_budget_state.enabled:
+                _emit_tune_event(
+                    event_emitter,
+                    "phase.finished",
+                    {
+                        "mode": "spawn",
+                        "phase": "spawn.iteration",
+                        "iteration": iteration,
+                        "status": "candidate_space_exhausted",
+                        "fixed_budget": fixed_budget_state.to_payload(),
+                    },
+                )
+                sink.print("  [yellow]Stopped: candidate space exhausted before budget[/yellow]")
+                fixed_budget_stop_reason = "candidate_space_exhausted"
+                stop_due_to_no_action = True
+                break
+
+            _emit_tune_event(
+                event_emitter,
+                "phase.finished",
+                {
+                    "mode": "spawn",
+                    "phase": "spawn.iteration",
+                    "iteration": iteration,
+                    "status": "no_new_candidates",
+                },
+            )
             stagnation_iterations += 1
             if stagnation_iterations >= convergence_patience:
                 _emit_tune_event(
@@ -4473,21 +5145,20 @@ async def _run_spawn_tune_loop_async(
                         "status": "converged",
                     },
                 )
+                stop_due_to_no_action = True
                 break
-            _emit_tune_event(
-                event_emitter,
-                "phase.finished",
-                {
-                    "mode": "spawn",
-                    "phase": "spawn.iteration",
-                    "iteration": iteration,
-                    "status": "no_new_candidates",
-                },
-            )
+            continue_after_no_candidates = True
+            break
+
+        if continue_after_no_candidates:
             continue
+        if stop_due_to_no_action:
+            break
 
         sink.print(
-            f"\n[bold cyan]Round {iteration} Step 2: Candidate Search ({len(candidate_plans)} profiled run(s), max {max_iterations})[/bold cyan]"
+            f"\n[bold cyan]Round {iteration} Step 2: Candidate Search "
+            f"({len(candidate_attempts)} candidate attempt(s), max "
+            f"{candidate_attempt_limit})[/bold cyan]"
         )
 
         iteration_best_time = current_time
@@ -4508,14 +5179,81 @@ async def _run_spawn_tune_loop_async(
         successful_trials = 0
         non_improving_trials = 0
 
-        for idx, candidate in enumerate(candidate_plans, start=1):
+        for idx, candidate in enumerate(candidate_attempts, start=1):
             total_candidate_trials_executed += 1
+            if fixed_budget_state.enabled:
+                fixed_budget_state.consume(
+                    "candidate_attempt",
+                    str(candidate["label"]),
+                    str(candidate.get("materialized_reason", "candidate materialized")),
+                )
+
             trial_plan = candidate
             trial_cmd = trial_plan["cmd"]
             trial_env = trial_plan["env_overrides"]
             trial_label = trial_plan["label"]
             skipped_execution_actions = trial_plan["skipped_actions"]
             trial_actions = trial_plan.get("actions", [])
+
+            materialized_status = str(trial_plan.get("materialized_status", "ready"))
+            if materialized_status != "ready":
+                _append_candidate_outcome(
+                    str(trial_label),
+                    materialized_status,
+                    str(trial_plan.get("materialized_reason", "candidate rejected")),
+                )
+                evaluated_payload: dict[str, object] = {
+                    "mode": "spawn",
+                    "iteration": iteration,
+                    "candidate_id": idx,
+                    "label": trial_label,
+                    "verdict": materialized_status,
+                    "cmd_diff": trial_label,
+                    "reason": str(trial_plan.get("materialized_reason", "candidate rejected")),
+                }
+                if fixed_budget_state.enabled:
+                    evaluated_payload["fixed_budget"] = fixed_budget_state.to_payload()
+                _emit_tune_event(
+                    event_emitter,
+                    "candidate.evaluated",
+                    evaluated_payload,
+                )
+                sink.print(f"  Trial {idx}/{len(candidate_attempts)}: {trial_label}")
+                sink.print(
+                    "    [yellow]Materialized candidate rejected before execution: "
+                    f"{trial_plan.get('materialized_reason', 'candidate rejected')}[/yellow]"
+                )
+                continue
+
+            trial_key = _command_key(trial_cmd, trial_env)
+            if trial_key in seen_trials:
+                _append_candidate_outcome(
+                    str(trial_label),
+                    "duplicate",
+                    "candidate duplicated a previously tried command",
+                )
+                evaluated_payload = {
+                    "mode": "spawn",
+                    "iteration": iteration,
+                    "candidate_id": idx,
+                    "label": trial_label,
+                    "verdict": "duplicate",
+                    "cmd_diff": trial_label,
+                    "reason": "candidate duplicated a previously tried command",
+                }
+                if fixed_budget_state.enabled:
+                    evaluated_payload["fixed_budget"] = fixed_budget_state.to_payload()
+                _emit_tune_event(
+                    event_emitter,
+                    "candidate.evaluated",
+                    evaluated_payload,
+                )
+                sink.print(f"  Trial {idx}/{len(candidate_attempts)}: {trial_label}")
+                sink.print(
+                    "    [yellow]Materialized candidate duplicated a previously "
+                    "tried command[/yellow]"
+                )
+                continue
 
             _emit_tune_event(
                 event_emitter,
@@ -4525,14 +5263,14 @@ async def _run_spawn_tune_loop_async(
                     "phase": "spawn.candidate_search",
                     "iteration": iteration,
                     "current_trial": idx,
-                    "total_trials": len(candidate_plans),
+                    "total_trials": len(candidate_attempts),
                     "candidate_label": trial_label,
                 },
             )
 
             while True:
                 seen_trials.add(_command_key(trial_cmd, trial_env))
-                sink.print(f"  Trial {idx}/{len(candidate_plans)}: {trial_label}")
+                sink.print(f"  Trial {idx}/{len(candidate_attempts)}: {trial_label}")
                 sink.print(f"    Running: {' '.join(trial_cmd)}")
                 if trial_env:
                     sink.print(f"    Environment overrides: {trial_env}")
@@ -4561,6 +5299,7 @@ async def _run_spawn_tune_loop_async(
                         "candidate_id": idx,
                         "candidate_label": trial_label,
                         "run_label": trial_label,
+                        "profiling_enabled": profiling_enabled,
                     },
                 )
                 trial_artifacts = await _run_live_profiling_pipeline(
@@ -4572,6 +5311,7 @@ async def _run_spawn_tune_loop_async(
                     env_overrides=trial_env,
                     hypothesis_profiles=candidate_hypothesis_profiles,
                     live_output_callback=_plain_live_output_callback,
+                    skip_profiling=not profiling_enabled,
                 )
                 total_profiled_runs += 1
                 trial_time = trial_artifacts["wall_time"]
@@ -4607,7 +5347,7 @@ async def _run_spawn_tune_loop_async(
                         "phase": "spawn.candidate_search",
                         "iteration": iteration,
                         "current_trial": idx,
-                        "total_trials": len(candidate_plans),
+                        "total_trials": len(candidate_attempts),
                         "candidate_id": idx,
                         "candidate_label": trial_label,
                         "returncode": trial_rc,
@@ -4648,6 +5388,12 @@ async def _run_spawn_tune_loop_async(
                 trial_actions = retry_plan.get("actions", [])
 
             if trial_rc != 0:
+                _append_candidate_outcome(
+                    str(trial_label),
+                    "failed",
+                    f"returncode={trial_rc}",
+                    wall_time_s=float(trial_time),
+                )
                 _emit_tune_event(
                     event_emitter,
                     "candidate.evaluated",
@@ -4665,7 +5411,11 @@ async def _run_spawn_tune_loop_async(
                 sink.print(f"    [yellow]Trial failed (rc={trial_rc})[/yellow]")
                 sink.print(f"    [dim]stderr: {trial_stderr[:240]}[/dim]")
                 non_improving_trials += 1
-                if non_improving_trials >= convergence_patience and successful_trials > 0:
+                if (
+                    not fixed_budget_state.enabled
+                    and non_improving_trials >= convergence_patience
+                    and successful_trials > 0
+                ):
                     sink.print("  Candidate search converged after non-improving trials")
                     break
                 continue
@@ -4683,13 +5433,20 @@ async def _run_spawn_tune_loop_async(
                 trial_metrics = await _extract_metrics_from_output(
                     agent,
                     trial_stdout,
-                    f"candidate run with actions: {trial_label}; primary objective query: {primary_objective}",
+                    "candidate run with actions: "
+                    f"{trial_label}; primary objective query: {primary_objective}",
                 )
                 trial_objective_value = _extract_primary_objective_value(
                     trial_metrics,
                     resolved_primary_objective_metric,
                 )
                 if trial_objective_value is None:
+                    _append_candidate_outcome(
+                        str(trial_label),
+                        "missing_primary_objective",
+                        f"missing numeric primary objective {resolved_primary_objective_metric}",
+                        wall_time_s=float(trial_time),
+                    )
                     _emit_tune_event(
                         event_emitter,
                         "candidate.evaluated",
@@ -4708,10 +5465,15 @@ async def _run_spawn_tune_loop_async(
                     )
                     sink.print(
                         "    [yellow]Trial missing numeric primary objective "
-                        f"'{resolved_primary_objective_metric}' for query '{primary_objective}'; rejected[/yellow]"
+                        f"'{resolved_primary_objective_metric}' for query "
+                        f"'{primary_objective}'; rejected[/yellow]"
                     )
                     non_improving_trials += 1
-                    if non_improving_trials >= convergence_patience and successful_trials > 0:
+                    if (
+                        not fixed_budget_state.enabled
+                        and non_improving_trials >= convergence_patience
+                        and successful_trials > 0
+                    ):
                         sink.print("  Candidate search converged after non-improving trials")
                         break
                     continue
@@ -4739,6 +5501,16 @@ async def _run_spawn_tune_loop_async(
                 )
 
             successful_trials += 1
+            _append_candidate_outcome(
+                str(trial_label),
+                "improved" if trial_is_better_than_iteration_best else "not_improved",
+                (
+                    "candidate outperformed the current configuration"
+                    if trial_is_better_than_iteration_best
+                    else "candidate did not outperform the current configuration"
+                ),
+                wall_time_s=float(trial_time),
+            )
 
             _emit_tune_event(
                 event_emitter,
@@ -4761,7 +5533,8 @@ async def _run_spawn_tune_loop_async(
                 },
             )
             sink.print(
-                f"    {current_change_label}: {current_change_value} ({current_change_pct:+.1f}% vs current)"
+                f"    {current_change_label}: {current_change_value} "
+                f"({current_change_pct:+.1f}% vs current)"
             )
             if primary_objective and resolved_primary_objective_metric:
                 wall_time_change_pct = (
@@ -4802,7 +5575,11 @@ async def _run_spawn_tune_loop_async(
             else:
                 non_improving_trials += 1
 
-            if non_improving_trials >= convergence_patience and successful_trials > 0:
+            if (
+                not fixed_budget_state.enabled
+                and non_improving_trials >= convergence_patience
+                and successful_trials > 0
+            ):
                 sink.print("  Candidate search converged after non-improving trials")
                 break
 
@@ -4818,6 +5595,11 @@ async def _run_spawn_tune_loop_async(
                 },
             )
             sink.print("  [yellow]No candidate completed successfully in this iteration[/yellow]")
+            if fixed_budget_state.enabled:
+                if fixed_budget_state.remaining == 0:
+                    fixed_budget_stop_reason = "fixed_budget_exhausted"
+                    break
+                continue
             stagnation_iterations += 1
             if stagnation_iterations >= convergence_patience:
                 break
@@ -4859,12 +5641,14 @@ async def _run_spawn_tune_loop_async(
             if primary_objective and current_objective_value is not None:
                 sink.print(
                     f"  New current {_objective_display_name(primary_objective)}: "
-                    f"{_format_metric_value(current_objective_value)} ({improvement_pct:+.1f}% vs previous)"
+                    f"{_format_metric_value(current_objective_value)} "
+                    f"({improvement_pct:+.1f}% vs previous)"
                 )
                 sink.print(f"  Current wall time: {current_time:.2f}s")
             else:
                 sink.print(
-                    f"  New current wall time: {current_time:.2f}s ({improvement_pct:+.1f}% vs previous)"
+                    f"  New current wall time: {current_time:.2f}s "
+                    f"({improvement_pct:+.1f}% vs previous)"
                 )
 
             best_candidate_wins = current_time < best_time
@@ -4890,6 +5674,7 @@ async def _run_spawn_tune_loop_async(
                 best_found_trial = iteration_best_trial
                 best_candidate_trials_to_find = iteration_best_candidate_trials_to_find
                 best_profiled_runs_to_find = iteration_best_profiled_runs_to_find
+                best_config_find_wall_time_s = time.time() - tune_started_at
 
             if improvement_pct >= min_improvement_pct:
                 stagnation_iterations = 0
@@ -4908,6 +5693,8 @@ async def _run_spawn_tune_loop_async(
             )
         else:
             sink.print("  No candidate outperformed the current configuration")
+            if fixed_budget_state.enabled and fixed_budget_state.remaining == 0:
+                fixed_budget_stop_reason = "fixed_budget_exhausted"
             stagnation_iterations += 1
             _emit_tune_event(
                 event_emitter,
@@ -4916,7 +5703,16 @@ async def _run_spawn_tune_loop_async(
                     "mode": "spawn",
                     "phase": "spawn.iteration",
                     "iteration": iteration,
-                    "status": "no_improvement",
+                    "status": (
+                        "fixed_budget_exhausted"
+                        if fixed_budget_state.enabled and fixed_budget_state.remaining == 0
+                        else "no_improvement"
+                    ),
+                    **(
+                        {"fixed_budget": fixed_budget_state.to_payload()}
+                        if fixed_budget_state.enabled
+                        else {}
+                    ),
                 },
             )
 
@@ -4927,7 +5723,59 @@ async def _run_spawn_tune_loop_async(
             f"wall={current_time:.2f}s"
         )
 
-        if stagnation_iterations >= convergence_patience:
+        if fixed_goal is not None and _fixed_goal_is_reached():
+            sink.print(
+                "  Stopped: fixed goal reached "
+                f"({_format_metric_value(_current_fixed_goal_value())} "
+                f"target, threshold {_format_metric_value(fixed_goal)})"
+            )
+            fixed_goal_stop_reason = "fixed_goal_reached"
+            break
+
+        if fixed_budget_state.enabled and fixed_budget_state.remaining == 0:
+            sink.print(
+                "  Stopped: fixed budget exhausted after "
+                f"{fixed_budget_state.used}/{fixed_budget_state.total} candidate attempts"
+            )
+            _emit_tune_event(
+                event_emitter,
+                "phase.progress",
+                {
+                    "mode": "spawn",
+                    "phase": "spawn.iteration",
+                    "iteration": iteration,
+                    "status": "fixed_budget_exhausted",
+                    "fixed_budget": fixed_budget_state.to_payload(),
+                },
+            )
+            fixed_budget_stop_reason = "fixed_budget_exhausted"
+            break
+
+        if _candidate_trials_remaining() == 0:
+            if fixed_goal is not None:
+                fixed_goal_stop_reason = "max_iterations_exhausted"
+                sink.print("  Stopped: max candidate trial limit exhausted before fixed goal")
+            else:
+                max_iterations_stop_reason = "max_iterations_exhausted"
+                sink.print(
+                    "  Stopped: max candidate trial limit exhausted after "
+                    f"{total_candidate_trials_executed}/{max_iterations} candidate attempts"
+                )
+            _emit_tune_event(
+                event_emitter,
+                "phase.progress",
+                {
+                    "mode": "spawn",
+                    "phase": "spawn.iteration",
+                    "iteration": iteration,
+                    "status": "max_iterations_exhausted",
+                    "total_candidate_trials_executed": total_candidate_trials_executed,
+                    "max_iterations": max_iterations,
+                },
+            )
+            break
+
+        if not fixed_budget_state.enabled and stagnation_iterations >= convergence_patience:
             sink.print("  Iterative loop converged after non-improving iterations")
             _emit_tune_event(
                 event_emitter,
@@ -4958,13 +5806,32 @@ async def _run_spawn_tune_loop_async(
     sink.print(
         f"  Search to best: {best_found_round} round(s), "
         f"{best_candidate_trials_to_find} candidate trial run(s), "
-        f"{best_profiled_runs_to_find} profiled run(s) including baseline/retries"
+        f"{best_profiled_runs_to_find} {run_count_label} including baseline/retries"
     )
     sink.print(
         f"  Full tuning search: {total_rounds_executed} round(s), "
         f"{total_candidate_trials_executed} candidate trial run(s), "
-        f"{total_profiled_runs} profiled run(s) including baseline/retries"
+        f"{total_profiled_runs} {run_count_label} including baseline/retries"
     )
+    if fixed_goal_stop_reason == "max_iterations_exhausted":
+        sink.print(
+            "  Stopped: max iterations exhausted before fixed goal "
+            f"({_format_metric_value(_current_fixed_goal_value())} target, "
+            f"threshold {_format_metric_value(fixed_goal)})"
+        )
+    elif fixed_goal_stop_reason == "fixed_goal_reached":
+        sink.print(
+            "  Stopped: fixed goal reached "
+            f"({_format_metric_value(_current_fixed_goal_value())} target, "
+            f"threshold {_format_metric_value(fixed_goal)})"
+        )
+    elif max_iterations_stop_reason == "max_iterations_exhausted":
+        sink.print(
+            "  Stopped: max candidate trial limit exhausted after "
+            f"{total_candidate_trials_executed}/{max_iterations} candidate attempts"
+        )
+    sink.print(f"  Total SysPilot wall time: {_elapsed_payload()['total_wall_time_s']:.2f}s")
+    sink.print(f"  Config find wall time: {best_config_find_wall_time_s:.2f}s")
 
     tuned_metrics: dict[str, Any] = dict(best_metrics)
     tuned_objective_value = best_objective_value
@@ -4983,7 +5850,11 @@ async def _run_spawn_tune_loop_async(
     primary_improvement_pct: float | None = None
     primary_speedup_ratio: float | None = None
     primary_speedup_label = ""
-    if primary_objective and baseline_objective_value is not None and tuned_objective_value is not None:
+    if (
+        primary_objective
+        and baseline_objective_value is not None
+        and tuned_objective_value is not None
+    ):
         primary_improvement_pct = _compute_objective_change_pct(
             baseline_objective_value,
             tuned_objective_value,
@@ -4996,7 +5867,9 @@ async def _run_spawn_tune_loop_async(
         )
         primary_speedup_label = _objective_speedup_label(primary_speedup_ratio)
     reported_improvement_pct = (
-        primary_improvement_pct if primary_improvement_pct is not None else wall_time_improvement_pct
+        primary_improvement_pct
+        if primary_improvement_pct is not None
+        else wall_time_improvement_pct
     )
     _emit_tune_event(
         event_emitter,
@@ -5024,16 +5897,37 @@ async def _run_spawn_tune_loop_async(
             "total_rounds_executed": total_rounds_executed,
             "total_candidate_trials_executed": total_candidate_trials_executed,
             "total_profiled_runs": total_profiled_runs,
+            "stop_reason": _final_stop_reason(),
+            "max_iterations_stop_reason": max_iterations_stop_reason,
+            **_elapsed_payload(),
+            **fixed_goal_payload(
+                threshold=fixed_goal,
+                value=_current_fixed_goal_value(),
+                objective_mode=_current_fixed_goal_mode(),
+                stop_reason=fixed_goal_stop_reason,
+            ),
+            **_fixed_budget_event_payload(
+                fixed_budget_state,
+                stop_reason=fixed_budget_stop_reason,
+            ),
         },
     )
 
     wall_time_change = f"{wall_time_improvement_pct:+.1f}%"
     if wall_time_improvement_pct > 0 and speedup > 0:
         wall_time_change = f"{speedup:.2f}x speed up ({wall_time_improvement_pct:+.1f}%)"
+    objective_speedup_display = _format_objective_speedup(
+        primary_speedup_ratio,
+        unavailable="ratio unavailable",
+    )
 
     table_rows: list[list[str]] = []
 
-    if primary_objective and baseline_objective_value is not None and tuned_objective_value is not None:
+    if (
+        primary_objective
+        and baseline_objective_value is not None
+        and tuned_objective_value is not None
+    ):
         table_rows.append(
             [
                 _objective_display_name(primary_objective),
@@ -5103,31 +5997,40 @@ async def _run_spawn_tune_loop_async(
     if reported_improvement_pct > 5:
         if primary_improvement_pct is not None:
             sink.print(
-                f"\n[bold green]✓ Success! {_objective_display_name(primary_objective)} improved to "
-                f"{_format_objective_speedup(primary_speedup_ratio, unavailable='ratio unavailable')} with actions: {action_label}[/bold green]"
+                "\n[bold green]✓ Success! "
+                f"{_objective_display_name(primary_objective)} improved to "
+                f"{objective_speedup_display} "
+                f"with actions: {action_label}[/bold green]"
             )
         else:
             sink.print(
-                f"\n[bold green]✓ Success! {speedup:.2f}x speed up ({reported_improvement_pct:.1f}% improvement) with actions: {action_label}[/bold green]"
+                f"\n[bold green]✓ Success! {speedup:.2f}x speed up "
+                f"({reported_improvement_pct:.1f}% improvement) with actions: "
+                f"{action_label}[/bold green]"
             )
         run_status = "improved"
     elif reported_improvement_pct > 0:
         if primary_improvement_pct is not None:
             sink.print(
-                f"\n[yellow]Modest primary-objective improvement ({_format_objective_speedup(primary_speedup_ratio, unavailable='ratio unavailable')})[/yellow]"
+                "\n[yellow]Modest primary-objective improvement "
+                f"({objective_speedup_display})[/yellow]"
             )
         else:
             sink.print(
-                f"\n[yellow]Modest improvement ({speedup:.2f}x speed up, {reported_improvement_pct:.1f}%)[/yellow]"
+                f"\n[yellow]Modest improvement ({speedup:.2f}x speed up, "
+                f"{reported_improvement_pct:.1f}%)[/yellow]"
             )
         run_status = "modest_improvement"
     else:
         if primary_improvement_pct is not None:
             sink.print(
-                f"\n[red]No improvement or regression ({_format_objective_speedup(primary_speedup_ratio, unavailable='ratio unavailable')})[/red]"
+                "\n[red]No improvement or regression "
+                f"({objective_speedup_display})[/red]"
             )
         else:
-            sink.print(f"\n[red]No improvement or regression ({reported_improvement_pct:.1f}%)[/red]")
+            sink.print(
+                f"\n[red]No improvement or regression ({reported_improvement_pct:.1f}%)[/red]"
+            )
         run_status = "no_improvement"
 
     _emit_tune_event(
@@ -5152,6 +6055,19 @@ async def _run_spawn_tune_loop_async(
             "total_rounds_executed": total_rounds_executed,
             "total_candidate_trials_executed": total_candidate_trials_executed,
             "total_profiled_runs": total_profiled_runs,
+            "stop_reason": _final_stop_reason(),
+            "max_iterations_stop_reason": max_iterations_stop_reason,
+            **_elapsed_payload(),
+            **fixed_goal_payload(
+                threshold=fixed_goal,
+                value=_current_fixed_goal_value(),
+                objective_mode=_current_fixed_goal_mode(),
+                stop_reason=fixed_goal_stop_reason,
+            ),
+            **_fixed_budget_event_payload(
+                fixed_budget_state,
+                stop_reason=fixed_budget_stop_reason,
+            ),
         },
     )
 
@@ -5161,12 +6077,15 @@ def _run_spawn_tune_loop(
     command: str,
     contracts: Sequence[str],
     manual_hints: Sequence[str],
+    fixed_budget: int | None,
+    fixed_goal: float | None,
     max_iterations: int,
     timeout: int,
     primary_objective: str | None = None,
     primary_objective_mode: str | None = None,
     workdir: Path | None = None,
     memory_high: str | None = None,
+    profiling_enabled: bool = True,
     sink: OutputSink | None = None,
     event_emitter: _TuneEmitter | None = None,
     structured_context_bundle: dict[str, object] | None = None,
@@ -5180,12 +6099,15 @@ def _run_spawn_tune_loop(
             command=command,
             contracts=contracts,
             manual_hints=manual_hints,
+            fixed_budget=fixed_budget,
+            fixed_goal=fixed_goal,
             max_iterations=max_iterations,
             timeout=timeout,
             primary_objective=primary_objective,
             primary_objective_mode=primary_objective_mode,
             workdir=workdir_str,
             memory_high=memory_high,
+            profiling_enabled=profiling_enabled,
             sink=sink,
             event_emitter=event_emitter,
             structured_context_bundle=structured_context_bundle,
@@ -5201,6 +6123,8 @@ def _run_quick_tune_loop(
     command: str,
     contracts: Sequence[str],
     manual_hints: Sequence[str],
+    fixed_budget: int | None,
+    fixed_goal: float | None,
     max_iterations: int,
     timeout: int,
     primary_objective: str | None,
@@ -5221,6 +6145,8 @@ def _run_quick_tune_loop(
         command=command,
         contracts=contracts,
         manual_hints=manual_hints,
+        fixed_budget=fixed_budget,
+        fixed_goal=fixed_goal,
         max_iterations=max_iterations,
         timeout=timeout,
         primary_objective=primary_objective,

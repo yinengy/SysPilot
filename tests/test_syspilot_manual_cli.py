@@ -5,39 +5,39 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, ClassVar, cast
 from unittest.mock import patch
 
 from click.testing import CliRunner
 
 from syspilot.cli import (
-    cli,
-    _load_default_llm_config,
     _build_spawn_profiling_env,
     _collect_contract_report_env,
     _compute_objective_speedup_ratio,
-    _extract_literal_numeric_metrics,
     _extract_hypothesis_profiles,
+    _extract_literal_numeric_metrics,
     _format_objective_speedup,
-    _recommendation_next_action_display,
+    _load_default_llm_config,
     _parse_spawn_actions,
+    _recommendation_next_action_display,
     _run_live_profiling_pipeline,
     _summarize_spawn_runtime_output,
+    cli,
 )
-from syspilot.core.config import SysPilotConfig
 from syspilot.core.agent import SysPilotAgent
+from syspilot.core.config import SysPilotConfig
 from syspilot.core.llm import LLMTimeoutError
 from syspilot_contract.compose_contracts import compose_contracts
-from syspilot_contract.integration import build_agent_context_bundle
-from syspilot_contract.integration import write_contract_bundle
+from syspilot_contract.integration import build_agent_context_bundle, write_contract_bundle
 from syspilot_contract.schemas import LibraryContract as LibraryContractDSL
 from syspilot_manual.integration import write_manual_bundle
 from syspilot_manual.schemas import LibraryManual
 from toolbox.shared.cgroup_v2 import (
     flatten_cgroup_memory_evidence as _flatten_cgroup_memory_evidence,
+)
+from toolbox.shared.cgroup_v2 import (
     normalize_cgroup_memory_evidence as _normalize_cgroup_memory_evidence,
 )
-
 
 FIXTURE_ROOT = Path(__file__).resolve().parents[1] / "examples" / "manual_mvp"
 
@@ -281,7 +281,7 @@ class _DummyResponse:
 
 
 class _DummyAgent:
-    instances: list["_DummyAgent"] = []
+    instances: list[_DummyAgent] = []
 
     def __init__(self, config: object) -> None:
         self.config = config
@@ -320,11 +320,42 @@ class _ActionThenNoneSpawnAgent(_DummyAgent):
         self._calls += 1
         if self._calls == 1:
             return _DummyResponse(
-                '{"summary":"try candidate","manual_citation":"rule","evidence":["baseline timed out"],'
+                '{"summary":"try candidate","manual_citation":"rule",'
+                '"evidence":["baseline timed out"],'
                 '"actions":[{"config_type":"env_var","parameter":"OMP_PROC_BIND","new_value":"close",'
                 '"reason":"improve locality","manual_citation":"rule"}]}'
             )
         return _DummyResponse('{"summary":"none","manual_citation":"","evidence":[],"actions":[]}')
+
+
+class _FixedBudgetRepromptThenActionSpawnAgent(_DummyAgent):
+    def __init__(self, config: object) -> None:
+        super().__init__(config)
+        self._calls = 0
+
+    async def step(self, prompt: str) -> _DummyResponse:
+        self.prompts.append(prompt)
+        self._calls += 1
+        if self._calls == 1:
+            return _DummyResponse(
+                '{"summary":"STOP:need_concrete_candidate","manual_citation":"","evidence":'
+                '["need a concrete safe env-only change"],"actions":[]}'
+            )
+        return _DummyResponse(
+            '{"summary":"apply wait policy","manual_citation":"rule","evidence":'
+            '["runtime output shows idle waits"],"actions":[{"config_type":"env_var",'
+            '"parameter":"OMP_WAIT_POLICY","new_value":"ACTIVE","reason":"reduce idle waits",'
+            '"manual_citation":"rule"}]}'
+        )
+
+
+class _FixedBudgetAlwaysNoActionSpawnAgent(_DummyAgent):
+    async def step(self, prompt: str) -> _DummyResponse:
+        self.prompts.append(prompt)
+        return _DummyResponse(
+            '{"summary":"STOP:no_safe_candidate","manual_citation":"","evidence":'
+            '["all safe candidates already exhausted"],"actions":[]}'
+        )
 
 
 async def _raise_llm_timeout(self: object, prompt: str | None = None) -> _DummyResponse:
@@ -515,6 +546,39 @@ class _FakeComposeManualLLMClient:
             return json.dumps({"valid": True, "issues": [], "repaired_manual": manual})
 
         raise AssertionError(prompt_name)
+
+
+class _CaptureEmitter:
+    instances: ClassVar[list[_CaptureEmitter]] = []
+
+    def __init__(
+        self,
+        *,
+        run_id: str | None = None,
+        capacity: int = 256,
+        critical_reserve: int = 16,
+    ) -> None:
+        _ = capacity
+        _ = critical_reserve
+        self.run_id = run_id or "capture-run"
+        self.records: list[dict[str, object]] = []
+        _CaptureEmitter.instances.append(self)
+
+    def publish(
+        self,
+        event_name: str,
+        payload: dict[str, object] | None = None,
+        *,
+        event_type: str | None = None,
+    ) -> bool:
+        self.records.append(
+            {
+                "event": event_name,
+                "payload": payload or {},
+                "event_type": event_type or "event",
+            }
+        )
+        return True
 
 
 def test_ingest_command_writes_chunk_manifest(tmp_path: Path) -> None:
@@ -1152,6 +1216,58 @@ def test_parse_spawn_actions_preserves_hypothesis_refs() -> None:
     assert parsed["hypothesis_refs"] == ["h_shared_cpu_compute_conflict_openblas_openmp_compute"]
 
 
+def test_parse_spawn_actions_allows_evidence_without_manual_citation() -> None:
+    parsed = _parse_spawn_actions(
+        json.dumps(
+            {
+                "summary": "runtime evidence supports env trial",
+                "manual_citation": "",
+                "evidence": ["score is DALI-limited and Torch has headroom"],
+                "actions": [
+                    {
+                        "config_type": "command_prefix",
+                        "new_value": [
+                            "env",
+                            "BENCHMARK_DALI_MPS_SHARE=70",
+                            "BENCHMARK_TORCH_MPS_SHARE=30",
+                        ],
+                        "reason": "rebalance reversible env-only GPU share",
+                        "manual_citation": "",
+                    }
+                ],
+            }
+        )
+    )
+
+    assert parsed["valid"] is True
+    assert parsed["manual_citation"] == ""
+    assert parsed["actions"]
+
+
+def test_parse_spawn_actions_still_rejects_actions_without_evidence() -> None:
+    parsed = _parse_spawn_actions(
+        json.dumps(
+            {
+                "summary": "unsupported guess",
+                "manual_citation": "",
+                "evidence": [],
+                "actions": [
+                    {
+                        "config_type": "env_var",
+                        "parameter": "OMP_PROC_BIND",
+                        "new_value": "close",
+                        "reason": "guess",
+                    }
+                ],
+            }
+        )
+    )
+
+    assert parsed["valid"] is False
+    assert parsed["error"] == "Actionable recommendations require non-empty evidence"
+    assert parsed["actions"] == []
+
+
 def test_summarize_spawn_runtime_output_extracts_openmp_signals() -> None:
     summary = _summarize_spawn_runtime_output(
         """
@@ -1376,7 +1492,8 @@ def test_spawn_mode_primary_objective_resolves_typo_query_to_metric() -> None:
     assert "Resolved primary objective metric: elapsed_sec (minimize)" in result.output
 
 
-def test_spawn_mode_primary_objective_requires_explicit_mode_when_resolved_metric_is_unknown() -> None:
+def test_spawn_mode_primary_objective_requires_explicit_mode_when_resolved_metric_is_unknown(
+) -> None:
     runner = CliRunner()
 
     async def _profiled_runs(*args: object, **kwargs: object) -> dict[str, object]:
@@ -1421,7 +1538,10 @@ def test_spawn_mode_primary_objective_requires_explicit_mode_when_resolved_metri
         )
 
     assert result.exit_code == 1
-    assert "Could not infer --primary-objective-mode after resolving 'custom metric'" in result.output
+    assert (
+        "Could not infer --primary-objective-mode after resolving 'custom metric'"
+        in result.output
+    )
     assert "custom_metric" in result.output
 
 
@@ -1558,7 +1678,10 @@ def test_spawn_mode_primary_objective_rejects_candidate_missing_metric() -> None
     assert result.exit_code == 0
     assert "Trial missing numeric primary objective" in result.output
     assert "wall time" in result.output
-    assert "No tuned candidate outperformed baseline; keeping baseline configuration" in result.output
+    assert (
+        "No tuned candidate outperformed baseline; keeping baseline configuration"
+        in result.output
+    )
 
 
 def test_spawn_mode_primary_objective_fails_when_baseline_metric_missing() -> None:
@@ -1711,6 +1834,205 @@ def test_spawn_mode_runs_candidate_search_after_timed_out_baseline() -> None:
     assert "Baseline run timed out; continuing with timeout as baseline" in result.output
     assert "Trial 1/1" in result.output
     assert "Accepted candidate" in result.output
+
+
+def test_fixed_budget_no_action_reprompts_until_candidate_materializes() -> None:
+    _CaptureEmitter.instances.clear()
+    _DummyAgent.instances.clear()
+    runner = CliRunner()
+    profile_calls: list[dict[str, object]] = []
+
+    async def _profiled_runs(*args: object, **kwargs: object) -> dict[str, object]:
+        _ = args
+        profile_calls.append(kwargs)
+        if len(profile_calls) == 1:
+            return {
+                "pid": 9999,
+                "wall_time": 1.0,
+                "stdout": "baseline",
+                "stderr": "",
+                "returncode": 0,
+                "profiling_text": "baseline profile",
+                "profiling_json": {},
+                "tool_calls_used": 0,
+            }
+        return {
+            "pid": 10001,
+            "wall_time": 0.8,
+            "stdout": "candidate",
+            "stderr": "",
+            "returncode": 0,
+            "profiling_text": "candidate profile",
+            "profiling_json": {},
+            "tool_calls_used": 0,
+        }
+
+    with (
+        patch("syspilot.cli.TuneEventEmitter", _CaptureEmitter),
+        patch("syspilot.cli.SysPilotAgent", _FixedBudgetRepromptThenActionSpawnAgent),
+        patch("syspilot.cli._register_default_skills", _noop),
+        patch("syspilot.cli._register_profiling_tools", _noop),
+        patch("syspilot.cli._register_tuning_tools", _noop),
+        patch("syspilot.cli._run_live_profiling_pipeline", _profiled_runs),
+        patch("syspilot.cli._run_command", _fake_run_command),
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "tune",
+                "--ui-mode",
+                "plain",
+                "--command",
+                "env OMP_PROC_BIND=close echo hi",
+                "--exclude-config",
+                "OMP_NUM_THREADS",
+                "--fixed-budget",
+                "1",
+                "--max-iterations",
+                "5",
+                "--timeout",
+                "1",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert len(profile_calls) == 2
+    assert _DummyAgent.instances
+    prompts = _DummyAgent.instances[-1].prompts
+    assert len(prompts) == 2
+    assert "re-prompting within fixed budget" in result.output
+    assert "## Fixed-Budget Re-prompt" in prompts[1]
+    assert "Remaining candidate-attempt budget: 1" in prompts[1]
+    assert "No-action reason: STOP:need_concrete_candidate" in prompts[1]
+    assert 'Protected/excluded controls: ["OMP_NUM_THREADS"]' in prompts[1]
+    assert 'Untouched current controls (where known): ["OMP_PROC_BIND"]' in prompts[1]
+    assert "Successful configs:" in prompts[1]
+    assert "Evaluated/rejected candidates:" in prompts[1]
+    comparison_payload = cast(
+        dict[str, Any],
+        next(
+            record["payload"]
+            for record in _CaptureEmitter.instances[-1].records
+            if record["event"] == "result.comparison"
+        ),
+    )
+    budget_payload = cast(dict[str, Any], comparison_payload["fixed_budget"])
+    assert comparison_payload["stop_reason"] == "fixed_budget_exhausted"
+    assert budget_payload["used"] == 1
+    assert budget_payload["remaining"] == 0
+    assert budget_payload["no_action_reprompts_used"] == 1
+
+
+def test_fixed_budget_unfillable_no_action_stops_without_spending_trials() -> None:
+    _CaptureEmitter.instances.clear()
+    _DummyAgent.instances.clear()
+    runner = CliRunner()
+
+    with (
+        patch("syspilot.cli.TuneEventEmitter", _CaptureEmitter),
+        patch("syspilot.cli.SysPilotAgent", _FixedBudgetAlwaysNoActionSpawnAgent),
+        patch("syspilot.cli._register_default_skills", _noop),
+        patch("syspilot.cli._register_profiling_tools", _noop),
+        patch("syspilot.cli._register_tuning_tools", _noop),
+        patch("syspilot.cli._run_live_profiling_pipeline", _fake_live_profile),
+        patch("syspilot.cli._run_command", _fake_run_command),
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "tune",
+                "--ui-mode",
+                "plain",
+                "--command",
+                "echo hi",
+                "--fixed-budget",
+                "2",
+                "--max-iterations",
+                "5",
+                "--timeout",
+                "1",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert _DummyAgent.instances
+    prompts = _DummyAgent.instances[-1].prompts
+    assert len(prompts) == 3
+    run_payload = cast(
+        dict[str, Any],
+        next(
+            record["payload"]
+            for record in _CaptureEmitter.instances[-1].records
+            if record["event"] == "run.finished"
+        ),
+    )
+    budget_payload = cast(dict[str, Any], run_payload["fixed_budget"])
+    assert run_payload["stop_reason"] == "unfillable_no_action"
+    assert run_payload["total_candidate_trials_executed"] == 0
+    assert budget_payload["used"] == 0
+    assert budget_payload["remaining"] == 2
+    assert budget_payload["no_action_reprompts_used"] == 2
+
+
+def test_fixed_budget_baseline_failure_reports_hard_failure_stop_reason() -> None:
+    _CaptureEmitter.instances.clear()
+    runner = CliRunner()
+
+    async def _failing_baseline(*args: object, **kwargs: object) -> dict[str, object]:
+        _ = args
+        _ = kwargs
+        return {
+            "pid": 9999,
+            "wall_time": 0.01,
+            "stdout": "",
+            "stderr": "boom",
+            "returncode": 3,
+            "timed_out": False,
+            "profiling_text": "baseline failed",
+            "profiling_json": {},
+            "tool_calls_used": 0,
+        }
+
+    with (
+        patch("syspilot.cli.TuneEventEmitter", _CaptureEmitter),
+        patch("syspilot.cli.SysPilotAgent", _DummyAgent),
+        patch("syspilot.cli._register_default_skills", _noop),
+        patch("syspilot.cli._register_profiling_tools", _noop),
+        patch("syspilot.cli._register_tuning_tools", _noop),
+        patch("syspilot.cli._run_live_profiling_pipeline", _failing_baseline),
+        patch("syspilot.cli._run_command", _fake_run_command),
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "tune",
+                "--ui-mode",
+                "plain",
+                "--command",
+                "echo hi",
+                "--fixed-budget",
+                "2",
+                "--max-iterations",
+                "5",
+                "--timeout",
+                "1",
+            ],
+        )
+
+    assert result.exit_code == 0
+    run_payload = cast(
+        dict[str, Any],
+        next(
+            record["payload"]
+            for record in _CaptureEmitter.instances[-1].records
+            if record["event"] == "run.finished"
+        ),
+    )
+    assert run_payload["status"] == "failed"
+    assert run_payload["fixed_budget_stop_reason"] == "hard_failure"
+    budget_payload = cast(dict[str, Any], run_payload["fixed_budget"])
+    assert budget_payload["used"] == 0
+    assert budget_payload["remaining"] == 2
 
 
 def test_spawn_mode_streams_candidate_child_output_in_plain_mode() -> None:
@@ -1939,7 +2261,10 @@ def test_live_profiling_pipeline_captures_cgroup_memory_evidence() -> None:
                 return_value={"target_pids": [1234], "primary_pid": 1234, "workers": []},
             ),
             patch("syspilot.cli.start_toolbox_probe_sessions", _fake_start_toolbox_probe_sessions),
-            patch("syspilot.cli.finish_toolbox_probe_sessions", _fake_finish_toolbox_probe_sessions),
+            patch(
+                "syspilot.cli.finish_toolbox_probe_sessions",
+                _fake_finish_toolbox_probe_sessions,
+            ),
         ):
             result = await _run_live_profiling_pipeline(
                 cast(SysPilotAgent, cast(object, agent)),

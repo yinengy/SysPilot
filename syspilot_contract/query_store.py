@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Mapping, cast
+from typing import Any, cast
 
 from syspilot.toolbox_runtime import resolve_toolbox_probe
 from syspilot_contract.checker import load_contract
 from syspilot_contract.compose_contracts import compose_contracts as compose_contract_models
 from syspilot_contract.schemas import (
+    RESOURCE_TO_HYPOTHESIS_KIND,
     Assumption,
     Component,
     ComposedContract,
@@ -17,9 +19,7 @@ from syspilot_contract.schemas import (
     Recipe,
     ResourceUse,
     Signal,
-    RESOURCE_TO_HYPOTHESIS_KIND,
 )
-
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +112,7 @@ class ContractStore:
 
     @staticmethod
     def _normalize_contract_key(value: str) -> str:
-        return value.strip().lower()
+        return re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
 
     def _register_alias(self, alias: str, bundle_id: str) -> None:
         normalized = self._normalize_contract_key(alias)
