@@ -4,14 +4,14 @@ AI Agent for System Monitoring and Application Performance Tuning
 
 ## Overview
 
-SysPilot is an intelligent agent that monitors system resources, profiles applications, and dynamically tunes configurations for optimal performance. It uses LLMs to generate custom profiling scripts and make data-driven tuning decisions.
+SysPilot is an intelligent agent that launches Linux workloads, collects structured runtime evidence, and tunes runtime/configuration controls for better performance. The harness gathers evidence with built-in collectors and LPCL contract-declared virtual probes, while the LLM reads that supplied context and recommends the next candidate actions as JSON.
 
 ### Key Features
 
 - **Iterative Tuning Engine**: Profile → Tune → Verify → Iterate loop for finding optimal configurations
-- **Dynamic Script Generation**: Agent writes custom scripts to gather specific profiling data
-- **eBPF Proficiency**: Low-overhead system profiling using eBPF/bpftrace
-- **Context Minimization**: Processes large profiling outputs into essential insights (using LLM parsing)
+- **Structured Evidence Collection**: Built-in CPU, memory, process, NUMA, stdout/stderr, and process-tree evidence feeds tune decisions
+- **LPCL Virtual Probes**: Contract-declared `virtual_probe` signals map to toolbox scripts under `toolbox/probes/...`
+- **Focused LLM Prompting**: Gives the LLM compact runtime evidence, contract findings, manual context, prior attempts, immutable controls, and an explicit JSON action schema
 - **Application Tuning**: Detects misconfigurations (NUMA, CPU affinity, etc.) and recommends optimizations
 - **Multi-LLM Support**: Works with OpenAI API keys, OpenAI account OAuth, and Anthropic models
 
@@ -21,9 +21,9 @@ SysPilot is an intelligent agent that monitors system resources, profiles applic
 syspilot/
 ├── core/           # Agent framework, LLM interface, configuration
 ├── profiling/      # System collectors (CPU, memory, process, NUMA)
-├── skills/         # Dynamic script execution, eBPF templates
+├── skills/         # Bounded helper execution and optional standalone skills
 │   ├── builtin/    # Strace analyzer, perf analyzer, data processor
-│   └── ebpf/       # eBPF skill and templates
+│   └── ebpf/       # Standalone eBPF skill and templates (not loaded by tune)
 ├── tuning/         # Config detection, tuning engine, and application tuner
 ├── utils/          # Logging, process utilities
 └── cli.py          # Command-line interface
@@ -35,9 +35,6 @@ syspilot/
 # Basic installation
 pip install -e .
 
-# With eBPF support
-pip install -e ".[ebpf]"
-
 # Development
 pip install -e ".[dev]"
 ```
@@ -45,35 +42,7 @@ pip install -e ".[dev]"
 ### System Requirements
 
 - Python 3.10+
-- Linux (for full eBPF support)
-- Optional: bpftrace, bcc-tools for eBPF profiling
-
-```bash
-# Ubuntu/Debian
-sudo apt install bpftrace bpfcc-tools linux-headers-$(uname -r)
-
-# Fedora
-sudo dnf install bpftrace bcc
-```
-
-### eBPF Permissions (Linux)
-
-If eBPF profiling fails with `Operation not permitted`, run SysPilot with elevated privileges:
-
-```bash
-sudo -E python3 -m syspilot.cli tune --command "..." --contract numactl
-```
-
-Runtime behavior notes:
-- SysPilot tries direct `bpftrace` first, then `sudo -n bpftrace` if needed.
-- If privileges are still insufficient, SysPilot records explicit eBPF errors and continues with non-eBPF profiling evidence.
-
-For stricter hosts, check kernel controls:
-
-```bash
-cat /proc/sys/kernel/unprivileged_bpf_disabled
-cat /proc/sys/kernel/perf_event_paranoid
-```
+- Linux
 
 ## Quick Start
 
@@ -163,10 +132,10 @@ syspilot tune \
 - `--quick-mode` switches to a fast-screening workflow: one full baseline run with periodic contract-signal sampling, offline abnormal-window detection, short candidate screens that stop at the matched baseline window budget, then capped full validation of the best short screens
 - Uses process-tree-aware profiling (manager + heavy child workers) to avoid parent-only blind spots
 - By default, stops by convergence (non-improving iteration patience) or `--max-iterations`; `--max-iterations` defaults to 20 materialized candidate trial attempts and does not count the baseline run.
-- `--fixed-budget N` adds an authoritative cap on candidate attempts. It limits search cost, not outcome quality, and does not guarantee the best possible configuration.
-- `--fixed-goal VALUE` keeps tuning until the selected optimization target reaches the requested value, or until the `--max-iterations` candidate-trial cap is exhausted. Maximize objectives stop at `>= VALUE`; minimize objectives such as wall time stop at `<= VALUE`.
+- `--fixed-budget N` adds an authoritative cap on candidate attempts. It limits search cost, not outcome quality, and does not guarantee the best possible configuration. When fixed budget is set, `--max-iterations` and its default are ignored.
+- `--fixed-goal VALUE` keeps tuning until the selected optimization target reaches the requested value, or until the active candidate-trial cap is exhausted. Maximize objectives stop at `>= VALUE`; minimize objectives such as wall time stop at `<= VALUE`.
 - Baseline profiling does not consume fixed budget. Concrete candidate attempts do, including duplicate, invalid, failed, or timed-out attempts once they are materialized.
-- In fixed-budget mode, SysPilot keeps searching past normal convergence or no-action stops while budget remains. `--max-iterations` uses the same materialized candidate-attempt counting method as fixed budget, so the effective trial cap is the smaller remaining value when both are set.
+- In fixed-budget mode, SysPilot keeps searching past normal convergence or no-action stops while budget remains. `--fixed-budget` is the active candidate-attempt cap even when `--max-iterations` is also provided.
 - No-action or malformed recommendation replies do not spend trial budget. They use a bounded re-prompt allowance that asks for finer-grained or untouched options, and SysPilot stops with an explicit no-valid-action reason if that allowance is exhausted.
 - Compares baseline vs best-found configuration side-by-side
 - Final summaries identify the round and per-round trial that found the reported best configuration, plus cumulative candidate trial runs and full-process round/trial/profiled-run totals
@@ -212,7 +181,7 @@ Quick mode currently:
 - requires profiling/sampling; `--no-profile` is intentionally rejected with `--quick-mode`
 - runs one full sampled baseline, ranks abnormal windows across useful contract signals offline, and checks them under internal short/full run budgets
 - `--fixed-budget N`, when set, caps total candidate attempts across quick-mode short screens and promoted full validations. It is a search-cost cap, not a promise that quick mode found the best available configuration.
-- `--fixed-goal VALUE`, when set, stops quick mode once the best validated target reaches the goal, or reports the current best when the `--max-iterations` candidate-trial cap is exhausted first.
+- `--fixed-goal VALUE`, when set, stops quick mode once the best validated target reaches the goal, or reports the current best when the active candidate-trial cap is exhausted first.
 - Quick mode keeps its own internal `--quick-max-total-short-runs` and `--quick-max-total-full-runs` caps. Those shape short-screen and promoted-full-validation counts, while `--fixed-budget` is a separate top-level cap on total candidate attempts.
 - screens candidates only until the exact ranked baseline window end offset for the currently ranked window, so short runs compare the same relative sampled slice
 - ranks short runs only on target-signal directional improvement in that matched window
@@ -280,12 +249,15 @@ Use OpenAI API mode:
   "base_url": "https://your-endpoint/v1",
   "api_key": "sk-...",
   "model": "gpt-5.4",
+  "metric_extraction_model": "gpt-5.3-codex",
   "temperature": 0.1,
   "max_tokens": 272000,
   "timeout_seconds": 120,
   "max_retries": 1
 }
 ```
+
+`model` is used for tuning analysis and candidate recommendations. `metric_extraction_model` is optional and only changes the model used for primary-objective metric extraction from workload stdout/stderr; it reuses the same provider, `base_url`, credentials, timeout, retry, and debug settings.
 
 To switch to ChatGPT OAuth mode, edit the same file:
 
@@ -309,7 +281,7 @@ monitoring:
   interval_seconds: 5.0
   cpu_threshold_percent: 80.0
   memory_threshold_percent: 85.0
-  enable_ebpf: true
+  enable_ebpf: false
 
 tuning:
   auto_tune: false
@@ -354,7 +326,9 @@ async def main():
 asyncio.run(main())
 ```
 
-### Using eBPF Skills
+### Standalone eBPF Skills
+
+The eBPF skill code remains available for direct programmatic use and tests, but it is not loaded by the default `syspilot tune` path. Current tune evidence relies on built-in collectors plus toolbox-backed LPCL `virtual_probe` signals.
 
 ```python
 from syspilot.skills.ebpf import EBPFSkill, EBPFTemplates
@@ -373,16 +347,16 @@ result = await skill.execute(
 )
 ```
 
-### Dynamic Script Generation
+### Structured Evidence Helpers
 
-The agent can generate custom scripts to process profiling data:
+SysPilot's primary profiling path is structured collection plus LPCL virtual probes. Bounded helper scripts still exist for deterministic parsing or postprocessing tasks, but LLM-authored custom profiling scripts are not the primary tuning mechanism:
 
 ```python
 from syspilot.skills.builtin import DynamicScriptSkill
 
 skill = DynamicScriptSkill()
 
-# Agent-generated script to process strace output
+# Bounded helper script to process a known artifact format
 script = '''
 import re
 from collections import Counter
@@ -395,7 +369,7 @@ result = await skill.execute(
 )
 ```
 
-## Available eBPF Templates
+## Standalone eBPF Templates
 
 | Template | Description |
 |----------|-------------|
@@ -414,11 +388,11 @@ result = await skill.execute(
 
 1. **Monitoring**: Agent continuously monitors system resources
 2. **Detection**: Identifies when target application underutilizes resources
-3. **Profiling**: Generates and executes profiling scripts (including eBPF)
-4. **Summarization**: Processes large outputs into minimal context
-5. **Analysis**: LLM analyzes summarized data for bottlenecks
-6. **Tuning**: Recommends or applies configuration changes
-7. **Verification**: Tuning Engine runs iterative loops to verify improvements
+3. **Profiling**: Collects built-in runtime evidence and LPCL toolbox-backed virtual-probe signals
+4. **Validation**: Turns contract hypotheses and collected evidence into structured findings
+5. **Analysis**: LLM analyzes compact evidence, loaded contracts/manuals, objective metrics, and prior attempts to recommend JSON candidate actions
+6. **Tuning**: Harness materializes and validates recommended runtime/configuration changes
+7. **Verification**: Tuning Engine executes candidate loops and compares measured outcomes
 
 ## Development
 

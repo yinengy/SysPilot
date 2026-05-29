@@ -25,7 +25,7 @@ from rich.table import Table
 from syspilot import __version__
 from syspilot.core.agent import SysPilotAgent
 from syspilot.core.config import LLMConfig, SysPilotConfig
-from syspilot.core.llm import LLMError
+from syspilot.core.llm import LLMError, LLMInterface, Message
 from syspilot.core.openai_auth import (
     build_authorization_url,
     create_pkce_verifier_and_challenge,
@@ -39,7 +39,12 @@ from syspilot.core.openai_auth import (
 from syspilot.fixed_budget import FixedBudgetState
 from syspilot.fixed_goal import fixed_goal_payload, fixed_goal_reached
 from syspilot.profiling import ProfilingManager
-from syspilot.prompt_budget import contract_context_json_for_prompt, profiling_json_for_prompt
+from syspilot.prompt_budget import (
+    CONTRACT_YAML_CONTEXT_KEY,
+    contract_context_json_for_prompt,
+    profiling_json_for_prompt,
+    truncate_prompt_text,
+)
 from syspilot.quick_mode import QuickModeDefaults
 from syspilot.skills import SkillRegistry
 from syspilot.skills.builtin import (
@@ -48,7 +53,6 @@ from syspilot.skills.builtin import (
     PerfAnalyzerSkill,
     StraceAnalyzerSkill,
 )
-from syspilot.skills.ebpf import EBPFSkill
 from syspilot.spawn_runtime import execute_profiled_spawn_run, execute_unprofiled_spawn_run
 from syspilot.toolbox_runtime import (
     finish_toolbox_probe_sessions,
@@ -65,6 +69,24 @@ from syspilot.utils import setup_logging
 console = Console()
 logger = logging.getLogger(__name__)
 DEFAULT_QUICK_MODE_DEFAULTS = QuickModeDefaults()
+
+METRIC_EXTRACTION_SYSTEM_PROMPT = """You extract numeric workload performance metrics from program output.
+Return exactly one flat JSON object and no explanation.
+Include only measured performance outcomes: throughput/rate, latency percentiles, runtime/duration, or bandwidth.
+Exclude configuration and static metadata such as thread counts, batch sizes, token counts, topology, hardware details, model size, or parameter counts.
+If no measured performance metrics are present, return {"no_metrics": true}."""
+
+
+def _enable_llm_debug_options(
+    config: SysPilotConfig,
+    *,
+    debug_llm: bool,
+    debug_llm_md: str | None,
+) -> None:
+    if debug_llm or debug_llm_md:
+        config.llm.debug_conversation = True
+    if debug_llm_md:
+        config.llm.debug_markdown_file = debug_llm_md
 
 
 async def _agent_step_for_prompt(agent: Any, prompt: str) -> Any:
@@ -95,6 +117,7 @@ def _merge_llm_config_with_repo_defaults(data: dict[str, Any]) -> LLMConfig:
     merged = {
         "provider": repo_llm.provider.value,
         "model": repo_llm.model,
+        "metric_extraction_model": repo_llm.metric_extraction_model,
         "api_key": repo_llm.api_key,
         "base_url": repo_llm.base_url,
         "openai_auth_file": repo_llm.openai_auth_file,
@@ -104,6 +127,7 @@ def _merge_llm_config_with_repo_defaults(data: dict[str, Any]) -> LLMConfig:
         "max_retries": repo_llm.max_retries,
         "debug_conversation": repo_llm.debug_conversation,
         "debug_markdown_file": repo_llm.debug_markdown_file,
+        "debug_markdown_append": repo_llm.debug_markdown_append,
     }
     merged.update(llm_data)
     return LLMConfig.from_dict(merged)
@@ -135,6 +159,13 @@ def _manual_pipeline_llm_config(base: LLMConfig, minimum_timeout_seconds: float)
     )
 
 
+def _metric_extraction_llm_config(base: LLMConfig) -> LLMConfig:
+    metric_model = (base.metric_extraction_model or "").strip()
+    if not metric_model:
+        return replace(base, debug_markdown_append=True)
+    return replace(base, model=metric_model, debug_markdown_append=True)
+
+
 class _TuneEmitter(Protocol):
     def publish(
         self,
@@ -159,7 +190,6 @@ def _register_default_skills(agent: SysPilotAgent) -> None:
         DynamicScriptSkill,
         StraceAnalyzerSkill,
         PerfAnalyzerSkill,
-        EBPFSkill,
         DataProcessorSkill,
     ]:
         skill = skill_cls()
@@ -305,10 +335,11 @@ def cli(
     ctx.obj["config"] = _load_cli_config(config)
 
     ctx.obj["config"].log_level = log_level
-    if debug_llm or debug_llm_md:
-        ctx.obj["config"].llm.debug_conversation = True
-    if debug_llm_md:
-        ctx.obj["config"].llm.debug_markdown_file = debug_llm_md
+    _enable_llm_debug_options(
+        ctx.obj["config"],
+        debug_llm=debug_llm,
+        debug_llm_md=debug_llm_md,
+    )
     setup_logging(log_level)
 
 
@@ -565,6 +596,33 @@ def _normalize_multi_value_option(values: Sequence[str]) -> list[str]:
     return normalized
 
 
+def _looks_like_inline_manual_hint(value: str) -> bool:
+    return any(char.isspace() for char in value)
+
+
+def _load_spawn_manual_inputs(
+    agent: SysPilotAgent,
+    manual_inputs: Sequence[str],
+) -> tuple[list[str], list[str], list[str]]:
+    loaded_manuals: list[str] = []
+    inline_hints: list[str] = []
+    missing_manuals: list[str] = []
+
+    for manual_input in manual_inputs:
+        if _looks_like_inline_manual_hint(manual_input):
+            inline_hints.append(manual_input)
+            continue
+
+        load_results = agent.load_manuals([manual_input])
+        if load_results.get(manual_input):
+            loaded_manuals.append(manual_input)
+        else:
+            missing_manuals.append(manual_input)
+            inline_hints.append(manual_input)
+
+    return loaded_manuals, inline_hints, missing_manuals
+
+
 def _render_excluded_config_names(names: Sequence[str]) -> str:
     if not names:
         return "(none)"
@@ -574,6 +632,15 @@ def _render_excluded_config_names(names: Sequence[str]) -> str:
         "environment variables, command-line parameters, or config controls are immutable; "
         "related controls with different names remain tunable when supported by evidence."
     )
+
+
+def _render_loaded_manual_context(loaded_manuals: dict[str, str]) -> str:
+    if not loaded_manuals:
+        return ""
+    parts: list[str] = []
+    for manual_name, manual_content in loaded_manuals.items():
+        parts.append(f"### Manual: {manual_name}\n{manual_content.strip()}")
+    return "\n\n".join(parts)
 
 
 def _build_structured_context_bundle(
@@ -648,12 +715,97 @@ def _build_contract_context_bundle(
             max_items_per_section=max_items_per_section,
             contract_root=contract_root,
         )
+        yaml_context = _render_contract_yaml_context(contracts, contract_root)
+        if yaml_context:
+            bundle = {**bundle, CONTRACT_YAML_CONTEXT_KEY: yaml_context}
         return bundle if _has_structured_context(bundle) else {}
     except KeyError:
         return {}
     except Exception as exc:
         logger.debug("Structured contract context unavailable: %s", exc)
         return {}
+
+
+def _contract_yaml_paths_for_prompt(
+    contracts: Sequence[str],
+    contract_root: Path,
+) -> list[Path]:
+    paths: list[Path] = []
+    seen: set[Path] = set()
+
+    def add_path(path: Path) -> None:
+        resolved = path.resolve() if path.exists() else path
+        if resolved in seen or not path.exists():
+            return
+        seen.add(resolved)
+        paths.append(path)
+
+    for contract_ref in contracts:
+        path = _resolve_contract_path(contract_ref, contract_root)
+        add_path(path)
+        if not path.exists():
+            continue
+        try:
+            payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            continue
+        if not isinstance(payload, dict) or payload.get("type") != "composed":
+            continue
+        raw_instances = payload.get("contract_instances", [])
+        if not isinstance(raw_instances, list):
+            continue
+        for item in raw_instances:
+            if not isinstance(item, dict):
+                continue
+            contract_id = item.get("contract_id")
+            if isinstance(contract_id, str) and contract_id.strip():
+                add_path(_resolve_contract_path(contract_id, contract_root))
+
+    return paths
+
+
+def _strip_contract_prompt_evidence(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            key: _strip_contract_prompt_evidence(item)
+            for key, item in value.items()
+            if str(key) != "evidence"
+        }
+    if isinstance(value, list):
+        return [_strip_contract_prompt_evidence(item) for item in value]
+    return value
+
+
+def _contract_yaml_text_for_prompt(path: Path) -> str:
+    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    stripped_payload = _strip_contract_prompt_evidence(payload)
+    return yaml.safe_dump(
+        stripped_payload,
+        sort_keys=False,
+        allow_unicode=True,
+    ).strip()
+
+
+def _render_contract_yaml_context(
+    contracts: Sequence[str],
+    contract_root: Path | None,
+) -> str:
+    if contract_root is None or not contracts:
+        return ""
+    parts: list[str] = []
+    for path in _contract_yaml_paths_for_prompt(contracts, contract_root):
+        if not path.exists():
+            continue
+        yaml_text = _contract_yaml_text_for_prompt(path)
+        if not yaml_text:
+            continue
+        label = path.parent.name
+        parts.append(f"### Contract YAML: {label}\n```yaml\n{yaml_text}\n```")
+    return truncate_prompt_text(
+        "\n\n".join(parts),
+        60_000,
+        label="contract YAML context",
+    )
 
 
 def _default_tune_prompt_log_path() -> Path:
@@ -1177,7 +1329,6 @@ def skills() -> None:
         DynamicScriptSkill,
         StraceAnalyzerSkill,
         PerfAnalyzerSkill,
-        EBPFSkill,
         DataProcessorSkill,
     ]:
         registry.register(skill_cls())
@@ -1378,6 +1529,10 @@ def skills() -> None:
     show_default=True,
     help="Quick-mode total cap on promoted full validation runs.",
 )
+@click.option("--debug-llm", is_flag=True, help="Show full LLM conversation input/output")
+@click.option(
+    "--debug-llm-md", type=click.Path(), help="Write LLM conversation transcript to markdown file"
+)
 @click.pass_context
 def tune(
     ctx: click.Context,
@@ -1409,6 +1564,8 @@ def tune(
     quick_max_signal_groups: int,
     quick_max_total_short_runs: int,
     quick_max_total_full_runs: int,
+    debug_llm: bool,
+    debug_llm_md: str | None,
 ) -> None:
     """Iteratively tune a spawned command.
 
@@ -1429,7 +1586,7 @@ def tune(
     resolved_primary_objective: str | None = None
     resolved_primary_objective_mode: str | None = None
     contract_names = _normalize_multi_value_option(contract)
-    manual_hints = _normalize_multi_value_option(manual)
+    manual_inputs = _normalize_multi_value_option(manual)
     excluded_config_names = _normalize_multi_value_option(exclude_config)
     if primary_objective is not None:
         resolved_primary_objective = primary_objective.strip()
@@ -1482,12 +1639,17 @@ def tune(
             )
 
     config: SysPilotConfig = ctx.obj["config"]
+    _enable_llm_debug_options(config, debug_llm=debug_llm, debug_llm_md=debug_llm_md)
     config.tuning.dry_run = dry_run
     config.tuning.max_tuning_iterations = max_iterations
 
     agent = SysPilotAgent(config)
     prompt_log_path = agent.enable_llm_prompt_logging(_default_tune_prompt_log_path())
     sink.print(f"[cyan]Saving LLM prompts to: {prompt_log_path}[/cyan]")
+    loaded_manual_refs, manual_hints, missing_manual_refs = _load_spawn_manual_inputs(
+        agent,
+        manual_inputs,
+    )
 
     contract_root = _discover_contract_root() if contract_names else None
     structured_context_bundle = _build_contract_context_bundle(
@@ -1500,6 +1662,12 @@ def tune(
     initial_hypothesis_profiles = _extract_hypothesis_profiles(
         structured_context_bundle,
         max_profiles=None,
+    )
+    agent.configure_tuning_prompt(
+        contract_enabled=bool(contract_names),
+        manual_enabled=bool(loaded_manual_refs or manual_hints),
+        quick_mode=quick_mode,
+        profiling_enabled=profile_enabled,
     )
 
     if contract_names:
@@ -1516,6 +1684,7 @@ def tune(
 
     if manual_hints:
         sink.print(f"[cyan]Using application manual hint(s): {', '.join(manual_hints)}[/cyan]")
+    _ = loaded_manual_refs, missing_manual_refs
 
     if excluded_config_names:
         sink.print(
@@ -3625,37 +3794,22 @@ async def _extract_metrics_from_output(
     context: str = "",
 ) -> dict[str, Any]:
     literal_metrics = _extract_literal_numeric_metrics(output)
-    prompt = f"""Extract ONLY runtime performance outcome metrics from this program output.
-Return JSON only.
-
-{f"Context: {context}" if context else ""}
+    prompt = f"""{f"Context: {context}" if context else ""}
 
 Program output:
 ```
 {output[:4000]}
 ```
-
-Include only metrics that represent measurable performance outcomes, such as:
-- throughput/rate (tokens_per_sec, ops_per_sec, req_per_sec, qps, rps, fps)
-- latency (ms/us/ns), including p50/p90/p95/p99
-- execution time / duration / runtime
-- bandwidth
-
-Exclude configuration or static metadata, including:
-- model size/params
-- thread counts, batch sizes, token counts
-- topology/hardware metadata
-- any key like n_threads, n_batch, n_prompt_tokens, model_size_bytes, model_params
-
-Return one flat JSON object: {{"metric_name": number, ...}}
-Do not return nested JSON, text, or explanations.
-
-If no metrics found, return: {{"no_metrics": true}}
-
-RESPOND WITH ONLY THE JSON OBJECT, NO EXPLANATION:"""
+"""
 
     try:
-        response = await _agent_step_for_prompt(agent, prompt)
+        metric_llm = LLMInterface(_metric_extraction_llm_config(agent.config.llm))
+        response = await metric_llm.chat(
+            messages=[
+                Message(role="system", content=METRIC_EXTRACTION_SYSTEM_PROMPT),
+                Message(role="user", content=prompt),
+            ]
+        )
     except LLMError as exc:
         logger.warning("Output metric extraction skipped after LLM failure: %s", exc)
         if literal_metrics:
@@ -4112,6 +4266,12 @@ async def _run_spawn_tune_loop_async(
 ) -> None:
     tune_started_at = time.time()
     best_config_find_wall_time_s = 0.0
+    agent.configure_tuning_prompt(
+        contract_enabled=bool(contracts),
+        manual_enabled=bool(agent.context.loaded_manuals or manual_hints),
+        quick_mode=False,
+        profiling_enabled=profiling_enabled,
+    )
 
     def _elapsed_payload() -> dict[str, float]:
         return {
@@ -4215,6 +4375,11 @@ async def _run_spawn_tune_loop_async(
         },
     )
 
+    candidate_trial_limit_display = (
+        f"fixed budget {fixed_budget_state.total} (--max-iterations ignored)"
+        if fixed_budget_state.enabled
+        else str(max_iterations)
+    )
     sink.panel(
         f"[bold green]SysPilot Tuning Engine (Spawn Mode)[/bold green]\n"
         f"Command: {command}\n"
@@ -4223,7 +4388,7 @@ async def _run_spawn_tune_loop_async(
         f"Workdir: {workdir or '(current)'}\n"
         f"MemoryHigh: {memory_high or '(none)'}\n"
         f"Profiling: {'enabled' if profiling_enabled else 'disabled (raw output only)'}\n"
-        f"Max Candidate Trials: {max_iterations}\n"
+        f"Candidate Trial Limit: {candidate_trial_limit_display}\n"
         f"Timeout: {timeout}s\n"
         f"Contracts: {len(loaded_contract_names)} loaded\n"
         f"Manual hints: {len(manual_hint_list)} provided",
@@ -4236,6 +4401,7 @@ async def _run_spawn_tune_loop_async(
         else ""
     )
     manual_hint_content = _render_spawn_manual_hints(manual_hint_list)
+    loaded_manual_content = _render_loaded_manual_context(agent.context.loaded_manuals)
     excluded_config_content = _render_excluded_config_names(excluded_config_list)
 
     benchmark_deterministic = _is_env_flag_enabled("SYSPILOT_BENCH_DETERMINISTIC")
@@ -4594,7 +4760,88 @@ async def _run_spawn_tune_loop_async(
     total_candidate_trials_executed = 0
     total_profiled_runs = 1
     candidate_outcomes: list[dict[str, Any]] = []
+    previous_round_findings: list[str] = []
     attempted_control_names: set[str] = set()
+
+    def _compact_history_text(value: object, max_chars: int = 420) -> str:
+        text = re.sub(r"\s+", " ", str(value)).strip()
+        if len(text) <= max_chars:
+            return text
+        return text[: max_chars - 3].rstrip() + "..."
+
+    def _contract_validation_history_text(validation: object) -> str:
+        if not isinstance(validation, dict):
+            return ""
+        profiles = validation.get("profiles")
+        if not isinstance(profiles, list) or not profiles:
+            return ""
+        parts: list[str] = []
+        for profile in profiles[:3]:
+            if not isinstance(profile, dict):
+                continue
+            hypothesis_id = profile.get("hypothesis_id") or profile.get("hypothesis_name")
+            signal_results = profile.get("signal_results", [])
+            observed = 0
+            total = 0
+            if isinstance(signal_results, list):
+                total = len(signal_results)
+                observed = sum(
+                    1 for item in signal_results if isinstance(item, dict) and item.get("observed")
+                )
+            if hypothesis_id:
+                parts.append(f"{hypothesis_id}: observed {observed}/{total} signal(s)")
+        return "; ".join(parts)
+
+    def _profile_history_text(artifacts: dict[str, Any]) -> str:
+        profiling_text = _compact_history_text(artifacts.get("profiling_text", ""), 320)
+        profiling_json = artifacts.get("profiling_json", {})
+        findings: list[str] = []
+        if isinstance(profiling_json, dict):
+            raw_findings = profiling_json.get("key_findings")
+            if isinstance(raw_findings, list):
+                findings.extend(_compact_history_text(item, 160) for item in raw_findings[:3])
+            contract_text = _contract_validation_history_text(
+                profiling_json.get("contract_hypothesis_validation")
+            )
+            if contract_text:
+                findings.append(f"contract validation: {contract_text}")
+        if findings:
+            return _compact_history_text("; ".join(findings), 500)
+        return profiling_text
+
+    def _append_previous_round_finding(text: str) -> None:
+        finding = str(text).strip()
+        if not finding:
+            return
+        previous_round_findings.append(finding)
+
+    def _candidate_outcomes_history_text(outcomes: Sequence[dict[str, Any]]) -> str:
+        parts: list[str] = []
+        for outcome in list(outcomes)[-4:]:
+            label = outcome.get("label", "candidate")
+            verdict = outcome.get("verdict", "unknown")
+            reason = outcome.get("reason", "")
+            wall_time = outcome.get("wall_time_s")
+            piece = f"{label}: {verdict}"
+            if wall_time is not None:
+                piece += f" wall={wall_time}s"
+            if reason:
+                piece += f" ({reason})"
+            profile_summary = outcome.get("profile_summary")
+            if profile_summary:
+                piece += f" profile={profile_summary}"
+            parts.append(_compact_history_text(piece, 260))
+        return "; ".join(parts)
+
+    def _previous_round_findings_text() -> str:
+        if not previous_round_findings:
+            return "(none)"
+        return "\n".join(f"- {item}" for item in previous_round_findings)
+
+    _append_previous_round_finding(
+        f"baseline: cmd={' '.join(current_command_parts)} status={baseline_status} "
+        f"wall={current_time:.2f}s profile={_profile_history_text(current_profile_artifacts)}"
+    )
 
     def _current_fixed_goal_value() -> float | None:
         if primary_objective:
@@ -4617,6 +4864,8 @@ async def _run_spawn_tune_loop_async(
         return fixed_goal_stop_reason or fixed_budget_stop_reason or max_iterations_stop_reason
 
     def _candidate_trials_remaining() -> int:
+        if fixed_budget_state.enabled:
+            return cast(int, fixed_budget_state.remaining)
         return max(0, max_iterations - total_candidate_trials_executed)
 
     def _capture_action_controls(actions: Sequence[dict[str, Any]]) -> None:
@@ -4644,6 +4893,7 @@ async def _run_spawn_tune_loop_async(
         reason: str,
         *,
         wall_time_s: float | None = None,
+        profile_artifacts: dict[str, Any] | None = None,
     ) -> None:
         entry: dict[str, Any] = {
             "label": label,
@@ -4652,6 +4902,10 @@ async def _run_spawn_tune_loop_async(
         }
         if wall_time_s is not None:
             entry["wall_time_s"] = round(wall_time_s, 6)
+        if profile_artifacts:
+            profile_summary = _profile_history_text(profile_artifacts)
+            if profile_summary:
+                entry["profile_summary"] = profile_summary
         candidate_outcomes.append(entry)
         if len(candidate_outcomes) > 12:
             del candidate_outcomes[:-12]
@@ -4748,6 +5002,7 @@ async def _run_spawn_tune_loop_async(
         )
 
         history_text = "\n".join(iteration_summaries[-6:]) if iteration_summaries else "(none)"
+        previous_findings_text = _previous_round_findings_text()
         tried_commands = [list(parts) for parts, _ in list(seen_trials)[-12:]]
         candidate_trials_remaining = _candidate_trials_remaining()
 
@@ -4760,11 +5015,12 @@ async def _run_spawn_tune_loop_async(
             "Refined Profiling Evidence" if profiling_enabled else "Raw Runtime Output Evidence"
         )
         evidence_rule = (
-            "- Use only profiling evidence, loaded contract context, and application manual hints."
+            "- Use only profiling evidence, loaded manual context, loaded contract context, and "
+            "application manual hints."
             if profiling_enabled
             else (
                 "- Profiling is disabled by --no-profile; use raw stdout/stderr, loaded "
-                "contract context, and application manual hints."
+                "manual context, loaded contract context, and application manual hints."
             )
         )
         profiled_run_rule = (
@@ -4805,6 +5061,9 @@ async def _run_spawn_tune_loop_async(
 ## Prior Iterations (latest first)
 {history_text}
 
+## Previous Round Findings
+{previous_findings_text}
+
 ## Already Tried Command Forms
 {json.dumps(tried_commands)}
 
@@ -4818,16 +5077,19 @@ async def _run_spawn_tune_loop_async(
     else "(No contract-guided validation findings)"
 }
 
-## Loaded Contract Context
+## Loaded Contract YAML
 {contract_content if contract_content else "(No contract context provided)"}
+
+## Loaded Manual Context
+{loaded_manual_content if loaded_manual_content else "(No manual content loaded)"}
 
 ## Application Manual Hints
 {manual_hint_content if manual_hint_content else "(No application manual hints provided)"}
 
 ## Rules
 {evidence_rule}
-- Loaded contract context may be a structured JSON context bundle; use the structured bundle
-  first when present.
+- Loaded contract YAML is the canonical contract source; use its controls, signals,
+  recipes, and hypothesis definitions together with runtime validation evidence.
 - Contract hypothesis validation, when present, is runtime-generated structured evidence.
   Prefer it over inferring raw DSL semantics yourself.
 {profiled_run_rule}
@@ -4869,6 +5131,11 @@ async def _run_spawn_tune_loop_async(
         no_action_reprompts_this_stall = 0
         prompt_text = prompt
         analysis_unavailable = False
+        round_candidate_outcome_start = len(candidate_outcomes)
+        round_recommendation_summary = ""
+        round_recommendation_evidence: list[str] = []
+        round_action_preview = ""
+        round_llm_response_text = ""
 
         while True:
             analysis_unavailable = False
@@ -4884,6 +5151,7 @@ async def _run_spawn_tune_loop_async(
                     "actions": [],
                     "skipped_actions": [],
                 }
+                round_llm_response_text = str(recommendation["summary"])
                 sink.print(
                     "\n[dim]Deterministic benchmark mode: no tuning actions generated.[/dim]"
                 )
@@ -4906,9 +5174,11 @@ async def _run_spawn_tune_loop_async(
                         "actions": [],
                         "skipped_actions": [],
                     }
+                    round_llm_response_text = str(recommendation["summary"])
                 else:
                     analysis_wall_time_s = time.time() - analysis_started_at
                     sink.print(f"\n[dim]{response.content}[/dim]")
+                    round_llm_response_text = response.content
                     recommendation = _parse_spawn_actions(response.content)
 
             if not recommendation["valid"]:
@@ -4965,6 +5235,12 @@ async def _run_spawn_tune_loop_async(
                         f"{fixed_budget_state.no_action_reprompts_used} re-prompts[/yellow]"
                     )
                     fixed_budget_stop_reason = "unfillable_no_action"
+                _append_previous_round_finding(
+                    f"round {iteration}: recommendation=invalid ({recommendation['error']}); "
+                    f"llm_response={round_llm_response_text or 'unavailable'}; "
+                    f"result=no_actionable_recommendation; "
+                    f"current profile={_profile_history_text(current_profile_artifacts)}"
+                )
                 stop_due_to_no_action = True
                 break
 
@@ -4975,6 +5251,9 @@ async def _run_spawn_tune_loop_async(
 
             summary = recommendation["summary"] or "No actionable tuning recommendation returned."
             next_action_display = _recommendation_next_action_display(recommendation["actions"])
+            round_recommendation_summary = summary
+            round_recommendation_evidence = [str(item) for item in recommendation["evidence"][:5]]
+            round_action_preview = next_action_display
             recommendation_payload: dict[str, Any] = {
                 "mode": "spawn",
                 "iteration": iteration,
@@ -5057,6 +5336,12 @@ async def _run_spawn_tune_loop_async(
                         f"{fixed_budget_state.no_action_reprompts_used} re-prompts[/yellow]"
                     )
                     fixed_budget_stop_reason = "unfillable_no_action"
+                _append_previous_round_finding(
+                    f"round {iteration}: recommendation={round_recommendation_summary}; "
+                    f"llm_response={round_llm_response_text or 'unavailable'}; "
+                    f"action=no_action; evidence={'; '.join(round_recommendation_evidence) or 'none'}; "
+                    f"result=no_actions; current profile={_profile_history_text(current_profile_artifacts)}"
+                )
                 stop_due_to_no_action = True
                 break
 
@@ -5393,6 +5678,7 @@ async def _run_spawn_tune_loop_async(
                     "failed",
                     f"returncode={trial_rc}",
                     wall_time_s=float(trial_time),
+                    profile_artifacts=cast(dict[str, Any], trial_artifacts),
                 )
                 _emit_tune_event(
                     event_emitter,
@@ -5446,6 +5732,7 @@ async def _run_spawn_tune_loop_async(
                         "missing_primary_objective",
                         f"missing numeric primary objective {resolved_primary_objective_metric}",
                         wall_time_s=float(trial_time),
+                        profile_artifacts=cast(dict[str, Any], trial_artifacts),
                     )
                     _emit_tune_event(
                         event_emitter,
@@ -5510,6 +5797,7 @@ async def _run_spawn_tune_loop_async(
                     else "candidate did not outperform the current configuration"
                 ),
                 wall_time_s=float(trial_time),
+                profile_artifacts=cast(dict[str, Any], trial_artifacts),
             )
 
             _emit_tune_event(
@@ -5595,6 +5883,14 @@ async def _run_spawn_tune_loop_async(
                 },
             )
             sink.print("  [yellow]No candidate completed successfully in this iteration[/yellow]")
+            _append_previous_round_finding(
+                f"round {iteration}: recommendation={round_recommendation_summary or 'unavailable'}; "
+                f"llm_response={round_llm_response_text or 'unavailable'}; "
+                f"action={round_action_preview or 'none'}; "
+                f"evidence={'; '.join(round_recommendation_evidence) or 'none'}; "
+                f"candidates={_candidate_outcomes_history_text(candidate_outcomes[round_candidate_outcome_start:]) or 'none completed'}; "
+                f"result=no_successful_trials; current profile={_profile_history_text(current_profile_artifacts)}"
+            )
             if fixed_budget_state.enabled:
                 if fixed_budget_state.remaining == 0:
                     fixed_budget_stop_reason = "fixed_budget_exhausted"
@@ -5721,6 +6017,16 @@ async def _run_spawn_tune_loop_async(
             f"{primary_objective + '=' if primary_objective else ''}"
             f"{_format_metric_value(current_objective_value) if primary_objective else ''} "
             f"wall={current_time:.2f}s"
+        )
+        _append_previous_round_finding(
+            f"round {iteration}: recommendation={round_recommendation_summary or 'unavailable'}; "
+            f"llm_response={round_llm_response_text or 'unavailable'}; "
+            f"action={round_action_preview or 'none'}; "
+            f"evidence={'; '.join(round_recommendation_evidence) or 'none'}; "
+            f"candidates={_candidate_outcomes_history_text(candidate_outcomes[round_candidate_outcome_start:]) or 'none'}; "
+            f"result={'accepted improvement' if iteration_improved else 'no improvement'}; "
+            f"current cmd={' '.join(current_command_parts)} wall={current_time:.2f}s; "
+            f"current profile={_profile_history_text(current_profile_artifacts)}"
         )
 
         if fixed_goal is not None and _fixed_goal_is_reached():

@@ -531,6 +531,7 @@ class LLMInterface:
         self._debug_markdown_path: Path | None = None
         self._debug_exchange_index = 0
         self._debug_last_message_count = 0
+        self._debug_last_messages_snapshot: list[Message] = []
 
         if self.config.debug_conversation:
             if self.config.debug_markdown_file:
@@ -541,13 +542,17 @@ class LLMInterface:
 
             path.parent.mkdir(parents=True, exist_ok=True)
             self._debug_markdown_path = path
-            path.write_text(
+            header = (
                 "# SysPilot LLM Debug Transcript\n\n"
                 f"- Started: {datetime.now().isoformat()}\n"
                 f"- Provider: {self.config.provider.value}\n"
-                f"- Model: {self.config.model}\n\n",
-                encoding="utf-8",
+                f"- Model: {self.config.model}\n\n"
             )
+            if self.config.debug_markdown_append and path.exists():
+                with path.open("a", encoding="utf-8") as f:
+                    f.write("\n" + header)
+            else:
+                path.write_text(header, encoding="utf-8")
             logger.info("LLM debug markdown output: %s", path)
 
     def _request_timeout_seconds(self) -> float:
@@ -637,11 +642,17 @@ class LLMInterface:
 
         self._debug_exchange_index += 1
 
-        if len(messages) >= self._debug_last_message_count:
+        previous_messages = self._debug_last_messages_snapshot
+        if (
+            previous_messages
+            and len(messages) >= len(previous_messages)
+            and messages[: len(previous_messages)] == previous_messages
+        ):
             delta_messages = messages[self._debug_last_message_count :]
         else:
             delta_messages = messages
 
+        self._debug_last_messages_snapshot = list(messages)
         self._debug_last_message_count = len(messages)
 
         lines: list[str] = []

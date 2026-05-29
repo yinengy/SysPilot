@@ -2,7 +2,8 @@
 SysPilot Agent - Core Agent Framework
 
 The main agent that orchestrates system monitoring, profiling, and tuning.
-Uses an LLM to dynamically generate scripts and make tuning decisions.
+Uses an LLM to analyze structured runtime evidence and recommend safe tuning
+candidates.
 """
 
 from __future__ import annotations
@@ -38,7 +39,7 @@ class ProfileResult:
     """Result from a profiling operation."""
 
     timestamp: datetime
-    source: str  # e.g., "cpu_collector", "ebpf_script", "custom_script"
+    source: str
     data: dict[str, Any]
     summary: str  # Condensed summary for LLM context
     raw_size_bytes: int
@@ -65,7 +66,7 @@ class AgentContext:
     target_name: str | None = None
     profile_history: list[ProfileResult] = field(default_factory=list)
     tuning_history: list[TuningRecommendation] = field(default_factory=list)
-    active_scripts: dict[str, str] = field(default_factory=dict)  # name -> script content
+    active_scripts: dict[str, str] = field(default_factory=dict)
     system_baseline: dict[str, Any] = field(default_factory=dict)
     loaded_manuals: dict[str, str] = field(default_factory=dict)
 
@@ -91,65 +92,84 @@ class AgentContext:
         return "\n".join(lines)
 
 
+@dataclass
+class AgentPromptContext:
+    contract_enabled: bool = False
+    manual_enabled: bool = False
+    quick_mode: bool = False
+    profiling_enabled: bool = True
+
+    @property
+    def tuning_configured(self) -> bool:
+        return (
+            self.contract_enabled
+            or self.manual_enabled
+            or self.quick_mode
+            or not self.profiling_enabled
+        )
+
+
 class SysPilotAgent:
     """
     Main SysPilot Agent.
 
-    Orchestrates system monitoring and application tuning using an LLM
-    to dynamically generate profiling scripts and make tuning decisions.
+    Orchestrates system monitoring and application tuning using an LLM to
+    analyze structured runtime evidence and make tuning decisions.
     """
 
-    SYSTEM_PROMPT = """You are SysPilot, an AI agent specialized in system monitoring and application performance tuning.
+    SYSTEM_PROMPT: str = """You are SysPilot's LLM reasoning component for Linux workload tuning.
 
-Your capabilities:
-1. Monitor system resources (CPU, memory, cache, I/O, NUMA topology)
-2. Profile target applications to understand their resource usage patterns
-3. Write custom scripts (Python, Bash, eBPF) to gather specific profiling data
-4. Analyze profiling results and identify performance bottlenecks
-5. Recommend and apply configuration tuning based on loaded manuals
-6. Iteratively tune applications: profile → apply → re-profile → compare → iterate
+You do not run workloads, collect profiles, execute virtual probes, enforce budgets, validate executable rewrites, or compare final candidate outcomes. The SysPilot harness does those things statically and supplies their results in each user prompt.
 
-Key principles:
-- MINIMIZE CONTEXT: Always summarize large profiling outputs into essential insights
-- DYNAMIC SCRIPTING: Write scripts to process raw data (strace, perf, etc.) and extract key metrics
-- eBPF PROFICIENCY: Use eBPF for low-overhead, precise system profiling when needed
-- CONSERVATIVE TUNING: Recommend changes with clear reasoning and confidence levels
-- MANUAL-GUIDED TUNING: When manuals are loaded, use them to identify tuning opportunities
-- ITERATIVE TUNING: Run profile-apply-measure loops and roll back regressions automatically
+Your core responsibility is to transform the supplied evidence into the exact response requested by the current prompt.
 
-When to use eBPF:
-- You need low-overhead kernel-level tracing (syscall patterns, page faults, context switches)
-- Standard profiling tools don't provide sufficient granularity
-- You need to trace NUMA page migrations, cache misses, or memory allocation patterns
-- The target application is latency-sensitive and cannot tolerate strace overhead
+Main tune-analysis task:
+- Read the current command and environment overrides.
+- Read immutable controls, remaining candidate budget, prior iterations, already tried/rejected candidates, current wall time, optional primary-objective value, stdout/stderr excerpts, runtime evidence, and any additional context supplied by the current mode.
+- Infer the most plausible bottleneck or constraint only from that supplied context.
+- Propose small, reversible runtime/configuration changes as ordered JSON actions when the evidence supports them.
+- Return no actions with a concise evidence-based stop reason when no safe, new candidate can be formed.
 
-Dynamic Script Generation pipeline:
-1. CAPTURE: Run a command and save its raw output to a temp file
-2. SAMPLE: Read the first few lines to understand the output format
-3. GENERATE: Write a Python processing script to compress the raw output into key insights
-4. EXECUTE: Run the processing script against the captured data
-5. RETURN: Provide the compressed result to minimize LLM context usage
+Action-output boundaries:
+- Follow the JSON schema in the user prompt exactly and return JSON only when a schema is requested.
+- Supported tuning action types are env_var, command_prefix, command parameters.
+- Every actionable recommendation must include non-empty evidence.
+- Recommend only changes grounded in supplied evidence and active mode context.
+- Keep workload-defining arguments fixed, including input sizes, model dimensions, repetitions, output paths, runtime roots, case identifiers, benchmark mode, and other non-tunable workload shape controls.
+- Respect exact immutable-control names from --exclude-config.
+- Do not repeat already tried or rejected candidates.
+- Do not claim that a candidate is validated before the harness has executed it.
 
-When writing profiling scripts:
-- Process raw data and output only essential metrics
-- Include error handling and timeouts
-- For eBPF: use BCC Python bindings or bpftrace
+General behavior:
+- Prefer the smallest measurable change that could plausibly improve the observed bottleneck.
+- Be explicit about uncertainty through evidence and stop reasons, not through extra prose outside the requested schema.
+- If the user prompt conflicts with this system prompt, preserve the safety/fairness boundaries above and otherwise obey the more specific user prompt.
 
-When tuning:
-- Detect which libraries/tools the application uses (check loaded .so files, imports, process name)
-- Reference the loaded manual sections for detection heuristics and tuning patterns
-- Before recommending configuration changes for a workload, run a profiling pipeline first:
-  1) collect_profile for process/system metrics
-  2) eBPF profiling when available (cache misses, page faults, or NUMA migrations)
-  3) dynamic script refinement (capture/process) to compress raw profiling output
-- Base recommendations on measured profiling evidence, not assumptions
-- Use the apply_tuning tool with config_type: sysctl | prlimit | command | env_var | numactl
-- Follow the manual's decision trees and recommended configurations
-- After applying changes, re-profile to verify improvement
-- Roll back any change that causes >5% performance regression
-- Stop iterating when 2 consecutive iterations show <1% improvement
+Available tools, if any, will be provided for interactions that use tool calling."""
 
-Available tools will be provided for each interaction."""
+    CONTRACT_PROMPT_SECTION: str = """Contract mode context:
+- A contract is structured LPCL library/runtime tuning knowledge supplied by the harness for this run.
+- A hypothesis is a contract-derived explanation of a possible resource bottleneck or conflict that can be checked against runtime evidence.
+- A signal is a named measurable observation used to support or reject a hypothesis.
+- A virtual_probe is the contract's abstract name for a signal source; the harness maps it to toolbox-backed collection code and provides only the collected results to you.
+- Use loaded contract context, candidate controls, hypothesis ids, and contract-hypothesis validation findings when they are present in the user prompt.
+- Do not invent contract facts, execute probes, or infer details that are not present in the supplied contract context or validation evidence."""
+
+    MANUAL_PROMPT_SECTION: str = """Manual mode context:
+- A manual is application-specific tuning information supplied for this run.
+- Treat manual instructions and tunable-flag lists as authoritative for application-level changes.
+- Prefer actions that follow the manual's declared tunable flags and instructions.
+- Do not change flags or parameters outside the manual's tunable set."""
+
+    QUICK_PROMPT_SECTION: str = """Quick-mode context:
+- Quick mode first collects a sampled baseline, ranks abnormal signal windows, then asks you for candidate actions for one window at a time.
+- A window is a bounded time interval from the baseline samples where one target signal looked abnormal or especially informative.
+- In quick-mode recommendation prompts, optimize the candidate for improvement of the target signal in that matched window.
+- Do not optimize directly for wall time or the primary objective during short-screen recommendations unless the prompt says the current stage is full validation."""
+
+    NO_PROFILE_PROMPT_SECTION: str = """No-profile context:
+- Profiling and probe collection are disabled for this run.
+- Base recommendations on raw stdout/stderr, parsed objective metrics, current command/environment state, prior attempts, and any active manual or contract context supplied in the prompt."""
 
     def __init__(self, config: SysPilotConfig) -> None:
         self.config = config
@@ -162,6 +182,7 @@ Available tools will be provided for each interaction."""
         self._tools: dict[str, Callable[..., Any]] = {}
         self._tool_definitions: list[ToolDefinition] = []
         self._message_history: list[Message] = []
+        self._prompt_context = AgentPromptContext()
         self._running = False
         self._llm_prompt_log_path: Path | None = None
         self._llm_prompt_log_index = 0
@@ -183,6 +204,22 @@ Available tools will be provided for each interaction."""
                 break
 
         # Initialize with system prompt (manuals will be loaded separately)
+        self._update_system_prompt()
+
+    def configure_tuning_prompt(
+        self,
+        *,
+        contract_enabled: bool = False,
+        manual_enabled: bool = False,
+        quick_mode: bool = False,
+        profiling_enabled: bool = True,
+    ) -> None:
+        self._prompt_context = AgentPromptContext(
+            contract_enabled=contract_enabled,
+            manual_enabled=manual_enabled,
+            quick_mode=quick_mode,
+            profiling_enabled=profiling_enabled,
+        )
         self._update_system_prompt()
 
     def enable_llm_prompt_logging(self, path: Path) -> Path:
@@ -236,7 +273,19 @@ Available tools will be provided for each interaction."""
     def _update_system_prompt(self) -> None:
         prompt_parts = [self.SYSTEM_PROMPT]
 
-        if self.context.loaded_manuals:
+        if self._prompt_context.contract_enabled:
+            prompt_parts.append(self.CONTRACT_PROMPT_SECTION)
+
+        if self._prompt_context.manual_enabled:
+            prompt_parts.append(self.MANUAL_PROMPT_SECTION)
+
+        if self._prompt_context.quick_mode:
+            prompt_parts.append(self.QUICK_PROMPT_SECTION)
+
+        if not self._prompt_context.profiling_enabled:
+            prompt_parts.append(self.NO_PROFILE_PROMPT_SECTION)
+
+        if self.context.loaded_manuals and not self._prompt_context.tuning_configured:
             prompt_parts.append("\n\n## LOADED MANUALS")
             prompt_parts.append("You have access to the following technical manuals for tuning:")
             for manual_name, manual_content in self.context.loaded_manuals.items():
@@ -314,6 +363,9 @@ Available tools will be provided for each interaction."""
             )
         )
         logger.info(f"Registered tool: {name}")
+
+    def has_tool(self, name: str) -> bool:
+        return name in self._tools
 
     def _build_context_message(self) -> str:
         """Build current context for the LLM."""

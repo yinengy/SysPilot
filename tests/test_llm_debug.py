@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, AsyncIterator
 
@@ -224,6 +225,42 @@ async def test_debug_markdown_transcript_written(tmp_path):
     assert "### Response" in text
     assert "collect_profile" in text
     assert "debug response" in text
+
+
+def test_debug_markdown_logs_fresh_same_length_requests(tmp_path: Path) -> None:
+    md_path = tmp_path / "llm_debug.md"
+    llm_config = LLMConfig(
+        provider=LLMProvider.OPENAI,
+        model="gpt-4o",
+        api_key="test",
+        debug_conversation=True,
+        debug_markdown_file=str(md_path),
+    )
+
+    llm = LLMInterface(llm_config)
+    llm._provider = DummyProvider()
+
+    async def _run_requests() -> None:
+        _ = await llm.chat(
+            [
+                Message(role="system", content="system prompt"),
+                Message(role="user", content="first stateless prompt"),
+            ]
+        )
+        _ = await llm.chat(
+            [
+                Message(role="system", content="system prompt"),
+                Message(role="user", content="second stateless prompt"),
+            ]
+        )
+
+    asyncio.run(_run_requests())
+
+    text = md_path.read_text(encoding="utf-8")
+    assert "## Exchange 2" in text
+    exchange_2 = text.split("## Exchange 2", maxsplit=1)[1]
+    assert "(no new messages)" not in exchange_2
+    assert "second stateless prompt" in exchange_2
 
 
 @pytest.mark.asyncio

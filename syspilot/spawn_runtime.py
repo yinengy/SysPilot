@@ -287,7 +287,6 @@ async def execute_profiled_spawn_run(
     key_findings: list[str] = []
     per_pid_runtime_maps: dict[str, dict[str, Any]] = {}
     per_pid_collect_profile: dict[str, dict[str, Any]] = {}
-    collect_summaries: list[str] = []
     agent_tool_calls = 0
 
     for target_pid in target_pids:
@@ -304,86 +303,8 @@ async def execute_profiled_spawn_run(
 
             if isinstance(collect_result, dict):
                 per_pid_collect_profile[str(target_pid)] = collect_result
-                summaries: list[str] = []
-                for collector_name, payload in collect_result.items():
-                    if isinstance(payload, dict) and "summary" in payload:
-                        summaries.append(f"{collector_name}: {payload['summary']}")
-                if summaries:
-                    collect_summaries.append(f"pid {target_pid}: " + " | ".join(summaries))
         except Exception as exc:
             key_findings.append(f"collect_profile failed for pid {target_pid}: {exc}")
-
-    ebpf_summary = ""
-    ebpf_data: dict[str, Any] = {}
-    try:
-        ebpf_check = await agent._execute_tool("skill_ebpf", {"action": "check_availability"})
-        agent_tool_calls += 1
-        tools_used.append("skill_ebpf.check_availability")
-        if isinstance(ebpf_check, dict):
-            ebpf_summary = str(ebpf_check.get("summary", ""))
-            raw_data = ebpf_check.get("data", {})
-            if isinstance(raw_data, dict):
-                ebpf_data = raw_data
-
-        template_name = ""
-        if ebpf_data.get("bpftrace_available"):
-            template_name = "syscall_count"
-        elif ebpf_data.get("bcc_available"):
-            template_name = "bcc_syscall_latency"
-
-        if template_name:
-            ebpf_profile = await agent._execute_tool(
-                "skill_ebpf",
-                {
-                    "action": "run_template",
-                    "template_name": template_name,
-                    "pid": primary_pid,
-                    "duration": 2,
-                },
-            )
-            agent_tool_calls += 1
-            tools_used.append(f"skill_ebpf.run_template:{template_name}:{primary_pid}")
-            if isinstance(ebpf_profile, dict):
-                profile_summary = str(ebpf_profile.get("summary", "")).strip()
-                profile_error = str(ebpf_profile.get("error", "")).strip()
-                if profile_summary:
-                    ebpf_summary = profile_summary
-                if profile_error:
-                    ebpf_summary = (
-                        f"{ebpf_summary} ({profile_error})" if ebpf_summary else profile_error
-                    )
-
-                profile_success = bool(ebpf_profile.get("success", False))
-                if (
-                    not profile_success
-                    and template_name == "syscall_count"
-                    and ebpf_data.get("bcc_available")
-                ):
-                    fallback_profile = await agent._execute_tool(
-                        "skill_ebpf",
-                        {
-                            "action": "run_template",
-                            "template_name": "bcc_syscall_latency",
-                            "pid": primary_pid,
-                            "duration": 2,
-                        },
-                    )
-                    agent_tool_calls += 1
-                    tools_used.append(f"skill_ebpf.run_template:bcc_syscall_latency:{primary_pid}")
-                    if isinstance(fallback_profile, dict):
-                        fallback_summary = str(fallback_profile.get("summary", "")).strip()
-                        fallback_error = str(fallback_profile.get("error", "")).strip()
-                        fallback_text = fallback_summary
-                        if fallback_error:
-                            fallback_text = (
-                                f"{fallback_text} ({fallback_error})"
-                                if fallback_text
-                                else fallback_error
-                            )
-                        if fallback_text:
-                            ebpf_summary = f"{ebpf_summary} | fallback: {fallback_text}"
-    except Exception as exc:
-        key_findings.append(f"ebpf profiling failed: {exc}")
 
     processor_script = (
         "import json\n"
@@ -570,9 +491,7 @@ async def execute_profiled_spawn_run(
         "tools_used": tools_used,
         "target_pids": target_pids,
         "primary_pid": primary_pid,
-        "collect_profile_summary": " | ".join(collect_summaries)[:1800],
         "collect_profile_data": primary_collect_profile,
-        "ebpf_summary": ebpf_summary,
         "refined_runtime_maps": refined_runtime_maps,
         "per_pid_runtime_maps": per_pid_runtime_maps,
         "cgroup_memory_evidence": cgroup_memory_evidence,
@@ -725,9 +644,7 @@ async def execute_unprofiled_spawn_run(
         "tools_used": [],
         "target_pids": [pid],
         "primary_pid": pid,
-        "collect_profile_summary": "profiling skipped; raw runtime output only",
         "collect_profile_data": {},
-        "ebpf_summary": "",
         "refined_runtime_maps": {},
         "per_pid_runtime_maps": {},
         "cgroup_memory_evidence": {},

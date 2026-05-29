@@ -11,8 +11,10 @@ from unittest.mock import patch
 from click.testing import CliRunner
 
 from syspilot.cli import (
+    METRIC_EXTRACTION_SYSTEM_PROMPT,
     _build_spawn_profiling_env,
     _collect_contract_report_env,
+    _extract_metrics_from_output,
     _compute_objective_speedup_ratio,
     _extract_hypothesis_profiles,
     _extract_literal_numeric_metrics,
@@ -20,12 +22,13 @@ from syspilot.cli import (
     _load_default_llm_config,
     _parse_spawn_actions,
     _recommendation_next_action_display,
+    _register_default_skills,
     _run_live_profiling_pipeline,
     _summarize_spawn_runtime_output,
     cli,
 )
 from syspilot.core.agent import SysPilotAgent
-from syspilot.core.config import SysPilotConfig
+from syspilot.core.config import LLMConfig, SysPilotConfig
 from syspilot.core.llm import LLMTimeoutError
 from syspilot_contract.compose_contracts import compose_contracts
 from syspilot_contract.integration import build_agent_context_bundle, write_contract_bundle
@@ -58,6 +61,47 @@ def test_literal_metric_extraction_reads_full_json_output() -> None:
     assert metrics["steps_per_sec"] == 4.25
     assert metrics["throughput"] == 136.0
     assert "batch_size" not in metrics
+
+
+def test_metric_extraction_uses_dedicated_model_and_system_prompt() -> None:
+    calls: list[dict[str, object]] = []
+
+    class FakeLLMInterface:
+        def __init__(self, config: LLMConfig) -> None:
+            self.config = config
+
+        async def chat(self, *, messages: list[object]) -> SimpleNamespace:
+            calls.append({"config": self.config, "messages": messages})
+            return SimpleNamespace(content='{"throughput": 12.5}')
+
+    config = SysPilotConfig()
+    config.llm = LLMConfig(
+        model="gpt-5.4(high)",
+        metric_extraction_model="gpt-5.3-codex",
+        base_url="https://example.test/v1",
+        api_key="test",
+    )
+    agent = SimpleNamespace(config=config)
+
+    with patch("syspilot.cli.LLMInterface", FakeLLMInterface):
+        metrics = asyncio.run(
+            _extract_metrics_from_output(
+                cast(SysPilotAgent, cast(object, agent)),
+                "benchmark says throughput is 12.5 items/s",
+                "candidate trial",
+            )
+        )
+
+    assert metrics["throughput"] == 12.5
+    assert len(calls) == 1
+    metric_config = cast(LLMConfig, calls[0]["config"])
+    assert metric_config.model == "gpt-5.3-codex"
+    assert metric_config.base_url == "https://example.test/v1"
+    messages = cast(list[object], calls[0]["messages"])
+    assert getattr(messages[0], "role") == "system"
+    assert getattr(messages[0], "content") == METRIC_EXTRACTION_SYSTEM_PROMPT
+    assert getattr(messages[1], "role") == "user"
+    assert "candidate trial" in getattr(messages[1], "content")
 
 
 def test_recommendation_next_action_display_formats_first_action_preview() -> None:
@@ -294,6 +338,19 @@ class _DummyAgent:
         self.prompt_log_path = path
         return path
 
+    def configure_tuning_prompt(
+        self,
+        *,
+        contract_enabled: bool = False,
+        manual_enabled: bool = False,
+        quick_mode: bool = False,
+        profiling_enabled: bool = True,
+    ) -> None:
+        _ = contract_enabled
+        _ = manual_enabled
+        _ = quick_mode
+        _ = profiling_enabled
+
     def load_manuals(self, names: list[str]) -> dict[str, bool]:
         for name in names:
             self.context.loaded_manuals[name] = "RAW MANUAL SHOULD NOT APPEAR"
@@ -414,9 +471,10 @@ async def _fake_timeout_live_profile(*args: object, **kwargs: object) -> dict[st
 class _ProfilingToolAgent:
     def __init__(self) -> None:
         self.context = SimpleNamespace(target_pid=777, loaded_manuals={})
+        self.tool_calls: list[str] = []
 
     async def _execute_tool(self, tool_name: str, payload: object) -> object:
-        _ = tool_name
+        self.tool_calls.append(tool_name)
         _ = payload
         return {}
 
@@ -772,8 +830,11 @@ def test_spawn_mode_uses_contract_context_from_contract_option(tmp_path: Path) -
     assert result.exit_code == 0
     assert _DummyAgent.instances
     prompt = _DummyAgent.instances[0].prompts[0]
-    assert '"candidate_actions"' in prompt
-    assert "Loaded Contract Context" in prompt
+    assert "Loaded Contract YAML" in prompt
+    assert "Contract YAML: openmp" in prompt
+    assert "OMP_NUM_THREADS" in prompt
+    assert "evidence:" not in prompt
+    assert "OpenMP_doc:chunk_001" not in prompt
 
 
 def test_spawn_mode_supports_contracts_and_manual_hints_together(tmp_path: Path) -> None:
@@ -814,10 +875,218 @@ def test_spawn_mode_supports_contracts_and_manual_hints_together(tmp_path: Path)
     assert result.exit_code == 0
     assert _DummyAgent.instances
     prompt = _DummyAgent.instances[0].prompts[0]
-    assert '"candidate_actions"' in prompt
-    assert '"os.context_switch_rate"' in prompt
+    assert "Loaded Contract YAML" in prompt
+    assert "Contract YAML: openmp" in prompt
+    assert "os.context_switch_rate" in prompt
+    assert "evidence:" not in prompt
+    assert "OpenMP_doc:chunk_001" not in prompt
     assert "Application Manual Hints" in prompt
     assert "parent process launches short-lived workers" in prompt
+
+
+def test_spawn_mode_prompt_includes_cumulative_previous_round_findings() -> None:
+    runner = CliRunner()
+    _DummyAgent.instances.clear()
+    long_response_marker = "FULL_RESPONSE_TAIL_MARKER"
+
+    class _LongResponseThenNoneSpawnAgent(_DummyAgent):
+        def __init__(self, config: object) -> None:
+            super().__init__(config)
+            self._calls = 0
+
+        async def step(self, prompt: str) -> _DummyResponse:
+            self.prompts.append(prompt)
+            self._calls += 1
+            if self._calls == 1:
+                return _DummyResponse(
+                    '{"summary":"try candidate","manual_citation":"",'
+                    '"evidence":["baseline timed out","'
+                    + ("x" * 1600)
+                    + long_response_marker
+                    + '"],"actions":[{"config_type":"env_var",'
+                    '"parameter":"OMP_PROC_BIND","new_value":"close",'
+                    '"reason":"improve locality","manual_citation":""}]}'
+                )
+            return _DummyResponse('{"summary":"none","manual_citation":"","evidence":[],"actions":[]}')
+
+    async def _profiled_runs(*args: object, **kwargs: object) -> dict[str, object]:
+        _ = args
+        _ = kwargs
+        call_index = int(getattr(_profiled_runs, "calls", 0)) + 1
+        setattr(_profiled_runs, "calls", call_index)
+        if call_index == 1:
+            return {
+                "pid": 9999,
+                "wall_time": 1.0,
+                "stdout": "baseline",
+                "stderr": "",
+                "returncode": 0,
+                "profiling_text": "baseline profile",
+                "profiling_json": {"key_findings": ["baseline context switches high"]},
+                "tool_calls_used": 0,
+            }
+        return {
+            "pid": 10001,
+            "wall_time": 0.7,
+            "stdout": "candidate",
+            "stderr": "",
+            "returncode": 0,
+            "profiling_text": "candidate profile",
+            "profiling_json": {
+                "key_findings": ["candidate context switches lower"],
+                "contract_hypothesis_validation": {
+                    "profiles": [
+                        {
+                            "hypothesis_id": "cpu-oversubscription",
+                            "signal_results": [{"observed": True}, {"observed": False}],
+                        }
+                    ]
+                },
+            },
+            "tool_calls_used": 0,
+        }
+
+    with (
+        patch("syspilot.cli.SysPilotAgent", _LongResponseThenNoneSpawnAgent),
+        patch("syspilot.cli._register_default_skills", _noop),
+        patch("syspilot.cli._register_profiling_tools", _noop),
+        patch("syspilot.cli._register_tuning_tools", _noop),
+        patch("syspilot.cli._run_live_profiling_pipeline", _profiled_runs),
+        patch("syspilot.cli._run_command", _fake_run_command),
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "tune",
+                "--ui-mode",
+                "plain",
+                "--command",
+                "echo hi",
+                "--max-iterations",
+                "2",
+                "--timeout",
+                "1",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert _DummyAgent.instances
+    prompts = _DummyAgent.instances[0].prompts
+    assert len(prompts) == 2
+    second_prompt = prompts[1]
+    assert "## Previous Round Findings" in second_prompt
+    assert "baseline context switches high" in second_prompt
+    assert "llm_response=" in second_prompt
+    assert '"summary":"try candidate"' in second_prompt
+    assert '"parameter":"OMP_PROC_BIND"' in second_prompt
+    assert long_response_marker in second_prompt
+    assert "round 1: recommendation=try candidate" in second_prompt
+    assert "action=OMP_PROC_BIND=close" in second_prompt
+    assert "evidence=baseline timed out" in second_prompt
+    assert "candidate context switches lower" in second_prompt
+    assert "cpu-oversubscription: observed 1/2 signal(s)" in second_prompt
+
+
+def test_spawn_mode_manual_name_loads_manual_folder_content(tmp_path: Path) -> None:
+    runner = CliRunner()
+    manual_root = tmp_path / "manual"
+    manual_dir = manual_root / "custom_manual"
+    manual_dir.mkdir(parents=True)
+    manual_text = "Set OMP_NUM_THREADS=2 when worker fanout exceeds socket count."
+    (manual_dir / "manual.md").write_text(manual_text, encoding="utf-8")
+    _DummyAgent.instances.clear()
+
+    class _ManualFileAgent(_DummyAgent):
+        def load_manuals(self, names: list[str]) -> dict[str, bool]:
+            results: dict[str, bool] = {}
+            for name in names:
+                candidates = [manual_root / f"{name}.md", manual_root / name / "manual.md"]
+                manual_path = next((path for path in candidates if path.exists()), None)
+                if manual_path is None:
+                    results[name] = False
+                    continue
+                self.context.loaded_manuals[name] = manual_path.read_text(encoding="utf-8")
+                results[name] = True
+            return results
+
+    with (
+        patch("syspilot.cli.SysPilotAgent", _ManualFileAgent),
+        patch("syspilot.cli._register_default_skills", _noop),
+        patch("syspilot.cli._register_profiling_tools", _noop),
+        patch("syspilot.cli._register_tuning_tools", _noop),
+        patch("syspilot.cli._run_live_profiling_pipeline", _fake_live_profile),
+        patch("syspilot.cli._run_command", _fake_run_command),
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "tune",
+                "--ui-mode",
+                "plain",
+                "--command",
+                "echo hi",
+                "--manual",
+                "custom_manual",
+                "--max-iterations",
+                "1",
+                "--timeout",
+                "1",
+            ],
+        )
+
+    assert result.exit_code == 0
+    prompt = _DummyAgent.instances[0].prompts[0]
+    assert "Loaded Manual Context" in prompt
+    assert "### Manual: custom_manual" in prompt
+    assert manual_text in prompt
+    assert "Application Manual Hints\n(No application manual hints provided)" in prompt
+
+
+def test_spawn_mode_accepts_debug_llm_flags_after_tune_command() -> None:
+    runner = CliRunner()
+    _DummyAgent.instances.clear()
+
+    with (
+        patch("syspilot.cli.SysPilotAgent", _DummyAgent),
+        patch("syspilot.cli._register_default_skills", _noop),
+        patch("syspilot.cli._register_profiling_tools", _noop),
+        patch("syspilot.cli._register_tuning_tools", _noop),
+        patch("syspilot.cli._run_live_profiling_pipeline", _fake_live_profile),
+        patch("syspilot.cli._run_command", _fake_run_command),
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "tune",
+                "--ui-mode",
+                "plain",
+                "--command",
+                "echo hi",
+                "--debug-llm",
+                "--debug-llm-md",
+                "debug.md",
+                "--max-iterations",
+                "1",
+                "--timeout",
+                "1",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert _DummyAgent.instances
+    config = cast(SysPilotConfig, _DummyAgent.instances[0].config)
+    assert config.llm.debug_conversation is True
+    assert config.llm.debug_markdown_file == "debug.md"
+
+
+def test_default_skill_registration_does_not_load_ebpf_skill() -> None:
+    agent = SysPilotAgent(SysPilotConfig())
+
+    _register_default_skills(agent)
+    has_tool = cast(Any, getattr(agent, "has_tool"))
+
+    assert not has_tool("skill_ebpf")
+    assert has_tool("skill_data_processor")
 
 
 def test_spawn_mode_accepts_composed_contract_without_manual_files(tmp_path: Path) -> None:
@@ -863,9 +1132,10 @@ def test_spawn_mode_accepts_composed_contract_without_manual_files(tmp_path: Pat
     assert _DummyAgent.instances
     assert _DummyAgent.instances[0].context.loaded_manuals == {}
     prompt = _DummyAgent.instances[0].prompts[0]
-    assert '"candidate_actions"' in prompt
-    assert '"conflicts"' in prompt
-    assert "Loaded Contract Context" in prompt
+    assert "Loaded Contract YAML" in prompt
+    assert "selected_contracts" in prompt
+    assert "OMP_NUM_THREADS" in prompt
+    assert "OPENBLAS_NUM_THREADS" in prompt
 
 
 def test_spawn_mode_passes_contract_hypotheses_into_first_profiling_round(tmp_path: Path) -> None:
@@ -2193,6 +2463,8 @@ def test_live_profiling_pipeline_restores_agent_target_pid() -> None:
         assert result["stdout"] == "ok\n"
         assert callback_lines == [("stdout", "ok\n")]
         assert agent.context.target_pid == 777
+        assert "skill_ebpf" not in agent.tool_calls
+        assert not any("ebpf profiling failed" in item for item in result["profiling_json"]["key_findings"])
 
     asyncio.run(_run())
 

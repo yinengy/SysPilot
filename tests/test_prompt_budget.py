@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 from syspilot.prompt_budget import (
+    CONTRACT_YAML_CONTEXT_KEY,
     PROMPT_JSON_LIMIT_MARKER,
     compact_contract_context_for_prompt,
     contract_context_json_for_prompt,
@@ -82,6 +83,18 @@ def test_contract_context_prompt_preserves_small_raw_payload() -> None:
     assert PROMPT_JSON_LIMIT_MARKER not in rendered
 
 
+def test_contract_context_prompt_prefers_yaml_context() -> None:
+    rendered = contract_context_json_for_prompt(
+        {
+            CONTRACT_YAML_CONTEXT_KEY: "### Contract YAML: openmp\n```yaml\ncontract: OpenMP\n```",
+            "candidate_actions": [{"control": {"name": "OMP_NUM_THREADS"}}],
+        }
+    )
+
+    assert "Contract YAML: openmp" in rendered
+    assert "candidate_actions" not in rendered
+
+
 def test_profiling_json_prompt_preserves_small_raw_payload() -> None:
     rendered = profiling_json_for_prompt(
         {
@@ -93,6 +106,24 @@ def test_profiling_json_prompt_preserves_small_raw_payload() -> None:
 
     assert "raw detail" in rendered
     assert PROMPT_JSON_LIMIT_MARKER not in rendered
+
+
+def test_profiling_json_prompt_drops_duplicate_prompt_fields() -> None:
+    rendered = profiling_json_for_prompt(
+        {
+            "collect_profile_summary": "duplicate summary",
+            "contract_hypothesis_validation": {"profiles": [{"hypothesis_id": "h1"}]},
+            "ebpf_summary": "unused ebpf",
+            "collect_profile_data": {"cpu": {"data": {"num_threads": 6}}},
+            "key_findings": ["useful finding"],
+        }
+    )
+
+    assert "duplicate summary" not in rendered
+    assert "contract_hypothesis_validation" not in rendered
+    assert "unused ebpf" not in rendered
+    assert "collect_profile_data" in rendered
+    assert "useful finding" in rendered
 
 
 def test_profiling_json_prompt_rendering_truncates_large_payload() -> None:

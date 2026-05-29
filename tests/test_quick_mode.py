@@ -3160,6 +3160,7 @@ def test_fixed_budget_quick_no_action_reprompt_cap_is_per_window_not_global() ->
         assert result.exit_code == 0
         assert len(report["checked_window_ids"]) == 2
         assert len(report["short_results"]) == 2
+        assert report["max_iterations_stop_reason"] == ""
         budget_state = _RecordingFixedBudgetState.instances[-1]
         assert budget_state.used == 2
         assert budget_state.no_action_reprompts_used == 2

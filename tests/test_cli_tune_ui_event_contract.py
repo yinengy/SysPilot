@@ -1153,7 +1153,7 @@ def test_fixed_budget_continues_into_second_round_after_non_improvement() -> Non
                 "--fixed-budget",
                 "2",
                 "--max-iterations",
-                "2",
+                "1",
                 "--timeout",
                 "1",
             ],
@@ -1175,6 +1175,7 @@ def test_fixed_budget_continues_into_second_round_after_non_improvement() -> Non
     assert comparison_payload["total_candidate_trials_executed"] == 2
     assert comparison_payload["total_profiled_runs"] == 3
     assert comparison_payload["stop_reason"] == "fixed_budget_exhausted"
+    assert comparison_payload["max_iterations_stop_reason"] == ""
     assert budget_payload["used"] == 2
     assert budget_payload["remaining"] == 0
 

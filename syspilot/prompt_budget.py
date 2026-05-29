@@ -9,6 +9,7 @@ PROMPT_JSON_LIMIT_MARKER = "__syspilot_prompt_note__"
 DEFAULT_PROMPT_JSON_CHAR_LIMIT = 80_000
 DEFAULT_CONTRACT_CONTEXT_CHAR_LIMIT = 60_000
 DEFAULT_PROFILING_JSON_CHAR_LIMIT = 45_000
+CONTRACT_YAML_CONTEXT_KEY = "__syspilot_contract_yaml_context__"
 _NO_COMPACTED_VALUE = object()
 
 _DROP_KEYS = {
@@ -17,6 +18,15 @@ _DROP_KEYS = {
     "source_refs",
     "resolved_components",
     "resolved_uses",
+}
+
+_PROFILING_DROP_KEYS = {
+    "collect_profile_summary",
+    "contract_hypothesis_validation",
+    "ebpf_summary",
+    "stderr",
+    "stdout",
+    "summary",
 }
 
 
@@ -218,6 +228,29 @@ def compact_contract_context_for_prompt(bundle: Mapping[str, Any] | None) -> dic
     return {key: value for key, value in compacted.items() if value not in (None, "", [])}
 
 
+def _compact_profiling_value(value: Any, *, max_depth: int = 6) -> Any:
+    if max_depth <= 0:
+        return compact_for_prompt(value, max_depth=0)
+
+    if isinstance(value, Mapping):
+        compacted: dict[str, Any] = {}
+        for raw_key, raw_item in value.items():
+            key = str(raw_key)
+            if key in _PROFILING_DROP_KEYS:
+                continue
+            compacted[key] = _compact_profiling_value(raw_item, max_depth=max_depth - 1)
+        return {key: item for key, item in compacted.items() if item not in (None, "", [], {})}
+
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return compact_for_prompt(value, max_depth=max_depth, max_list_items=8, max_string_chars=1_200)
+
+    return compact_for_prompt(value, max_depth=max_depth, max_list_items=8, max_string_chars=1_200)
+
+
+def compact_profiling_json_for_prompt(value: Any) -> Any:
+    return _compact_profiling_value(value)
+
+
 def json_for_prompt(
     value: Any,
     *,
@@ -241,6 +274,13 @@ def json_for_prompt(
 def contract_context_json_for_prompt(bundle: Mapping[str, Any] | None) -> str:
     if not isinstance(bundle, Mapping) or not bundle:
         return ""
+    yaml_context = bundle.get(CONTRACT_YAML_CONTEXT_KEY)
+    if isinstance(yaml_context, str) and yaml_context.strip():
+        return truncate_prompt_text(
+            yaml_context.strip(),
+            DEFAULT_CONTRACT_CONTEXT_CHAR_LIMIT,
+            label="contract YAML context",
+        )
     return json_for_prompt(
         bundle,
         max_chars=DEFAULT_CONTRACT_CONTEXT_CHAR_LIMIT,
@@ -250,8 +290,10 @@ def contract_context_json_for_prompt(bundle: Mapping[str, Any] | None) -> str:
 
 
 def profiling_json_for_prompt(value: Any) -> str:
+    compacted_value = compact_profiling_json_for_prompt(value)
     return json_for_prompt(
-        value,
+        compacted_value,
         max_chars=DEFAULT_PROFILING_JSON_CHAR_LIMIT,
         label="profiling JSON",
+        compacted_value=compacted_value,
     )

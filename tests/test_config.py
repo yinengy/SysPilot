@@ -9,6 +9,7 @@ from syspilot.cli import (
     _load_default_llm_config,
     _merge_llm_config_with_repo_defaults,
     _manual_pipeline_llm_config,
+    _metric_extraction_llm_config,
 )
 
 
@@ -25,6 +26,7 @@ def test_config_from_dict():
         "llm": {
             "provider": "anthropic",
             "model": "claude-3-opus-20240229",
+            "metric_extraction_model": "gpt-5.3-codex",
             "timeout_seconds": 12.5,
             "max_retries": 3,
             "debug_conversation": True,
@@ -39,6 +41,7 @@ def test_config_from_dict():
     config = SysPilotConfig.from_dict(data)
     assert config.llm.provider == LLMProvider.ANTHROPIC
     assert config.llm.model == "claude-3-opus-20240229"
+    assert config.llm.metric_extraction_model == "gpt-5.3-codex"
     assert config.llm.timeout_seconds == 12.5
     assert config.llm.max_retries == 3
     assert config.llm.debug_conversation is True
@@ -51,12 +54,14 @@ def test_config_to_dict():
     config = SysPilotConfig()
     config.target_pid = 5678
     config.llm.timeout_seconds = 9.0
+    config.llm.metric_extraction_model = "gpt-5.3-codex"
     config.llm.max_retries = 2
     config.llm.debug_conversation = True
     config.llm.debug_markdown_file = "/tmp/out.md"
 
     data = config.to_dict()
     assert data["llm"]["provider"] == "openai"
+    assert data["llm"]["metric_extraction_model"] == "gpt-5.3-codex"
     assert data["llm"]["timeout_seconds"] == 9.0
     assert data["llm"]["max_retries"] == 2
     assert data["llm"]["debug_conversation"] is True
@@ -118,6 +123,7 @@ def test_load_default_llm_config_reads_repo_config_file():
 
     assert config.provider.value == repo_config["provider"]
     assert config.model == repo_config["model"]
+    assert config.metric_extraction_model == repo_config["metric_extraction_model"]
     assert config.timeout_seconds == repo_config["timeout_seconds"]
     assert config.max_retries == repo_config["max_retries"]
 
@@ -129,6 +135,7 @@ def test_merge_llm_config_with_repo_defaults_uses_repo_values_when_yaml_missing_
 
     assert merged.provider == repo_llm.provider
     assert merged.model == repo_llm.model
+    assert merged.metric_extraction_model == repo_llm.metric_extraction_model
     assert merged.base_url == repo_llm.base_url
     assert merged.timeout_seconds == repo_llm.timeout_seconds
 
@@ -144,6 +151,30 @@ def test_merge_llm_config_with_repo_defaults_overlays_partial_yaml_llm():
     assert merged.base_url == repo_llm.base_url
     assert merged.timeout_seconds == 120.0
     assert merged.model == "gpt-5.4"
+    assert merged.metric_extraction_model == repo_llm.metric_extraction_model
+
+
+def test_metric_extraction_llm_config_overrides_only_model_and_appends_debug() -> None:
+    base = LLMConfig(
+        model="gpt-5.4(high)",
+        metric_extraction_model="gpt-5.3-codex",
+        base_url="https://example.test/v1",
+        api_key="test",
+        timeout_seconds=12.0,
+        debug_conversation=True,
+        debug_markdown_file="debug.md",
+    )
+
+    metric_config = _metric_extraction_llm_config(base)
+
+    assert metric_config.model == "gpt-5.3-codex"
+    assert metric_config.provider == base.provider
+    assert metric_config.base_url == base.base_url
+    assert metric_config.api_key == base.api_key
+    assert metric_config.timeout_seconds == base.timeout_seconds
+    assert metric_config.debug_conversation is True
+    assert metric_config.debug_markdown_file == "debug.md"
+    assert metric_config.debug_markdown_append is True
 
 
 def test_manual_pipeline_llm_config_enforces_minimum_timeout_and_retry():

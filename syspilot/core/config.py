@@ -31,6 +31,7 @@ class LLMConfig:
 
     provider: LLMProvider = LLMProvider.OPENAI
     model: str = "gpt-4o"
+    metric_extraction_model: str | None = None
     api_key: str | None = None
     base_url: str | None = None
     openai_auth_file: str | None = None
@@ -40,6 +41,7 @@ class LLMConfig:
     max_retries: int = 1
     debug_conversation: bool = False
     debug_markdown_file: str | None = None
+    debug_markdown_append: bool = False
 
     def __post_init__(self) -> None:
         """Load API key from environment if not provided."""
@@ -65,6 +67,7 @@ class LLMConfig:
         return cls(
             provider=provider,
             model=config.get("model", default_model),
+            metric_extraction_model=config.get("metric_extraction_model"),
             api_key=config.get("api_key"),
             base_url=config.get("base_url"),
             openai_auth_file=config.get("openai_auth_file"),
@@ -74,6 +77,7 @@ class LLMConfig:
             max_retries=config.get("max_retries", 1),
             debug_conversation=config.get("debug_conversation", False),
             debug_markdown_file=config.get("debug_markdown_file"),
+            debug_markdown_append=config.get("debug_markdown_append", False),
         )
 
     @classmethod
@@ -119,7 +123,7 @@ class MonitoringConfig:
     cpu_threshold_percent: float = 80.0
     memory_threshold_percent: float = 85.0
     io_threshold_percent: float = 90.0
-    enable_ebpf: bool = True
+    enable_ebpf: bool = False
     profile_duration_seconds: float = 10.0
 
 
@@ -216,6 +220,7 @@ class SysPilotConfig:
             "llm": {
                 "provider": self.llm.provider.value,
                 "model": self.llm.model,
+                "metric_extraction_model": self.llm.metric_extraction_model,
                 "base_url": self.llm.base_url,
                 "openai_auth_file": self.llm.openai_auth_file,
                 "temperature": self.llm.temperature,
@@ -224,6 +229,7 @@ class SysPilotConfig:
                 "max_retries": self.llm.max_retries,
                 "debug_conversation": self.llm.debug_conversation,
                 "debug_markdown_file": self.llm.debug_markdown_file,
+                "debug_markdown_append": self.llm.debug_markdown_append,
             },
             "monitoring": {
                 "interval_seconds": self.monitoring.interval_seconds,

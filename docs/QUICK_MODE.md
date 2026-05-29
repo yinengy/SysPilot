@@ -44,7 +44,7 @@ The current quick-mode configuration surface is:
 | `--quick-max-total-short-runs` | Global short-screen run budget | `12` |
 | `--quick-max-total-full-runs` | Global promoted full-validation budget | `6` |
 
-Quick mode also accepts the top-level tune flags `--max-iterations N`, `--fixed-budget N`, and `--fixed-goal VALUE`. Unlike the `--quick-*` knobs above, `--max-iterations` and fixed budget are shared candidate-attempt caps for standard spawn tuning and quick mode. Fixed goal stops once the best validated optimization target reaches the requested value, or reports the current best when the `--max-iterations` candidate-trial cap is exhausted first. Quick mode requires profiled signal sampling, so `--no-profile` is rejected when combined with `--quick-mode`.
+Quick mode also accepts the top-level tune flags `--max-iterations N`, `--fixed-budget N`, and `--fixed-goal VALUE`. Unlike the `--quick-*` knobs above, `--max-iterations` and fixed budget are candidate-attempt caps shared by standard spawn tuning and quick mode, but fixed budget is authoritative: when `--fixed-budget` is set, `--max-iterations` and its default are ignored. Fixed goal stops once the best validated optimization target reaches the requested value, or reports the current best when the active candidate-trial cap is exhausted first. Quick mode requires profiled signal sampling, so `--no-profile` is rejected when combined with `--quick-mode`.
 
 In quick mode, fixed budget counts concrete candidate attempts after they are materialized:
 
@@ -175,7 +175,7 @@ Promotions are constrained by both:
 - per-window-group cap: `--quick-max-full-runs-per-group`
 - global cap: `--quick-max-total-full-runs`
 
-If `--fixed-budget` is also set, both promoted full validations and short screens still spend from that shared top-level candidate-attempt cap. The quick-mode `--quick-max-total-short-runs` and `--quick-max-total-full-runs` knobs remain separate internal limits. In other words, fixed budget answers "how many candidate attempts can this tune run spend overall", while the quick-mode knobs answer "how many short screens or promoted full runs may quick mode schedule inside that total".
+If `--fixed-budget` is also set, both promoted full validations and short screens still spend from that authoritative top-level candidate-attempt cap, and `--max-iterations` does not further limit the run. The quick-mode `--quick-max-total-short-runs` and `--quick-max-total-full-runs` knobs remain separate internal limits. In other words, fixed budget answers "how many candidate attempts can this tune run spend overall", while the quick-mode knobs answer "how many short screens or promoted full runs may quick mode schedule inside that total".
 
 Promoted candidates are rerun as full validations. Those runs are where quick mode returns to end-to-end optimization semantics:
 

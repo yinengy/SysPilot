@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 from syspilot.core.agent import SysPilotAgent
 from syspilot.core.config import SysPilotConfig
-from syspilot.core.llm import LLMResponse
+from syspilot.core.llm import LLMResponse, Message
 
 
 @pytest.mark.asyncio
@@ -72,7 +73,7 @@ async def test_step_stateless_does_not_resend_previous_prompts(monkeypatch: pyte
 
     async def _fake_chat(*args: object, **kwargs: object) -> LLMResponse:
         _ = args
-        messages = kwargs["messages"]
+        messages = cast(list[Message], kwargs["messages"])
         captured.append([msg.content for msg in messages])
         return LLMResponse(content='{"summary":"ok","actions":[]}')
 
@@ -84,3 +85,43 @@ async def test_step_stateless_does_not_resend_previous_prompts(monkeypatch: pyte
     assert any("large previous tune prompt" in content for content in captured[0])
     assert any("small current tune prompt" in content for content in captured[1])
     assert not any("large previous tune prompt" in content for content in captured[1])
+
+
+def test_configure_tuning_prompt_omits_inactive_mode_terms() -> None:
+    agent = SysPilotAgent(SysPilotConfig())
+    agent.context.loaded_manuals["app"] = "SPECIFIC_TUNABLE_FLAG=only-this"
+    agent.configure_tuning_prompt(manual_enabled=True)
+
+    prompt = agent._message_history[0].content
+
+    assert "Manual mode context" in prompt
+    assert "SPECIFIC_TUNABLE_FLAG" not in prompt
+    assert "LPCL" not in prompt
+    assert "virtual_probe" not in prompt
+    assert "Quick-mode context" not in prompt
+
+
+def test_configure_tuning_prompt_adds_contract_context_terms() -> None:
+    agent = SysPilotAgent(SysPilotConfig())
+    agent.configure_tuning_prompt(contract_enabled=True)
+
+    prompt = agent._message_history[0].content
+
+    assert "Contract mode context" in prompt
+    assert "A contract is structured LPCL library/runtime tuning knowledge" in prompt
+    assert "A hypothesis is a contract-derived explanation" in prompt
+    assert "A signal is a named measurable observation" in prompt
+    assert "A virtual_probe is the contract's abstract name" in prompt
+    assert "Manual mode context" not in prompt
+
+
+def test_configure_tuning_prompt_adds_quick_window_terms() -> None:
+    agent = SysPilotAgent(SysPilotConfig())
+    agent.configure_tuning_prompt(contract_enabled=True, quick_mode=True, profiling_enabled=False)
+
+    prompt = agent._message_history[0].content
+
+    assert "Quick-mode context" in prompt
+    assert "A window is a bounded time interval" in prompt
+    assert "No-profile context" in prompt
+    assert "Contract mode context" in prompt

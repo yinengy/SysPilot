@@ -374,6 +374,15 @@ def _render_spawn_manual_hints(manuals: Sequence[str]) -> str:
     return "\n".join(f"- {manual}" for manual in manuals)
 
 
+def _render_loaded_manual_context(loaded_manuals: dict[str, str]) -> str:
+    if not loaded_manuals:
+        return ""
+    parts: list[str] = []
+    for manual_name, manual_content in loaded_manuals.items():
+        parts.append(f"### Manual: {manual_name}\n{manual_content.strip()}")
+    return "\n\n".join(parts)
+
+
 _SHORT_RUN_WRAPPER_FOOTER_PREFIXES = (
     "[kafka-runner] Timing summary:",
     "RUN_LABEL=",
@@ -1571,6 +1580,7 @@ def _build_quick_recommendation_prompt(
     max_iterations: int,
     baseline_profiling_json: dict[str, Any],
     contract_content: str,
+    loaded_manual_content: str,
     manual_hint_content: str,
     fixed_budget_remaining: int | None,
     successful_prior_configs: Sequence[str],
@@ -1630,8 +1640,11 @@ def _build_quick_recommendation_prompt(
 ## Baseline Profiling JSON
 {profiling_json_for_prompt(baseline_profiling_json)}
 
-## Loaded Contract Context
+## Loaded Contract YAML
 {contract_content if contract_content else "(No contract context provided)"}
+
+## Loaded Manual Context
+{loaded_manual_content if loaded_manual_content else "(No manual content loaded)"}
 
 ## Application Manual Hints
 {manual_hint_content if manual_hint_content else "(No application manual hints provided)"}
@@ -1874,6 +1887,15 @@ async def run_quick_tune_loop_async(
     tune_started_at = time.time()
     baseline_config_find_wall_time_s = 0.0
     result_find_wall_times: dict[str, float] = {}
+    configure_prompt = getattr(agent, "configure_tuning_prompt", None)
+    if callable(configure_prompt):
+        agent_context = getattr(agent, "context", None)
+        configure_prompt(
+            contract_enabled=bool(structured_context_bundle),
+            manual_enabled=bool(getattr(agent_context, "loaded_manuals", {}) or manual_hints),
+            quick_mode=True,
+            profiling_enabled=True,
+        )
 
     def _elapsed_payload(config_find_wall_time_s: float) -> dict[str, float]:
         return {
@@ -2256,6 +2278,8 @@ async def run_quick_tune_loop_async(
     fixed_goal_stop_reason = ""
 
     def _max_iteration_trials_remaining() -> int:
+        if fixed_budget_state.enabled:
+            return fixed_budget_state.remaining or 0
         return max(0, max_iterations - max_iteration_trials_used)
 
     def _select_best_validated_result(
@@ -2301,6 +2325,9 @@ async def run_quick_tune_loop_async(
         if fixed_goal is not None and _fixed_goal_is_reached(None):
             fixed_goal_stop_reason = "fixed_goal_reached"
             break
+        if fixed_budget_state.enabled and not fixed_budget_state.can_consume():
+            fixed_budget_exhausted = True
+            break
         if _max_iteration_trials_remaining() == 0:
             max_iterations_exhausted = True
             if fixed_goal is not None:
@@ -2311,9 +2338,6 @@ async def run_quick_tune_loop_async(
             or full_budget_used >= resolved_defaults.max_total_full_runs
         ):
             budget_exhausted = True
-            break
-        if fixed_budget_state.enabled and not fixed_budget_state.can_consume():
-            fixed_budget_exhausted = True
             break
         checked_window_ids.append(window.window_id)
         target_spec = signal_spec_map[window.signal_ref]
@@ -2341,6 +2365,7 @@ async def run_quick_tune_loop_async(
             else ""
         )
         manual_hint_content = _render_spawn_manual_hints(manual_hints)
+        loaded_manual_content = _render_loaded_manual_context(agent.context.loaded_manuals)
         excluded_config_content = _render_excluded_config_names(excluded_config_list)
         group_short_results: list[QuickShortResult] = []
         skipped_rejected_candidates: list[str] = []
@@ -2363,6 +2388,7 @@ async def run_quick_tune_loop_async(
                     dict[str, Any], baseline_artifact.get("profiling_json", {})
                 ),
                 contract_content=contract_content,
+                loaded_manual_content=loaded_manual_content,
                 manual_hint_content=manual_hint_content,
                 fixed_budget_remaining=fixed_budget_state.remaining,
                 successful_prior_configs=_successful_prior_config_summaries(
@@ -2527,6 +2553,9 @@ async def run_quick_tune_loop_async(
             for plan in candidate_plans:
                 if short_budget_used >= resolved_defaults.max_total_short_runs:
                     budget_exhausted = True
+                    break
+                if fixed_budget_state.enabled and not fixed_budget_state.can_consume():
+                    fixed_budget_exhausted = True
                     break
                 if _max_iteration_trials_remaining() == 0:
                     max_iterations_exhausted = True
