@@ -4,6 +4,8 @@ import json
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+import yaml
+
 
 PROMPT_JSON_LIMIT_MARKER = "__syspilot_prompt_note__"
 DEFAULT_PROMPT_JSON_CHAR_LIMIT = 80_000
@@ -27,6 +29,12 @@ _PROFILING_DROP_KEYS = {
     "stderr",
     "stdout",
     "summary",
+}
+
+_HYPOTHESIS_YAML_DROP_KEYS = {
+    "evidence",
+    "source_artifacts",
+    "source_refs",
 }
 
 
@@ -287,6 +295,49 @@ def contract_context_json_for_prompt(bundle: Mapping[str, Any] | None) -> str:
         label="contract context",
         compacted_value=compact_contract_context_for_prompt(bundle),
     )
+
+
+def _yaml_safe_prompt_value(value: Any, *, drop_keys: set[str]) -> Any:
+    if isinstance(value, Mapping):
+        rendered: dict[str, Any] = {}
+        for raw_key, raw_item in value.items():
+            key = str(raw_key)
+            if key in drop_keys:
+                continue
+            item = _yaml_safe_prompt_value(raw_item, drop_keys=drop_keys)
+            if item not in (None, "", [], {}):
+                rendered[key] = item
+        return rendered
+
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return [_yaml_safe_prompt_value(item, drop_keys=drop_keys) for item in value]
+
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def hypothesis_profiles_yaml_for_prompt(profiles: Sequence[Mapping[str, Any]] | None) -> str:
+    if not profiles:
+        return ""
+    rendered_profiles = [
+        _yaml_safe_prompt_value(profile, drop_keys=_HYPOTHESIS_YAML_DROP_KEYS)
+        for profile in profiles
+    ]
+    rendered_profiles = [profile for profile in rendered_profiles if profile not in (None, "", [], {})]
+    if not rendered_profiles:
+        return ""
+    return yaml.safe_dump(
+        {"hypotheses": rendered_profiles},
+        sort_keys=False,
+        allow_unicode=True,
+        default_flow_style=False,
+        width=10_000,
+    )
+
+
+def hypothesis_profiles_json_for_prompt(profiles: Sequence[Mapping[str, Any]] | None) -> str:
+    return hypothesis_profiles_yaml_for_prompt(profiles)
 
 
 def profiling_json_for_prompt(value: Any) -> str:

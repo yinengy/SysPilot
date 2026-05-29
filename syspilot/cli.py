@@ -41,7 +41,7 @@ from syspilot.fixed_goal import fixed_goal_payload, fixed_goal_reached
 from syspilot.profiling import ProfilingManager
 from syspilot.prompt_budget import (
     CONTRACT_YAML_CONTEXT_KEY,
-    contract_context_json_for_prompt,
+    hypothesis_profiles_yaml_for_prompt,
     profiling_json_for_prompt,
     truncate_prompt_text,
 )
@@ -70,11 +70,15 @@ console = Console()
 logger = logging.getLogger(__name__)
 DEFAULT_QUICK_MODE_DEFAULTS = QuickModeDefaults()
 
-METRIC_EXTRACTION_SYSTEM_PROMPT = """You extract numeric workload performance metrics from program output.
-Return exactly one flat JSON object and no explanation.
-Include only measured performance outcomes: throughput/rate, latency percentiles, runtime/duration, or bandwidth.
-Exclude configuration and static metadata such as thread counts, batch sizes, token counts, topology, hardware details, model size, or parameter counts.
-If no measured performance metrics are present, return {"no_metrics": true}."""
+METRIC_EXTRACTION_SYSTEM_PROMPT = (
+    "You extract numeric workload performance metrics from program output.\n"
+    "Return exactly one flat JSON object and no explanation.\n"
+    "Include only measured performance outcomes: throughput/rate, latency percentiles, "
+    "runtime/duration, or bandwidth.\n"
+    "Exclude configuration and static metadata such as thread counts, batch sizes, token "
+    "counts, topology, hardware details, model size, or parameter counts.\n"
+    'If no measured performance metrics are present, return {"no_metrics": true}.'
+)
 
 
 def _enable_llm_debug_options(
@@ -284,7 +288,7 @@ def _register_tuning_tools(agent: SysPilotAgent, tuner: ApplicationTuner) -> Non
         func=apply_tuning,
         description=(
             "Apply tuning actions to a process. Each action must specify config_type "
-            "(sysctl|prlimit|command|env_var|numactl), parameter, current_value, new_value, reason."
+            "(sysctl|prlimit|command|env_var), parameter, current_value, new_value, reason."
         ),
         parameters={
             "type": "object",
@@ -297,7 +301,7 @@ def _register_tuning_tools(agent: SysPilotAgent, tuner: ApplicationTuner) -> Non
                         "properties": {
                             "config_type": {
                                 "type": "string",
-                                "enum": ["sysctl", "prlimit", "command", "env_var", "numactl"],
+                                "enum": ["sysctl", "prlimit", "command", "env_var"],
                             },
                             "parameter": {"type": "string"},
                             "current_value": {},
@@ -2413,6 +2417,12 @@ def _build_contract_hypothesis_validation_script(
         "probe_results = profiling.get('virtual_probe_results', {}) if isinstance(\n"
         "    profiling, dict\n"
         ") else {}\n"
+        "if isinstance(probe_results, list):\n"
+        "    simplified_probe_results = {}\n"
+        "    for item in probe_results:\n"
+        "        if isinstance(item, dict):\n"
+        "            simplified_probe_results.update(item)\n"
+        "    probe_results = simplified_probe_results\n"
         "cpu_collector = collect_profile_data.get('cpu', {}) if isinstance(\n"
         "    collect_profile_data, dict\n"
         ") else {}\n"
@@ -2464,6 +2474,11 @@ def _build_contract_hypothesis_validation_script(
         "    probe_result = probe_results.get(virtual_probe, {}) if isinstance(\n"
         "        probe_results, dict\n"
         "    ) else {}\n"
+        "    if probe_result is not None and not isinstance(probe_result, dict):\n"
+        "        result['observed'] = True\n"
+        "        result['source'] = 'virtual_probe_results'\n"
+        "        result['value'] = probe_result\n"
+        "        return result\n"
         "    if isinstance(probe_result, dict) and probe_result:\n"
         "        result['observed'] = bool(probe_result.get('observed', False))\n"
         "        result['source'] = str(probe_result.get('source', 'toolbox_script'))\n"
@@ -2917,7 +2932,7 @@ def _candidate_actions_without_unsupported_options(
     for option_name in unsupported_options:
         for idx, action in enumerate(updated_actions):
             config_type = str(action.get("config_type", "")).strip().lower()
-            if config_type not in {"command", "command_prefix", "numactl"}:
+            if config_type not in {"command", "command_prefix"}:
                 continue
             tokens = _to_token_list(action.get("new_value"))
             if not tokens or option_name not in tokens:
@@ -2947,7 +2962,7 @@ def _candidate_actions_without_unsupported_options(
             if not removed:
                 continue
             removed_options.append(option_name)
-            if not new_tokens or (config_type == "numactl" and new_tokens == ["numactl"]):
+            if not new_tokens:
                 updated_actions.pop(idx)
             else:
                 action["new_value"] = new_tokens
@@ -3181,6 +3196,10 @@ def _validate_spawn_command_rewrite(
         return ["command rewrite validation received an empty command"]
 
     issues: list[str] = []
+    _, base_positionals = _parse_cli_command_signature(base_command)
+    _, candidate_positionals = _parse_cli_command_signature(candidate_command)
+    if candidate_positionals != base_positionals:
+        issues.append("must keep positional arguments unchanged for fair benchmark comparison")
     issues.extend(_validate_wrapper_command_options(base_command, candidate_command))
 
     executable_name = Path(base_command[0]).name
@@ -3235,7 +3254,7 @@ def _parse_spawn_actions(response: str) -> dict[str, Any]:
             "skipped_actions": [],
         }
 
-    supported_types = {"numactl", "env_var", "command_prefix", "command"}
+    supported_types = {"env_var", "command_prefix", "command"}
     normalized_actions: list[dict[str, Any]] = []
     skipped_actions: list[str] = []
 
@@ -3309,16 +3328,12 @@ def _format_spawn_action_preview(action: dict[str, Any]) -> str:
         return value
 
     tokens = _to_token_list(new_value)
-    if config_type == "numactl" and tokens and tokens[0] == "numactl":
-        tokens = tokens[1:]
     token_display = " ".join(tokens)
     fallback = "" if new_value is None else str(new_value).strip()
     value_display = token_display or fallback
 
     if config_type == "command":
         return value_display
-    if config_type == "numactl":
-        return f"numactl {value_display}".strip()
     if config_type == "command_prefix":
         return f"prefix {value_display}".strip()
     if parameter and value_display:
@@ -3418,6 +3433,56 @@ def _excluded_command_option_changes(
     return changed
 
 
+def _replace_command_option_delta(
+    base_command: list[str],
+    option_name: str,
+    replacement_tokens: list[str],
+) -> list[str]:
+    idx = 1
+    while idx < len(base_command):
+        token = base_command[idx]
+        if token == option_name or token.startswith(f"{option_name}="):
+            end_idx = idx + 1
+            if (
+                token == option_name
+                and end_idx < len(base_command)
+                and (
+                    not _is_option_token(base_command[end_idx])
+                    or _looks_like_numeric_token(base_command[end_idx])
+                )
+            ):
+                end_idx += 1
+            return [*base_command[:idx], *replacement_tokens, *base_command[end_idx:]]
+        idx += 1
+    return [*base_command, *replacement_tokens]
+
+
+def _apply_command_delta(
+    base_command: list[str],
+    parameter: str,
+    value_tokens: list[str],
+) -> list[str]:
+    if not value_tokens:
+        return []
+    if parameter and _is_option_token(parameter):
+        replacement_tokens = (
+            value_tokens
+            if value_tokens[0] == parameter or value_tokens[0].startswith(f"{parameter}=")
+            else [parameter, *value_tokens]
+        )
+        return _replace_command_option_delta(base_command, parameter, replacement_tokens)
+    if not parameter and _is_option_token(value_tokens[0]):
+        option_name = value_tokens[0].split("=", 1)[0]
+        return _replace_command_option_delta(base_command, option_name, value_tokens)
+    if parameter:
+        try:
+            token_index = base_command.index(parameter, 1)
+        except ValueError:
+            return [*base_command, *value_tokens]
+        return [*base_command[:token_index], *value_tokens, *base_command[token_index + 1 :]]
+    return [*base_command, *value_tokens]
+
+
 def _build_spawn_execution_plan(
     base_command: list[str],
     actions: list[dict[str, Any]],
@@ -3464,6 +3529,16 @@ def _build_spawn_execution_plan(
             if command_replaced:
                 skipped.append(f"action[{idx}] additional command rewrite skipped")
                 continue
+
+            candidate_executable_tokens, _ = _extract_inline_env_assignments(tokens)
+            if (
+                not candidate_executable_tokens
+                or Path(candidate_executable_tokens[0]).name != Path(base_command[0]).name
+            ):
+                tokens = _apply_command_delta(base_command, parameter, tokens)
+                if not tokens:
+                    skipped.append(f"action[{idx}] command delta produced no executable tokens")
+                    continue
 
             normalized_tokens, inline_env_overrides = _extract_inline_env_assignments(tokens)
             if not normalized_tokens:
@@ -3512,23 +3587,6 @@ def _build_spawn_execution_plan(
             applied.append(f"command {' '.join(normalized_tokens)}")
             continue
 
-        if config_type == "numactl":
-            if tokens[0] == "numactl":
-                tokens = tokens[1:]
-            if not tokens:
-                skipped.append(f"action[{idx}] numactl flags were empty")
-                continue
-            excluded_options = _excluded_option_tokens_in_tokens(tokens, excluded_controls)
-            if excluded_options:
-                skipped.append(
-                    f"action[{idx}] numactl changes excluded config(s): "
-                    f"{', '.join(excluded_options)}"
-                )
-                continue
-            prefix_tokens.extend(["numactl", *tokens])
-            applied.append(f"numactl {' '.join(tokens)}")
-            continue
-
         if config_type == "command_prefix":
             excluded_env_changes = _excluded_env_assignments_in_tokens(tokens, excluded_controls)
             excluded_options = _excluded_option_tokens_in_tokens(tokens, excluded_controls)
@@ -3568,7 +3626,7 @@ def _build_spawn_candidates(
     if max_candidates < 1:
         return []
 
-    alternative_action_types = {"command", "command_prefix", "numactl"}
+    alternative_action_types = {"command", "command_prefix"}
     shared_actions: list[dict[str, Any]] = []
     alternative_actions: list[dict[str, Any]] = []
 
@@ -3634,7 +3692,7 @@ def _materialize_spawn_candidate_attempts(
     if max_attempts < 1:
         return []
 
-    alternative_action_types = {"command", "command_prefix", "numactl"}
+    alternative_action_types = {"command", "command_prefix"}
     shared_actions: list[dict[str, Any]] = []
     alternative_actions: list[dict[str, Any]] = []
 
@@ -4349,6 +4407,10 @@ async def _run_spawn_tune_loop_async(
     manual_hint_list = list(manual_hints)
     excluded_config_list = list(excluded_config_names or [])
     loaded_manual_names = sorted(agent.context.loaded_manuals.keys())
+    manual_context_status = (
+        f"Manual context: {len(loaded_manual_names)} loaded, "
+        f"{len(manual_hint_list)} hints provided"
+    )
 
     _emit_tune_event(
         event_emitter,
@@ -4391,15 +4453,10 @@ async def _run_spawn_tune_loop_async(
         f"Candidate Trial Limit: {candidate_trial_limit_display}\n"
         f"Timeout: {timeout}s\n"
         f"Contracts: {len(loaded_contract_names)} loaded\n"
-        f"Manual hints: {len(manual_hint_list)} provided",
+        f"{manual_context_status}",
         title="Starting",
     )
 
-    contract_content = (
-        contract_context_json_for_prompt(structured_context_bundle)
-        if structured_context_bundle
-        else ""
-    )
     manual_hint_content = _render_spawn_manual_hints(manual_hint_list)
     loaded_manual_content = _render_loaded_manual_context(agent.context.loaded_manuals)
     excluded_config_content = _render_excluded_config_names(excluded_config_list)
@@ -4423,6 +4480,7 @@ async def _run_spawn_tune_loop_async(
     startup_hypothesis_profiles = [
         item for item in (initial_hypothesis_profiles or []) if isinstance(item, dict)
     ]
+    generated_hypothesis_content = hypothesis_profiles_yaml_for_prompt(startup_hypothesis_profiles)
 
     evidence_kind = "profiled" if profiling_enabled else "raw-output"
     run_count_label = "profiled run(s)" if profiling_enabled else "raw-output run(s)"
@@ -4748,10 +4806,11 @@ async def _run_spawn_tune_loop_async(
     seen_trials: set[tuple[tuple[str, ...], tuple[tuple[str, str], ...]]] = {
         _command_key(current_command_parts, current_env_overrides)
     }
-    iteration_summaries: list[str] = []
     fixed_budget_stop_reason = ""
     fixed_goal_stop_reason = ""
     max_iterations_stop_reason = ""
+    fixed_goal_no_action_reprompts_used = 0
+    fixed_goal_max_no_action_reprompts = max(0, min(3, max_iterations))
     stagnation_iterations = 0
     convergence_patience = 2
     min_improvement_pct = 1.0
@@ -4760,7 +4819,7 @@ async def _run_spawn_tune_loop_async(
     total_candidate_trials_executed = 0
     total_profiled_runs = 1
     candidate_outcomes: list[dict[str, Any]] = []
-    previous_round_findings: list[str] = []
+    previous_round_findings: list[object] = []
     attempted_control_names: set[str] = set()
 
     def _compact_history_text(value: object, max_chars: int = 420) -> str:
@@ -4809,38 +4868,197 @@ async def _run_spawn_tune_loop_async(
             return _compact_history_text("; ".join(findings), 500)
         return profiling_text
 
-    def _append_previous_round_finding(text: str) -> None:
-        finding = str(text).strip()
+    def _append_previous_round_finding(finding: object) -> None:
+        if isinstance(finding, str):
+            finding = finding.strip()
         if not finding:
             return
         previous_round_findings.append(finding)
 
-    def _candidate_outcomes_history_text(outcomes: Sequence[dict[str, Any]]) -> str:
-        parts: list[str] = []
-        for outcome in list(outcomes)[-4:]:
-            label = outcome.get("label", "candidate")
-            verdict = outcome.get("verdict", "unknown")
-            reason = outcome.get("reason", "")
-            wall_time = outcome.get("wall_time_s")
-            piece = f"{label}: {verdict}"
-            if wall_time is not None:
-                piece += f" wall={wall_time}s"
-            if reason:
-                piece += f" ({reason})"
-            profile_summary = outcome.get("profile_summary")
-            if profile_summary:
-                piece += f" profile={profile_summary}"
-            parts.append(_compact_history_text(piece, 260))
-        return "; ".join(parts)
+    def _action_history_entries(actions: Sequence[dict[str, Any]]) -> list[dict[str, object]]:
+        entries: list[dict[str, object]] = []
+        for idx, action in enumerate(actions, start=1):
+            preview = _format_spawn_action_preview(action).strip()
+            if not preview:
+                continue
+            entry: dict[str, object] = {
+                "action_index": idx,
+                "action": preview,
+                "config_type": str(action.get("config_type", "")),
+            }
+            parameter = action.get("parameter")
+            if isinstance(parameter, str) and parameter.strip():
+                entry["parameter"] = parameter.strip()
+            reason = action.get("reason")
+            if isinstance(reason, str) and reason.strip():
+                entry["reason"] = _compact_history_text(reason, 360)
+            entries.append(entry)
+        return entries
 
-    def _previous_round_findings_text() -> str:
-        if not previous_round_findings:
-            return "(none)"
-        return "\n".join(f"- {item}" for item in previous_round_findings)
+    def _candidate_outcome_prompt_entry(outcome: dict[str, Any]) -> dict[str, object]:
+        entry: dict[str, object] = {
+            "candidate": str(outcome.get("label", "candidate")),
+            "verdict": str(outcome.get("verdict", "unknown")),
+        }
+        wall_time = outcome.get("wall_time_s")
+        if wall_time is not None:
+            entry["wall_time_s"] = wall_time
+        reason = outcome.get("reason")
+        if reason:
+            entry["reason"] = _compact_history_text(reason, 260)
+        profile_summary = outcome.get("profile_summary")
+        if profile_summary:
+            entry["profile"] = _compact_history_text(profile_summary, 500)
+        actions = outcome.get("actions")
+        if isinstance(actions, list) and actions:
+            entry["materialized_actions"] = [str(item) for item in actions]
+        return entry
+
+    def _round_history_entry(
+        *,
+        round_index: int,
+        recommendation_summary: str,
+        llm_response: str,
+        recommended_actions: Sequence[dict[str, Any]],
+        recommendation_evidence: Sequence[str],
+        candidate_outcomes_for_round: Sequence[dict[str, Any]],
+        result: str,
+        current_profile_artifacts: dict[str, Any],
+        current_changes: str | None = None,
+        current_wall_time_s: float | None = None,
+    ) -> dict[str, object]:
+        action_entries = _action_history_entries(recommended_actions)
+        all_candidate_results = [
+            _candidate_outcome_prompt_entry(outcome)
+            for outcome in candidate_outcomes_for_round
+        ]
+
+        for action_entry in action_entries:
+            action_preview = action_entry.get("action")
+            if not isinstance(action_preview, str):
+                continue
+            matching_results = [
+                _candidate_outcome_prompt_entry(outcome)
+                for outcome in candidate_outcomes_for_round
+                if action_preview in [str(item) for item in outcome.get("actions", [])]
+            ]
+            if matching_results:
+                action_entry["candidate_results"] = matching_results
+
+        entry: dict[str, object] = {
+            "round": round_index,
+            "recommendation": recommendation_summary or "unavailable",
+            "llm_response": llm_response or "unavailable",
+            "evidence": list(recommendation_evidence) or ["none"],
+            "recommended_actions": action_entries or [{"action": "none"}],
+            "candidate_results": all_candidate_results or [],
+            "result": result,
+            "current_profile": _profile_history_text(current_profile_artifacts),
+        }
+        if current_changes is not None:
+            entry["current_changes"] = current_changes
+        if current_wall_time_s is not None:
+            entry["current_wall_time_s"] = round(current_wall_time_s, 6)
+        return entry
+
+    def _command_main_tokens(command_parts: Sequence[str]) -> tuple[list[str], list[str], dict[str, str]]:
+        normalized_command, inline_env = _extract_inline_env_assignments(list(command_parts))
+        base_executable = Path(cmd_parts[0]).name if cmd_parts else ""
+        if not normalized_command or not base_executable:
+            return [], normalized_command, inline_env
+        if Path(normalized_command[0]).name == base_executable:
+            return [], normalized_command, inline_env
+        for idx, token in enumerate(normalized_command[1:], start=1):
+            if Path(token).name == base_executable:
+                return normalized_command[:idx], normalized_command[idx:], inline_env
+        return [], normalized_command, inline_env
+
+    def _display_option_values(values: list[str] | None) -> str:
+        if values is None:
+            return "(removed)"
+        if not values:
+            return "true"
+        return ", ".join(value if value else "true" for value in values)
+
+    def _baseline_relative_changes(
+        command_parts: Sequence[str],
+        env_pairs: Sequence[tuple[str, str]],
+    ) -> list[dict[str, str]]:
+        prefix_tokens, main_command, inline_env = _command_main_tokens(command_parts)
+        candidate_env = {str(name): str(value) for name, value in env_pairs}
+        candidate_env.update(inline_env)
+        base_env = {str(name): str(value) for name, value in inline_env_overrides.items()}
+        changes: list[dict[str, str]] = []
+
+        for name in sorted(set(base_env) | set(candidate_env)):
+            if candidate_env.get(name) != base_env.get(name):
+                changes.append({"name": f"env.{name}", "new_value": candidate_env.get(name, "(unset)")})
+
+        if prefix_tokens:
+            changes.append({"name": "command_prefix", "new_value": " ".join(prefix_tokens)})
+
+        base_options, base_positionals = _parse_cli_command_signature(cmd_parts)
+        candidate_options, candidate_positionals = _parse_cli_command_signature(main_command)
+        for name in sorted(set(base_options) | set(candidate_options)):
+            if candidate_options.get(name) != base_options.get(name):
+                changes.append(
+                    {
+                        "name": name,
+                        "new_value": _display_option_values(candidate_options.get(name)),
+                    }
+                )
+
+        if candidate_positionals != base_positionals:
+            changes.append(
+                {"name": "positionals", "new_value": " ".join(candidate_positionals)}
+            )
+
+        return sorted(changes, key=lambda item: item["name"])
+
+    def _tried_config_deltas() -> list[dict[str, Any]]:
+        entries: list[dict[str, Any]] = []
+        for command_tuple, env_tuple in seen_trials:
+            changes = _baseline_relative_changes(command_tuple, env_tuple)
+            if changes:
+                entries.append({"changes": changes})
+        return sorted(
+            entries,
+            key=lambda entry: json.dumps(entry["changes"], sort_keys=True),
+        )[-12:]
+
+    def _prior_findings_and_tried_changes_text() -> str:
+        tried_deltas = _tried_config_deltas()
+        tried_text = (
+            json.dumps(tried_deltas, indent=2, sort_keys=True)
+            if tried_deltas
+            else "(baseline only; no changed candidate values tried yet)"
+        )
+        findings_text = (
+            yaml.safe_dump(previous_round_findings, sort_keys=False, allow_unicode=True, width=10_000)
+            if previous_round_findings
+            else "(none)"
+        )
+        return (
+            "### Tried baseline-relative changes\n"
+            f"{tried_text}\n\n"
+            "### Findings by round\n"
+            f"{findings_text}"
+        )
+
+    def _current_changes_history_text() -> str:
+        changes = _baseline_relative_changes(current_command_parts, tuple(current_env_overrides.items()))
+        if not changes:
+            return "baseline"
+        return json.dumps(changes, sort_keys=True)
 
     _append_previous_round_finding(
-        f"baseline: cmd={' '.join(current_command_parts)} status={baseline_status} "
-        f"wall={current_time:.2f}s profile={_profile_history_text(current_profile_artifacts)}"
+        {
+            "round": 0,
+            "result": "baseline",
+            "status": baseline_status,
+            "wall_time_s": round(current_time, 6),
+            "profile": _profile_history_text(current_profile_artifacts),
+        }
     )
 
     def _current_fixed_goal_value() -> float | None:
@@ -4868,6 +5086,40 @@ async def _run_spawn_tune_loop_async(
             return cast(int, fixed_budget_state.remaining)
         return max(0, max_iterations - total_candidate_trials_executed)
 
+    def _fixed_goal_search_active() -> bool:
+        return (
+            fixed_goal is not None
+            and not _fixed_goal_is_reached()
+            and _candidate_trials_remaining() > 0
+        )
+
+    def _bounded_search_active() -> bool:
+        return fixed_budget_state.enabled or _fixed_goal_search_active()
+
+    def _reprompt_scope() -> str:
+        return "fixed budget" if fixed_budget_state.enabled else "fixed goal"
+
+    def _no_action_reprompts_used() -> int:
+        if fixed_budget_state.enabled:
+            return fixed_budget_state.no_action_reprompts_used
+        return fixed_goal_no_action_reprompts_used
+
+    def _max_no_action_reprompts() -> int:
+        if fixed_budget_state.enabled:
+            return fixed_budget_state.max_no_action_reprompts
+        return fixed_goal_max_no_action_reprompts
+
+    def _record_no_action_reprompt(stall_reprompts_used: int) -> bool:
+        nonlocal fixed_goal_no_action_reprompts_used
+        if fixed_budget_state.enabled:
+            return fixed_budget_state.record_no_action_reprompt(stall_reprompts_used)
+        if not _fixed_goal_search_active():
+            return False
+        if stall_reprompts_used >= fixed_goal_max_no_action_reprompts:
+            return False
+        fixed_goal_no_action_reprompts_used += 1
+        return True
+
     def _capture_action_controls(actions: Sequence[dict[str, Any]]) -> None:
         for action in actions:
             parameter = action.get("parameter")
@@ -4894,12 +5146,19 @@ async def _run_spawn_tune_loop_async(
         *,
         wall_time_s: float | None = None,
         profile_artifacts: dict[str, Any] | None = None,
+        actions: Sequence[dict[str, Any]] | None = None,
     ) -> None:
         entry: dict[str, Any] = {
             "label": label,
             "verdict": verdict,
             "reason": reason,
         }
+        if actions:
+            entry["actions"] = [
+                preview
+                for preview in (_format_spawn_action_preview(action).strip() for action in actions)
+                if preview
+            ]
         if wall_time_s is not None:
             entry["wall_time_s"] = round(wall_time_s, 6)
         if profile_artifacts:
@@ -4942,16 +5201,23 @@ async def _run_spawn_tune_loop_async(
             - attempted_control_names
             - set(excluded_config_list)
         )
+        remaining_budget = (
+            fixed_budget_state.remaining
+            if fixed_budget_state.enabled
+            else _candidate_trials_remaining()
+        )
+        reprompt_heading = "Fixed-Budget" if fixed_budget_state.enabled else "Fixed-Goal"
         return (
             f"{base_prompt}\n\n"
-            "## Fixed-Budget Re-prompt\n"
-            f"Remaining candidate-attempt budget: {fixed_budget_state.remaining}\n"
+            f"## {reprompt_heading} Re-prompt\n"
+            f"Remaining candidate-attempt budget: {remaining_budget}\n"
             f"No-action reason: {reason}\n"
             "No-action re-prompts used for this stall: "
             f"{stall_reprompts_used}/"
-            f"{fixed_budget_state.max_no_action_reprompts}\n\n"
+            f"{_max_no_action_reprompts()}\n\n"
             "## Candidate History\n"
-            f"Tried command forms: {json.dumps(tried_commands, indent=2)}\n"
+            "Tried baseline-relative changes: "
+            f"{json.dumps(_tried_config_deltas(), indent=2, sort_keys=True)}\n"
             f"Evaluated/rejected candidates: {json.dumps(candidate_outcomes[-8:], indent=2)}\n"
             f"Successful configs: {json.dumps(_successful_configs_snapshot(), indent=2)}\n"
             f"Untouched current controls (where known): {json.dumps(untouched_controls)}\n"
@@ -5001,9 +5267,7 @@ async def _run_spawn_tune_loop_async(
             prefix=f"Current {evidence_kind} run",
         )
 
-        history_text = "\n".join(iteration_summaries[-6:]) if iteration_summaries else "(none)"
-        previous_findings_text = _previous_round_findings_text()
-        tried_commands = [list(parts) for parts, _ in list(seen_trials)[-12:]]
+        prior_findings_and_tried_changes_text = _prior_findings_and_tried_changes_text()
         candidate_trials_remaining = _candidate_trials_remaining()
 
         memory_envelope_block = _render_effective_memory_envelope(profiling_json, memory_high)
@@ -5015,12 +5279,13 @@ async def _run_spawn_tune_loop_async(
             "Refined Profiling Evidence" if profiling_enabled else "Raw Runtime Output Evidence"
         )
         evidence_rule = (
-            "- Use only profiling evidence, loaded manual context, loaded contract context, and "
-            "application manual hints."
+            "- Use only profiling evidence, generated contract hypotheses, "
+            "contract validation findings, loaded manual context, and application manual hints."
             if profiling_enabled
             else (
                 "- Profiling is disabled by --no-profile; use raw stdout/stderr, loaded "
-                "manual context, loaded contract context, and application manual hints."
+                "manual context, generated contract hypotheses, contract validation findings, "
+                "and application manual hints."
             )
         )
         profiled_run_rule = (
@@ -5058,17 +5323,14 @@ async def _run_spawn_tune_loop_async(
 ## Current Program Output (excerpt)
 {current_stdout[:2500] if current_stdout else "(no stdout)"}
 
-## Prior Iterations (latest first)
-{history_text}
-
-## Previous Round Findings
-{previous_findings_text}
-
-## Already Tried Command Forms
-{json.dumps(tried_commands)}
+## Previous Round Findings and Tried Changes
+{prior_findings_and_tried_changes_text}
 
 ## {evidence_heading}
 {profiling_json_for_prompt(profiling_json) if profiling_json else profiling_text[:2500]}
+
+## Generated Contract Hypotheses
+{generated_hypothesis_content if generated_hypothesis_content else "(No generated contract hypotheses)"}
 
 ## Contract Hypothesis Validation
 {
@@ -5076,9 +5338,6 @@ async def _run_spawn_tune_loop_async(
     if contract_validation
     else "(No contract-guided validation findings)"
 }
-
-## Loaded Contract YAML
-{contract_content if contract_content else "(No contract context provided)"}
 
 ## Loaded Manual Context
 {loaded_manual_content if loaded_manual_content else "(No manual content loaded)"}
@@ -5088,8 +5347,8 @@ async def _run_spawn_tune_loop_async(
 
 ## Rules
 {evidence_rule}
-- Loaded contract YAML is the canonical contract source; use its controls, signals,
-  recipes, and hypothesis definitions together with runtime validation evidence.
+- Generated contract hypotheses are the contract-derived plan; use their controls,
+  signals, recipes, and hypothesis ids together with runtime validation evidence.
 - Contract hypothesis validation, when present, is runtime-generated structured evidence.
   Prefer it over inferring raw DSL semantics yourself.
 {profiled_run_rule}
@@ -5100,7 +5359,7 @@ async def _run_spawn_tune_loop_async(
 - Recommend only options that are valid for the target executable.
 - If evidence is insufficient, return no actions.
 - Return JSON only (no markdown, no prose).
-- Provide up to {candidate_trials_remaining} candidates ordered best-first.
+- Provide up to 3 candidates ordered best-first.
 
 ## JSON Schema
 {{
@@ -5111,9 +5370,9 @@ async def _run_spawn_tune_loop_async(
   "hypothesis_refs": ["optional hypothesis ids to prioritize next profiling round"],
   "actions": [
     {{
-      "config_type": "numactl | env_var | command_prefix | command",
-      "parameter": "required only for env_var",
-      "new_value": "string or token list; for command use full rewritten command",
+      "config_type": "env_var | command_prefix | command",
+      "parameter": "required for env_var; for command use the option/name being changed when applicable",
+      "new_value": "string or token list; for command include only changed tokens relative to the current command, not the full command",
       "reason": "why this action follows from evidence",
       "manual_citation": "optional manual/contract rule supporting this action"
     }}
@@ -5134,8 +5393,8 @@ async def _run_spawn_tune_loop_async(
         round_candidate_outcome_start = len(candidate_outcomes)
         round_recommendation_summary = ""
         round_recommendation_evidence: list[str] = []
-        round_action_preview = ""
         round_llm_response_text = ""
+        round_recommended_actions: list[dict[str, Any]] = []
 
         while True:
             analysis_unavailable = False
@@ -5191,14 +5450,12 @@ async def _run_spawn_tune_loop_async(
                         "message": recommendation["error"],
                     },
                 )
-                if fixed_budget_state.enabled and fixed_budget_state.record_no_action_reprompt(
-                    no_action_reprompts_this_stall
-                ):
+                if _record_no_action_reprompt(no_action_reprompts_this_stall):
                     no_action_reprompts_this_stall += 1
                     no_action_reason = recommendation["error"]
                     sink.print(
                         "\n[yellow]Agent recommendation was not actionable; re-prompting "
-                        "within fixed budget[/yellow]"
+                        f"within {_reprompt_scope()}[/yellow]"
                     )
                     sink.print(f"  Reason: {no_action_reason}")
                     prompt_text = _build_fixed_budget_no_action_reprompt(
@@ -5218,7 +5475,11 @@ async def _run_spawn_tune_loop_async(
                         "status": (
                             "unfillable_no_action"
                             if fixed_budget_state.enabled
-                            else "no_actionable_recommendation"
+                            else (
+                                "max_iterations_exhausted"
+                                if fixed_goal is not None
+                                else "no_actionable_recommendation"
+                            )
                         ),
                         **(
                             {"fixed_budget": fixed_budget_state.to_payload()}
@@ -5235,11 +5496,19 @@ async def _run_spawn_tune_loop_async(
                         f"{fixed_budget_state.no_action_reprompts_used} re-prompts[/yellow]"
                     )
                     fixed_budget_stop_reason = "unfillable_no_action"
+                elif fixed_goal is not None:
+                    fixed_goal_stop_reason = "max_iterations_exhausted"
                 _append_previous_round_finding(
-                    f"round {iteration}: recommendation=invalid ({recommendation['error']}); "
-                    f"llm_response={round_llm_response_text or 'unavailable'}; "
-                    f"result=no_actionable_recommendation; "
-                    f"current profile={_profile_history_text(current_profile_artifacts)}"
+                    _round_history_entry(
+                        round_index=iteration,
+                        recommendation_summary=f"invalid ({recommendation['error']})",
+                        llm_response=round_llm_response_text,
+                        recommended_actions=[],
+                        recommendation_evidence=[],
+                        candidate_outcomes_for_round=[],
+                        result="no_actionable_recommendation",
+                        current_profile_artifacts=current_profile_artifacts,
+                    )
                 )
                 stop_due_to_no_action = True
                 break
@@ -5253,7 +5522,7 @@ async def _run_spawn_tune_loop_async(
             next_action_display = _recommendation_next_action_display(recommendation["actions"])
             round_recommendation_summary = summary
             round_recommendation_evidence = [str(item) for item in recommendation["evidence"][:5]]
-            round_action_preview = next_action_display
+            round_recommended_actions = [dict(action) for action in recommendation["actions"]]
             recommendation_payload: dict[str, Any] = {
                 "mode": "spawn",
                 "iteration": iteration,
@@ -5293,15 +5562,15 @@ async def _run_spawn_tune_loop_async(
             actions = recommendation["actions"]
             if not actions:
                 if (
-                    fixed_budget_state.enabled
+                    _bounded_search_active()
                     and not analysis_unavailable
-                    and fixed_budget_state.record_no_action_reprompt(no_action_reprompts_this_stall)
+                    and _record_no_action_reprompt(no_action_reprompts_this_stall)
                 ):
                     no_action_reprompts_this_stall += 1
                     no_action_reason = summary
                     sink.print(
                         "\n[yellow]Agent recommended no actionable tuning; re-prompting within "
-                        "fixed budget[/yellow]"
+                        f"{_reprompt_scope()}[/yellow]"
                     )
                     prompt_text = _build_fixed_budget_no_action_reprompt(
                         prompt,
@@ -5320,7 +5589,11 @@ async def _run_spawn_tune_loop_async(
                         "status": (
                             "unfillable_no_action"
                             if fixed_budget_state.enabled and not analysis_unavailable
-                            else "no_actions"
+                            else (
+                                "max_iterations_exhausted"
+                                if fixed_goal is not None and not analysis_unavailable
+                                else "no_actions"
+                            )
                         ),
                         **(
                             {"fixed_budget": fixed_budget_state.to_payload()}
@@ -5336,11 +5609,19 @@ async def _run_spawn_tune_loop_async(
                         f"{fixed_budget_state.no_action_reprompts_used} re-prompts[/yellow]"
                     )
                     fixed_budget_stop_reason = "unfillable_no_action"
+                elif fixed_goal is not None and not analysis_unavailable:
+                    fixed_goal_stop_reason = "max_iterations_exhausted"
                 _append_previous_round_finding(
-                    f"round {iteration}: recommendation={round_recommendation_summary}; "
-                    f"llm_response={round_llm_response_text or 'unavailable'}; "
-                    f"action=no_action; evidence={'; '.join(round_recommendation_evidence) or 'none'}; "
-                    f"result=no_actions; current profile={_profile_history_text(current_profile_artifacts)}"
+                    _round_history_entry(
+                        round_index=iteration,
+                        recommendation_summary=round_recommendation_summary,
+                        llm_response=round_llm_response_text,
+                        recommended_actions=round_recommended_actions,
+                        recommendation_evidence=round_recommendation_evidence,
+                        candidate_outcomes_for_round=[],
+                        result="no_actions",
+                        current_profile_artifacts=current_profile_artifacts,
+                    )
                 )
                 stop_due_to_no_action = True
                 break
@@ -5379,9 +5660,7 @@ async def _run_spawn_tune_loop_async(
                 "\n[yellow]No new executable tuning actions remained after validation[/yellow]"
             )
 
-            if fixed_budget_state.enabled and fixed_budget_state.record_no_action_reprompt(
-                no_action_reprompts_this_stall
-            ):
+            if _record_no_action_reprompt(no_action_reprompts_this_stall):
                 no_action_reprompts_this_stall += 1
                 no_action_reason = "no_new_candidates_after_validation"
                 prompt_text = _build_fixed_budget_no_action_reprompt(
@@ -5405,6 +5684,21 @@ async def _run_spawn_tune_loop_async(
                 )
                 sink.print("  [yellow]Stopped: candidate space exhausted before budget[/yellow]")
                 fixed_budget_stop_reason = "candidate_space_exhausted"
+                stop_due_to_no_action = True
+                break
+
+            if fixed_goal is not None:
+                _emit_tune_event(
+                    event_emitter,
+                    "phase.finished",
+                    {
+                        "mode": "spawn",
+                        "phase": "spawn.iteration",
+                        "iteration": iteration,
+                        "status": "max_iterations_exhausted",
+                    },
+                )
+                fixed_goal_stop_reason = "max_iterations_exhausted"
                 stop_due_to_no_action = True
                 break
 
@@ -5486,6 +5780,7 @@ async def _run_spawn_tune_loop_async(
                     str(trial_label),
                     materialized_status,
                     str(trial_plan.get("materialized_reason", "candidate rejected")),
+                    actions=cast(list[dict[str, Any]], trial_actions),
                 )
                 evaluated_payload: dict[str, object] = {
                     "mode": "spawn",
@@ -5516,6 +5811,7 @@ async def _run_spawn_tune_loop_async(
                     str(trial_label),
                     "duplicate",
                     "candidate duplicated a previously tried command",
+                    actions=cast(list[dict[str, Any]], trial_actions),
                 )
                 evaluated_payload = {
                     "mode": "spawn",
@@ -5679,6 +5975,7 @@ async def _run_spawn_tune_loop_async(
                     f"returncode={trial_rc}",
                     wall_time_s=float(trial_time),
                     profile_artifacts=cast(dict[str, Any], trial_artifacts),
+                    actions=cast(list[dict[str, Any]], trial_actions),
                 )
                 _emit_tune_event(
                     event_emitter,
@@ -5698,7 +5995,8 @@ async def _run_spawn_tune_loop_async(
                 sink.print(f"    [dim]stderr: {trial_stderr[:240]}[/dim]")
                 non_improving_trials += 1
                 if (
-                    not fixed_budget_state.enabled
+                    fixed_goal is None
+                    and not fixed_budget_state.enabled
                     and non_improving_trials >= convergence_patience
                     and successful_trials > 0
                 ):
@@ -5733,6 +6031,7 @@ async def _run_spawn_tune_loop_async(
                         f"missing numeric primary objective {resolved_primary_objective_metric}",
                         wall_time_s=float(trial_time),
                         profile_artifacts=cast(dict[str, Any], trial_artifacts),
+                        actions=cast(list[dict[str, Any]], trial_actions),
                     )
                     _emit_tune_event(
                         event_emitter,
@@ -5757,7 +6056,8 @@ async def _run_spawn_tune_loop_async(
                     )
                     non_improving_trials += 1
                     if (
-                        not fixed_budget_state.enabled
+                        fixed_goal is None
+                        and not fixed_budget_state.enabled
                         and non_improving_trials >= convergence_patience
                         and successful_trials > 0
                     ):
@@ -5798,6 +6098,7 @@ async def _run_spawn_tune_loop_async(
                 ),
                 wall_time_s=float(trial_time),
                 profile_artifacts=cast(dict[str, Any], trial_artifacts),
+                actions=cast(list[dict[str, Any]], trial_actions),
             )
 
             _emit_tune_event(
@@ -5864,7 +6165,8 @@ async def _run_spawn_tune_loop_async(
                 non_improving_trials += 1
 
             if (
-                not fixed_budget_state.enabled
+                fixed_goal is None
+                and not fixed_budget_state.enabled
                 and non_improving_trials >= convergence_patience
                 and successful_trials > 0
             ):
@@ -5884,16 +6186,25 @@ async def _run_spawn_tune_loop_async(
             )
             sink.print("  [yellow]No candidate completed successfully in this iteration[/yellow]")
             _append_previous_round_finding(
-                f"round {iteration}: recommendation={round_recommendation_summary or 'unavailable'}; "
-                f"llm_response={round_llm_response_text or 'unavailable'}; "
-                f"action={round_action_preview or 'none'}; "
-                f"evidence={'; '.join(round_recommendation_evidence) or 'none'}; "
-                f"candidates={_candidate_outcomes_history_text(candidate_outcomes[round_candidate_outcome_start:]) or 'none completed'}; "
-                f"result=no_successful_trials; current profile={_profile_history_text(current_profile_artifacts)}"
+                _round_history_entry(
+                    round_index=iteration,
+                    recommendation_summary=round_recommendation_summary,
+                    llm_response=round_llm_response_text,
+                    recommended_actions=round_recommended_actions,
+                    recommendation_evidence=round_recommendation_evidence,
+                    candidate_outcomes_for_round=candidate_outcomes[round_candidate_outcome_start:],
+                    result="no_successful_trials",
+                    current_profile_artifacts=current_profile_artifacts,
+                )
             )
             if fixed_budget_state.enabled:
                 if fixed_budget_state.remaining == 0:
                     fixed_budget_stop_reason = "fixed_budget_exhausted"
+                    break
+                continue
+            if fixed_goal is not None:
+                if _candidate_trials_remaining() == 0:
+                    fixed_goal_stop_reason = "max_iterations_exhausted"
                     break
                 continue
             stagnation_iterations += 1
@@ -6012,21 +6323,19 @@ async def _run_spawn_tune_loop_async(
                 },
             )
 
-        iteration_summaries.append(
-            f"iter {iteration}: cmd={' '.join(current_command_parts)} "
-            f"{primary_objective + '=' if primary_objective else ''}"
-            f"{_format_metric_value(current_objective_value) if primary_objective else ''} "
-            f"wall={current_time:.2f}s"
-        )
         _append_previous_round_finding(
-            f"round {iteration}: recommendation={round_recommendation_summary or 'unavailable'}; "
-            f"llm_response={round_llm_response_text or 'unavailable'}; "
-            f"action={round_action_preview or 'none'}; "
-            f"evidence={'; '.join(round_recommendation_evidence) or 'none'}; "
-            f"candidates={_candidate_outcomes_history_text(candidate_outcomes[round_candidate_outcome_start:]) or 'none'}; "
-            f"result={'accepted improvement' if iteration_improved else 'no improvement'}; "
-            f"current cmd={' '.join(current_command_parts)} wall={current_time:.2f}s; "
-            f"current profile={_profile_history_text(current_profile_artifacts)}"
+            _round_history_entry(
+                round_index=iteration,
+                recommendation_summary=round_recommendation_summary,
+                llm_response=round_llm_response_text,
+                recommended_actions=round_recommended_actions,
+                recommendation_evidence=round_recommendation_evidence,
+                candidate_outcomes_for_round=candidate_outcomes[round_candidate_outcome_start:],
+                result="accepted improvement" if iteration_improved else "no improvement",
+                current_profile_artifacts=current_profile_artifacts,
+                current_changes=_current_changes_history_text(),
+                current_wall_time_s=current_time,
+            )
         )
 
         if fixed_goal is not None and _fixed_goal_is_reached():
@@ -6081,7 +6390,11 @@ async def _run_spawn_tune_loop_async(
             )
             break
 
-        if not fixed_budget_state.enabled and stagnation_iterations >= convergence_patience:
+        if (
+            fixed_goal is None
+            and not fixed_budget_state.enabled
+            and stagnation_iterations >= convergence_patience
+        ):
             sink.print("  Iterative loop converged after non-improving iterations")
             _emit_tune_event(
                 event_emitter,

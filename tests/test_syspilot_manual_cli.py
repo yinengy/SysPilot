@@ -14,10 +14,10 @@ from syspilot.cli import (
     METRIC_EXTRACTION_SYSTEM_PROMPT,
     _build_spawn_profiling_env,
     _collect_contract_report_env,
-    _extract_metrics_from_output,
     _compute_objective_speedup_ratio,
     _extract_hypothesis_profiles,
     _extract_literal_numeric_metrics,
+    _extract_metrics_from_output,
     _format_objective_speedup,
     _load_default_llm_config,
     _parse_spawn_actions,
@@ -830,11 +830,14 @@ def test_spawn_mode_uses_contract_context_from_contract_option(tmp_path: Path) -
     assert result.exit_code == 0
     assert _DummyAgent.instances
     prompt = _DummyAgent.instances[0].prompts[0]
-    assert "Loaded Contract YAML" in prompt
-    assert "Contract YAML: openmp" in prompt
-    assert "OMP_NUM_THREADS" in prompt
+    assert "Loaded Contract YAML" not in prompt
+    assert "Contract YAML: openmp" not in prompt
+    assert "Generated Contract Hypotheses" in prompt
     assert "evidence:" not in prompt
     assert "OpenMP_doc:chunk_001" not in prompt
+    assert '"config_type": "env_var | command_prefix | command"' in prompt
+    assert "not the full command" in prompt
+    assert '"config_type": "numactl' not in prompt
 
 
 def test_spawn_mode_supports_contracts_and_manual_hints_together(tmp_path: Path) -> None:
@@ -875,9 +878,9 @@ def test_spawn_mode_supports_contracts_and_manual_hints_together(tmp_path: Path)
     assert result.exit_code == 0
     assert _DummyAgent.instances
     prompt = _DummyAgent.instances[0].prompts[0]
-    assert "Loaded Contract YAML" in prompt
-    assert "Contract YAML: openmp" in prompt
-    assert "os.context_switch_rate" in prompt
+    assert "Loaded Contract YAML" not in prompt
+    assert "Contract YAML: openmp" not in prompt
+    assert "Generated Contract Hypotheses" in prompt
     assert "evidence:" not in prompt
     assert "OpenMP_doc:chunk_001" not in prompt
     assert "Application Manual Hints" in prompt
@@ -907,7 +910,9 @@ def test_spawn_mode_prompt_includes_cumulative_previous_round_findings() -> None
                     '"parameter":"OMP_PROC_BIND","new_value":"close",'
                     '"reason":"improve locality","manual_citation":""}]}'
                 )
-            return _DummyResponse('{"summary":"none","manual_citation":"","evidence":[],"actions":[]}')
+            return _DummyResponse(
+                '{"summary":"none","manual_citation":"","evidence":[],"actions":[]}'
+            )
 
     async def _profiled_runs(*args: object, **kwargs: object) -> dict[str, object]:
         _ = args
@@ -974,15 +979,33 @@ def test_spawn_mode_prompt_includes_cumulative_previous_round_findings() -> None
     prompts = _DummyAgent.instances[0].prompts
     assert len(prompts) == 2
     second_prompt = prompts[1]
-    assert "## Previous Round Findings" in second_prompt
+    assert "## Previous Round Findings and Tried Changes" in second_prompt
+    assert "## Prior Iterations" not in second_prompt
+    assert "## Already Tried Command Forms" not in second_prompt
+    assert "### Tried baseline-relative changes" in second_prompt
+    assert '"name": "env.OMP_PROC_BIND"' in second_prompt
+    assert '"new_value": "close"' in second_prompt
+    assert '["echo", "hi"]' not in second_prompt
+    assert "cmd=echo hi" not in second_prompt
+    assert "### Findings by round" in second_prompt
+    assert "- round: 0" in second_prompt
+    assert "result: baseline" in second_prompt
     assert "baseline context switches high" in second_prompt
-    assert "llm_response=" in second_prompt
+    assert "llm_response:" in second_prompt
     assert '"summary":"try candidate"' in second_prompt
     assert '"parameter":"OMP_PROC_BIND"' in second_prompt
     assert long_response_marker in second_prompt
-    assert "round 1: recommendation=try candidate" in second_prompt
-    assert "action=OMP_PROC_BIND=close" in second_prompt
-    assert "evidence=baseline timed out" in second_prompt
+    assert "round: 1" in second_prompt
+    assert "recommendation: try candidate" in second_prompt
+    assert "recommended_actions:" in second_prompt
+    assert "action: OMP_PROC_BIND=close" in second_prompt
+    assert "candidate_results:" in second_prompt
+    assert "candidate: env OMP_PROC_BIND=close" in second_prompt
+    assert "verdict: improved" in second_prompt
+    assert "wall_time_s: 0.7" in second_prompt
+    assert "materialized_actions:" in second_prompt
+    assert "evidence:" in second_prompt
+    assert "- baseline timed out" in second_prompt
     assert "candidate context switches lower" in second_prompt
     assert "cpu-oversubscription: observed 1/2 signal(s)" in second_prompt
 
@@ -1035,6 +1058,8 @@ def test_spawn_mode_manual_name_loads_manual_folder_content(tmp_path: Path) -> N
         )
 
     assert result.exit_code == 0
+    assert "Manual context: 1 loaded, 0 hints provided" in result.output
+    assert "Manual hints: 0 provided" not in result.output
     prompt = _DummyAgent.instances[0].prompts[0]
     assert "Loaded Manual Context" in prompt
     assert "### Manual: custom_manual" in prompt
@@ -1132,8 +1157,9 @@ def test_spawn_mode_accepts_composed_contract_without_manual_files(tmp_path: Pat
     assert _DummyAgent.instances
     assert _DummyAgent.instances[0].context.loaded_manuals == {}
     prompt = _DummyAgent.instances[0].prompts[0]
-    assert "Loaded Contract YAML" in prompt
-    assert "selected_contracts" in prompt
+    assert "Loaded Contract YAML" not in prompt
+    assert "selected_contracts" not in prompt
+    assert "Generated Contract Hypotheses" in prompt
     assert "OMP_NUM_THREADS" in prompt
     assert "OPENBLAS_NUM_THREADS" in prompt
 
@@ -1222,8 +1248,13 @@ def test_spawn_mode_passes_contract_hypotheses_into_first_profiling_round(tmp_pa
     assert {str(item["hypothesis_id"]) for item in captured_profiles[0]} == expected_ids
     assert _collect_contract_report_env(captured_profiles[0]) == expected_report_env
     prompt = _DummyAgent.instances[0].prompts[0]
+    assert "Generated Contract Hypotheses" in prompt
     assert "Contract Hypothesis Validation" in prompt
-    assert next(iter(expected_ids)) in prompt
+    expected_id = next(iter(expected_ids))
+    assert expected_id in prompt
+    assert prompt.index("Generated Contract Hypotheses") < prompt.index(
+        "Contract Hypothesis Validation"
+    )
 
 
 def test_spawn_mode_manual_hints_do_not_generate_contract_hypotheses() -> None:
@@ -1512,6 +1543,30 @@ def test_parse_spawn_actions_allows_evidence_without_manual_citation() -> None:
     assert parsed["valid"] is True
     assert parsed["manual_citation"] == ""
     assert parsed["actions"]
+
+
+def test_parse_spawn_actions_rejects_numactl_config_type() -> None:
+    parsed = _parse_spawn_actions(
+        json.dumps(
+            {
+                "summary": "legacy hardcoded placement action",
+                "manual_citation": "",
+                "evidence": ["numa placement needs adjustment"],
+                "actions": [
+                    {
+                        "config_type": "numactl",
+                        "parameter": "--cpunodebind",
+                        "new_value": "0",
+                        "reason": "legacy placement action",
+                    }
+                ],
+            }
+        )
+    )
+
+    assert parsed["valid"] is True
+    assert parsed["actions"] == []
+    assert parsed["skipped_actions"] == ["action[0] has unsupported config_type 'numactl'"]
 
 
 def test_parse_spawn_actions_still_rejects_actions_without_evidence() -> None:
@@ -2193,6 +2248,138 @@ def test_fixed_budget_no_action_reprompts_until_candidate_materializes() -> None
     assert budget_payload["no_action_reprompts_used"] == 1
 
 
+def test_fixed_goal_no_action_reprompts_until_candidate_materializes() -> None:
+    _CaptureEmitter.instances.clear()
+    _DummyAgent.instances.clear()
+    runner = CliRunner()
+    profile_calls: list[dict[str, object]] = []
+
+    async def _profiled_runs(*args: object, **kwargs: object) -> dict[str, object]:
+        _ = args
+        profile_calls.append(kwargs)
+        if len(profile_calls) == 1:
+            return {
+                "pid": 9999,
+                "wall_time": 1.0,
+                "stdout": "baseline",
+                "stderr": "",
+                "returncode": 0,
+                "profiling_text": "baseline profile",
+                "profiling_json": {},
+                "tool_calls_used": 0,
+            }
+        return {
+            "pid": 10001,
+            "wall_time": 0.8,
+            "stdout": "candidate",
+            "stderr": "",
+            "returncode": 0,
+            "profiling_text": "candidate profile",
+            "profiling_json": {},
+            "tool_calls_used": 0,
+        }
+
+    with (
+        patch("syspilot.cli.TuneEventEmitter", _CaptureEmitter),
+        patch("syspilot.cli.SysPilotAgent", _FixedBudgetRepromptThenActionSpawnAgent),
+        patch("syspilot.cli._register_default_skills", _noop),
+        patch("syspilot.cli._register_profiling_tools", _noop),
+        patch("syspilot.cli._register_tuning_tools", _noop),
+        patch("syspilot.cli._run_live_profiling_pipeline", _profiled_runs),
+        patch("syspilot.cli._run_command", _fake_run_command),
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "tune",
+                "--ui-mode",
+                "plain",
+                "--command",
+                "env OMP_PROC_BIND=close echo hi",
+                "--exclude-config",
+                "OMP_NUM_THREADS",
+                "--fixed-goal",
+                "0.85",
+                "--max-iterations",
+                "2",
+                "--timeout",
+                "1",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert len(profile_calls) == 2
+    assert _DummyAgent.instances
+    prompts = _DummyAgent.instances[-1].prompts
+    assert len(prompts) == 2
+    assert "re-prompting within fixed goal" in result.output
+    assert "## Fixed-Goal Re-prompt" in prompts[1]
+    assert "Remaining candidate-attempt budget: 2" in prompts[1]
+    assert "No-action reason: STOP:need_concrete_candidate" in prompts[1]
+    assert 'Protected/excluded controls: ["OMP_NUM_THREADS"]' in prompts[1]
+    comparison_payload = cast(
+        dict[str, Any],
+        next(
+            record["payload"]
+            for record in _CaptureEmitter.instances[-1].records
+            if record["event"] == "result.comparison"
+        ),
+    )
+    assert comparison_payload["stop_reason"] == "fixed_goal_reached"
+    assert comparison_payload["fixed_goal_stop_reason"] == "fixed_goal_reached"
+    assert comparison_payload["total_candidate_trials_executed"] == 1
+
+
+def test_fixed_goal_unfillable_no_action_reports_cap_stop_reason() -> None:
+    _CaptureEmitter.instances.clear()
+    _DummyAgent.instances.clear()
+    runner = CliRunner()
+
+    with (
+        patch("syspilot.cli.TuneEventEmitter", _CaptureEmitter),
+        patch("syspilot.cli.SysPilotAgent", _FixedBudgetAlwaysNoActionSpawnAgent),
+        patch("syspilot.cli._register_default_skills", _noop),
+        patch("syspilot.cli._register_profiling_tools", _noop),
+        patch("syspilot.cli._register_tuning_tools", _noop),
+        patch("syspilot.cli._run_live_profiling_pipeline", _fake_live_profile),
+        patch("syspilot.cli._run_command", _fake_run_command),
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "tune",
+                "--ui-mode",
+                "plain",
+                "--command",
+                "echo hi",
+                "--fixed-goal",
+                "0.001",
+                "--max-iterations",
+                "2",
+                "--timeout",
+                "1",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert _DummyAgent.instances
+    prompts = _DummyAgent.instances[-1].prompts
+    assert len(prompts) == 3
+    assert "re-prompting within fixed goal" in result.output
+    assert "Stopped: no valid action before fixed goal" not in result.output
+    run_payload = cast(
+        dict[str, Any],
+        next(
+            record["payload"]
+            for record in _CaptureEmitter.instances[-1].records
+            if record["event"] == "run.finished"
+        ),
+    )
+    assert run_payload["stop_reason"] == "max_iterations_exhausted"
+    assert run_payload["fixed_goal_stop_reason"] == "max_iterations_exhausted"
+    assert run_payload["total_candidate_trials_executed"] == 0
+
+
 def test_fixed_budget_unfillable_no_action_stops_without_spending_trials() -> None:
     _CaptureEmitter.instances.clear()
     _DummyAgent.instances.clear()
@@ -2464,7 +2651,10 @@ def test_live_profiling_pipeline_restores_agent_target_pid() -> None:
         assert callback_lines == [("stdout", "ok\n")]
         assert agent.context.target_pid == 777
         assert "skill_ebpf" not in agent.tool_calls
-        assert not any("ebpf profiling failed" in item for item in result["profiling_json"]["key_findings"])
+        assert not any(
+            "ebpf profiling failed" in item
+            for item in result["profiling_json"]["key_findings"]
+        )
 
     asyncio.run(_run())
 
@@ -2549,10 +2739,12 @@ def test_live_profiling_pipeline_captures_cgroup_memory_evidence() -> None:
         profiling_json = cast(dict[str, object], result["profiling_json"])
         cgroup_memory = cast(dict[str, object], profiling_json["cgroup_memory_evidence"])
         refined_runtime_maps = cast(dict[str, object], profiling_json["refined_runtime_maps"])
+        virtual_probe_results = cast(list[dict[str, object]], profiling_json["virtual_probe_results"])
         assert cgroup_memory["status"] == "pressured"
         assert cgroup_memory["effective_limit_bytes"] == 1024
         assert refined_runtime_maps["memory.events.high"] == 7
         assert refined_runtime_maps["memory.pressure.some.total"] == 11
+        assert virtual_probe_results == [{"cgroup.memory.events.high": 7}]
 
     asyncio.run(_run())
 

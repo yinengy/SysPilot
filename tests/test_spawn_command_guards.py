@@ -139,6 +139,43 @@ def test_llama_bench_rewrite_accepts_runtime_tuning_options() -> None:
     assert "-mmp" in command
 
 
+def test_command_delta_replaces_option_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    base = ["worker", "--threads", "24", "--items", "100"]
+    action = {
+        "config_type": "command",
+        "new_value": ["--threads", "12"],
+    }
+
+    monkeypatch.setattr(cli_module, "_discover_supported_cli_options", lambda help_target: None)
+
+    command, env_overrides, applied, skipped = _build_spawn_execution_plan(base, [action])
+
+    assert command == ["worker", "--threads", "12", "--items", "100"]
+    assert env_overrides == {}
+    assert skipped == []
+    assert applied == ["command worker --threads 12 --items 100"]
+
+
+def test_command_delta_replaces_parameter_option_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = ["worker", "--threads", "24", "--items", "100"]
+    action = {
+        "config_type": "command",
+        "parameter": "--threads",
+        "new_value": "12",
+    }
+
+    monkeypatch.setattr(cli_module, "_discover_supported_cli_options", lambda help_target: None)
+
+    command, env_overrides, applied, skipped = _build_spawn_execution_plan(base, [action])
+
+    assert command == ["worker", "--threads", "12", "--items", "100"]
+    assert env_overrides == {}
+    assert skipped == []
+    assert applied == ["command worker --threads 12 --items 100"]
+
+
 def test_llama_bench_rewrite_rejects_thread_sweep_values() -> None:
     base = _llama_bench_base_command()
     action = {
@@ -197,7 +234,15 @@ def test_gmx_mdrun_rewrite_defers_unsupported_subcommand_option_to_runtime(
         "new_value": "gmx_mpi_d mdrun -s topol.tpr -npme 0 -ntomp 12 -pin on -badflag 1 -deffnm run",
     }
 
-    monkeypatch.setattr(cli_module, "_discover_supported_cli_options", lambda help_target: None)
+    def fake_discover_supported_cli_options(help_target: tuple[str, ...]) -> set[str] | None:
+        _ = help_target
+        return None
+
+    monkeypatch.setattr(
+        cli_module,
+        "_discover_supported_cli_options",
+        fake_discover_supported_cli_options,
+    )
 
     command, env_overrides, applied, skipped = _build_spawn_execution_plan(base, [action])
 
@@ -205,6 +250,42 @@ def test_gmx_mdrun_rewrite_defers_unsupported_subcommand_option_to_runtime(
     assert env_overrides == {}
     assert skipped == []
     assert any(item.startswith("command ") for item in applied)
+
+
+def test_command_rewrite_rejects_split_quoted_option_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = [
+        "python",
+        "worker.py",
+        "--case-id",
+        "size_small",
+        "--label",
+        "size small",
+        "--workers",
+        "6",
+    ]
+    action = {
+        "config_type": "command",
+        "new_value": "python worker.py --case-id size_small --label size small --workers 4",
+    }
+
+    def fake_discover_supported_cli_options(help_target: tuple[str, ...]) -> set[str] | None:
+        _ = help_target
+        return None
+
+    monkeypatch.setattr(
+        cli_module,
+        "_discover_supported_cli_options",
+        fake_discover_supported_cli_options,
+    )
+
+    command, env_overrides, applied, skipped = _build_spawn_execution_plan(base, [action])
+
+    assert command == base
+    assert env_overrides == {}
+    assert applied == []
+    assert any("positional arguments unchanged" in item for item in skipped)
 
 
 def test_extract_inline_env_assignments_from_spawn_command() -> None:
@@ -412,6 +493,27 @@ def test_command_rewrite_skips_excluded_option(monkeypatch: pytest.MonkeyPatch) 
         return None
 
     monkeypatch.setattr(cli_module, "_discover_supported_cli_options", _no_help_options)
+
+    command, env_overrides, applied, skipped = _build_spawn_execution_plan(
+        base,
+        [action],
+        excluded_config_names=["--threads"],
+    )
+
+    assert command == base
+    assert env_overrides == {}
+    assert applied == []
+    assert skipped == ["action[0] command rewrite changes excluded config(s): --threads"]
+
+
+def test_command_delta_skips_excluded_option(monkeypatch: pytest.MonkeyPatch) -> None:
+    base = ["worker", "--threads", "24", "--items", "100"]
+    action = {
+        "config_type": "command",
+        "new_value": ["--threads", "12"],
+    }
+
+    monkeypatch.setattr(cli_module, "_discover_supported_cli_options", lambda help_target: None)
 
     command, env_overrides, applied, skipped = _build_spawn_execution_plan(
         base,

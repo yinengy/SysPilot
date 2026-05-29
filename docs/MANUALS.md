@@ -341,7 +341,9 @@ Spawn-mode tune is separate and is the only CLI tuning workflow:
 2. Contract names are resolved into structured contract context bundles
 3. Application manual hints are kept as free-form natural language and appended directly to the tuning prompt
 4. Only contracts drive startup hypothesis synthesis and contract-guided profiling
-5. UI/event output reports contracts and manual hints separately
+5. UI/event output reports contracts and manual context separately: named manuals loaded
+   from disk count as loaded manual context, while unresolved `--manual` values count as
+   free-form hints
 
 ### System Prompt Structure
 
@@ -371,7 +373,7 @@ In spawn mode, contracts provide library policy and hypotheses, while manual hin
 
 1. Run current configuration and collect profiling evidence
 2. Re-profile process tree (parent + heavy worker children), optionally with contract-guided hypothesis validation
-3. Ask agent for structured actions using profiling evidence, loaded contract context, and application manual hints (`summary`, `manual_citation`, `evidence`, `actions`)
+3. Ask agent for structured actions using profiling evidence, generated contract hypotheses, contract-validation findings, and application manual hints (`summary`, `manual_citation`, `evidence`, `actions`)
 4. Execute bounded candidate search
 5. Keep best-so-far config and stop by convergence or the `--max-iterations` materialized candidate-trial cap by default, or by `--fixed-budget N` when an explicit candidate-attempt cap is active. Fixed budget limits search cost only and does not promise an optimal result.
 

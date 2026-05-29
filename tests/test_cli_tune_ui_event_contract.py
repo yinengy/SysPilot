@@ -32,6 +32,9 @@ class _DummySpawnAgent:
     def enable_llm_prompt_logging(self, path: Path) -> Path:
         return path
 
+    def configure_tuning_prompt(self, **kwargs: object) -> None:
+        _ = kwargs
+
 
 class _ActionSpawnAgent(_DummySpawnAgent):
     def __init__(self, config: object) -> None:
@@ -92,6 +95,51 @@ class _SecondRoundActionSpawnAgent(_DummySpawnAgent):
         return _DummyResponse('{"summary":"none","manual_citation":"","evidence":[],"actions":[]}')
 
 
+class _ThirdRoundActionSpawnAgent(_DummySpawnAgent):
+    def __init__(self, config: object) -> None:
+        super().__init__(config)
+        self._calls: int = 0
+
+    async def step(self, prompt: str) -> _DummyResponse:
+        _ = prompt
+        self._calls += 1
+        if self._calls == 1:
+            return _DummyResponse(
+                '{"summary":"first round candidate","manual_citation":"rule","evidence":["signal"],'
+                '"actions":[{"config_type":"env_var","parameter":"OMP_PROC_BIND","new_value":"close",'
+                '"reason":"first try","manual_citation":"rule"}]}'
+            )
+        if self._calls == 2:
+            return _DummyResponse(
+                '{"summary":"second round candidate",'
+                '"manual_citation":"rule","evidence":["signal"],'
+                '"actions":[{"config_type":"env_var","parameter":"OMP_WAIT_POLICY",'
+                '"new_value":"ACTIVE","reason":"second try","manual_citation":"rule"}]}'
+            )
+        if self._calls == 3:
+            return _DummyResponse(
+                '{"summary":"third round candidate",'
+                '"manual_citation":"rule","evidence":["signal"],'
+                '"actions":[{"config_type":"env_var","parameter":"OMP_NUM_THREADS",'
+                '"new_value":"2","reason":"third try","manual_citation":"rule"}]}'
+            )
+        return _DummyResponse('{"summary":"none","manual_citation":"","evidence":[],"actions":[]}')
+
+
+class _ThreeCandidateActionSpawnAgent(_DummySpawnAgent):
+    async def step(self, prompt: str) -> _DummyResponse:
+        _ = prompt
+        return _DummyResponse(
+            '{"summary":"try three candidates","manual_citation":"rule","evidence":["signal"],'
+            '"actions":[{"config_type":"env_var","parameter":"OMP_PROC_BIND",'
+            '"new_value":"close","reason":"first try","manual_citation":"rule"},'
+            '{"config_type":"env_var","parameter":"OMP_WAIT_POLICY","new_value":"ACTIVE",'
+            '"reason":"second try","manual_citation":"rule"},'
+            '{"config_type":"env_var","parameter":"OMP_NUM_THREADS","new_value":"2",'
+            '"reason":"third try","manual_citation":"rule"}]}'
+        )
+
+
 class _GuardRejectedBudgetSpawnAgent(_DummySpawnAgent):
     async def step(self, prompt: str) -> _DummyResponse:
         _ = prompt
@@ -99,6 +147,16 @@ class _GuardRejectedBudgetSpawnAgent(_DummySpawnAgent):
             '{"summary":"repeat baseline env","manual_citation":"rule","evidence":["signal"],'
             '"actions":[{"config_type":"env_var","parameter":"OMP_PROC_BIND","new_value":"close",'
             '"reason":"same as baseline","manual_citation":"rule"}]}'
+        )
+
+
+class _ExcludedControlSpawnAgent(_DummySpawnAgent):
+    async def step(self, prompt: str) -> _DummyResponse:
+        _ = prompt
+        return _DummyResponse(
+            '{"summary":"touch excluded control","manual_citation":"rule","evidence":["signal"],'
+            '"actions":[{"config_type":"env_var","parameter":"OMP_NUM_THREADS","new_value":"2",'
+            '"reason":"blocked by exclude-config","manual_citation":"rule"}]}'
         )
 
 
@@ -463,7 +521,7 @@ def test_spawn_flow_reports_contracts_and_manual_hints_separately() -> None:
 
     assert result.exit_code == 0
     assert "Contracts: 2 loaded" in result.output
-    assert "Manual hints: 1 provided" in result.output
+    assert "Manual context: 0 loaded, 1 hints provided" in result.output
     run_started = next(
         record
         for record in _CaptureEmitter.instances[-1].records
@@ -969,6 +1027,261 @@ def test_fixed_goal_stops_after_reaching_wall_time_target() -> None:
     assert comparison_payload["fixed_goal_stop_reason"] == "fixed_goal_reached"
     assert isinstance(comparison_payload["total_wall_time_s"], float)
     assert isinstance(comparison_payload["config_find_wall_time_s"], float)
+
+
+def test_fixed_goal_continues_after_non_improving_rounds_until_goal() -> None:
+    _CaptureEmitter.instances.clear()
+    runner = CliRunner()
+    profile_calls: list[dict[str, object]] = []
+
+    async def _profiled_runs(*args: object, **kwargs: object) -> dict[str, object]:
+        _ = args
+        profile_calls.append(kwargs)
+        wall_times = [1.0, 1.1, 1.05, 0.8]
+        outputs = ["baseline", "round1 candidate", "round2 candidate", "round3 candidate"]
+        index = len(profile_calls) - 1
+        return {
+            "pid": 9999 + len(profile_calls),
+            "wall_time": wall_times[index],
+            "stdout": outputs[index],
+            "stderr": "",
+            "returncode": 0,
+            "profiling_text": f"profile {index}",
+            "profiling_json": {},
+            "tool_calls_used": 0,
+        }
+
+    with (
+        patch("syspilot.cli.TuneEventEmitter", _CaptureEmitter),
+        patch("syspilot.cli.SysPilotAgent", _ThirdRoundActionSpawnAgent),
+        patch("syspilot.cli._register_default_skills", _noop),
+        patch("syspilot.cli._register_profiling_tools", _noop),
+        patch("syspilot.cli._register_tuning_tools", _noop),
+        patch("syspilot.cli._run_live_profiling_pipeline", _profiled_runs),
+        patch("syspilot.cli._run_command", _unexpected_run_command),
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "tune",
+                "--ui-mode",
+                "plain",
+                "--command",
+                "echo hi",
+                "--fixed-goal",
+                "0.85",
+                "--max-iterations",
+                "3",
+                "--timeout",
+                "1",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert len(profile_calls) == 4
+    assert "Round 3 Step 1: Agent Tuning Analysis" in result.output
+    assert "Iterative loop converged after non-improving iterations" not in result.output
+    result_comparison = next(
+        record
+        for record in _CaptureEmitter.instances[-1].records
+        if record["event"] == "result.comparison"
+    )
+    comparison_payload = cast(dict[str, object], result_comparison["payload"])
+    assert comparison_payload["best_found_round"] == 3
+    assert comparison_payload["total_rounds_executed"] == 3
+    assert comparison_payload["total_candidate_trials_executed"] == 3
+    assert comparison_payload["stop_reason"] == "fixed_goal_reached"
+    assert comparison_payload["fixed_goal_current_value"] == 0.8
+    assert comparison_payload["fixed_goal_stop_reason"] == "fixed_goal_reached"
+
+
+def test_fixed_goal_ignores_candidate_search_convergence_until_goal() -> None:
+    _CaptureEmitter.instances.clear()
+    runner = CliRunner()
+    profile_calls: list[dict[str, object]] = []
+
+    async def _profiled_runs(*args: object, **kwargs: object) -> dict[str, object]:
+        _ = args
+        profile_calls.append(kwargs)
+        wall_times = [1.0, 1.1, 1.05, 0.8]
+        index = len(profile_calls) - 1
+        return {
+            "pid": 9999 + len(profile_calls),
+            "wall_time": wall_times[index],
+            "stdout": f"run {index}",
+            "stderr": "",
+            "returncode": 0,
+            "profiling_text": f"profile {index}",
+            "profiling_json": {},
+            "tool_calls_used": 0,
+        }
+
+    with (
+        patch("syspilot.cli.TuneEventEmitter", _CaptureEmitter),
+        patch("syspilot.cli.SysPilotAgent", _ThreeCandidateActionSpawnAgent),
+        patch("syspilot.cli._register_default_skills", _noop),
+        patch("syspilot.cli._register_profiling_tools", _noop),
+        patch("syspilot.cli._register_tuning_tools", _noop),
+        patch("syspilot.cli._run_live_profiling_pipeline", _profiled_runs),
+        patch("syspilot.cli._run_command", _unexpected_run_command),
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "tune",
+                "--ui-mode",
+                "plain",
+                "--command",
+                "echo hi",
+                "--fixed-goal",
+                "0.85",
+                "--max-iterations",
+                "3",
+                "--timeout",
+                "1",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert len(profile_calls) == 4
+    assert "Candidate search converged after non-improving trials" not in result.output
+    result_comparison = next(
+        record
+        for record in _CaptureEmitter.instances[-1].records
+        if record["event"] == "result.comparison"
+    )
+    comparison_payload = cast(dict[str, object], result_comparison["payload"])
+    assert comparison_payload["total_rounds_executed"] == 1
+    assert comparison_payload["total_candidate_trials_executed"] == 3
+    assert comparison_payload["stop_reason"] == "fixed_goal_reached"
+    assert comparison_payload["fixed_goal_current_value"] == 0.8
+
+
+def test_fixed_goal_no_new_candidates_reports_cap_stop_reason() -> None:
+    _CaptureEmitter.instances.clear()
+    runner = CliRunner()
+    profile_calls: list[dict[str, object]] = []
+
+    async def _baseline_only(*args: object, **kwargs: object) -> dict[str, object]:
+        _ = args
+        profile_calls.append(kwargs)
+        return {
+            "pid": 9999,
+            "wall_time": 1.0,
+            "stdout": "baseline",
+            "stderr": "",
+            "returncode": 0,
+            "profiling_text": "baseline profile",
+            "profiling_json": {},
+            "tool_calls_used": 0,
+        }
+
+    with (
+        patch("syspilot.cli.TuneEventEmitter", _CaptureEmitter),
+        patch("syspilot.cli.SysPilotAgent", _ExcludedControlSpawnAgent),
+        patch("syspilot.cli._register_default_skills", _noop),
+        patch("syspilot.cli._register_profiling_tools", _noop),
+        patch("syspilot.cli._register_tuning_tools", _noop),
+        patch("syspilot.cli._run_live_profiling_pipeline", _baseline_only),
+        patch("syspilot.cli._run_command", _unexpected_run_command),
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "tune",
+                "--ui-mode",
+                "plain",
+                "--command",
+                "env OMP_PROC_BIND=close echo hi",
+                "--exclude-config",
+                "OMP_NUM_THREADS",
+                "--fixed-goal",
+                "0.5",
+                "--max-iterations",
+                "2",
+                "--timeout",
+                "1",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert len(profile_calls) == 1
+    assert "Stopped: candidate space exhausted before fixed goal" not in result.output
+    result_comparison = next(
+        record
+        for record in _CaptureEmitter.instances[-1].records
+        if record["event"] == "result.comparison"
+    )
+    comparison_payload = cast(dict[str, object], result_comparison["payload"])
+    assert comparison_payload["stop_reason"] == "max_iterations_exhausted"
+    assert comparison_payload["fixed_goal_stop_reason"] == "max_iterations_exhausted"
+    assert comparison_payload["stop_reason"] != "candidate_space_exhausted"
+    assert comparison_payload["stop_reason"] != "unfillable_no_action"
+
+
+def test_fixed_budget_ignores_candidate_search_convergence_until_budget() -> None:
+    _CaptureEmitter.instances.clear()
+    runner = CliRunner()
+    profile_calls: list[dict[str, object]] = []
+
+    async def _profiled_runs(*args: object, **kwargs: object) -> dict[str, object]:
+        _ = args
+        profile_calls.append(kwargs)
+        wall_times = [1.0, 1.1, 1.05, 0.8]
+        index = len(profile_calls) - 1
+        return {
+            "pid": 9999 + len(profile_calls),
+            "wall_time": wall_times[index],
+            "stdout": f"run {index}",
+            "stderr": "",
+            "returncode": 0,
+            "profiling_text": f"profile {index}",
+            "profiling_json": {},
+            "tool_calls_used": 0,
+        }
+
+    with (
+        patch("syspilot.cli.TuneEventEmitter", _CaptureEmitter),
+        patch("syspilot.cli.SysPilotAgent", _ThreeCandidateActionSpawnAgent),
+        patch("syspilot.cli._register_default_skills", _noop),
+        patch("syspilot.cli._register_profiling_tools", _noop),
+        patch("syspilot.cli._register_tuning_tools", _noop),
+        patch("syspilot.cli._run_live_profiling_pipeline", _profiled_runs),
+        patch("syspilot.cli._run_command", _unexpected_run_command),
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "tune",
+                "--ui-mode",
+                "plain",
+                "--command",
+                "echo hi",
+                "--fixed-budget",
+                "3",
+                "--max-iterations",
+                "1",
+                "--timeout",
+                "1",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert len(profile_calls) == 4
+    assert "Candidate search converged after non-improving trials" not in result.output
+    assert "Stopped: fixed budget exhausted after 3/3 candidate attempts" in result.output
+    result_comparison = next(
+        record
+        for record in _CaptureEmitter.instances[-1].records
+        if record["event"] == "result.comparison"
+    )
+    comparison_payload = cast(dict[str, object], result_comparison["payload"])
+    budget_payload = cast(dict[str, object], comparison_payload["fixed_budget"])
+    assert comparison_payload["total_rounds_executed"] == 1
+    assert comparison_payload["total_candidate_trials_executed"] == 3
+    assert comparison_payload["stop_reason"] == "fixed_budget_exhausted"
+    assert budget_payload["used"] == 3
+    assert budget_payload["remaining"] == 0
 
 
 def test_max_iterations_caps_total_candidate_trials_not_rounds() -> None:

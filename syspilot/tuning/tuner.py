@@ -183,7 +183,6 @@ class ApplicationTuner:
             "prlimit": self._apply_prlimit,
             "command": self._apply_command,
             "env_var": self._apply_env_var,
-            "numactl": self._apply_numactl,
         }
 
         handler = dispatch.get(action.config_type)
@@ -243,19 +242,6 @@ class ApplicationTuner:
             f"Environment variable '{action.parameter}' should be set to "
             f"'{action.new_value}' on next process restart."
         )
-        return True
-
-    def _apply_numactl(self, pid: int | None, action: TuningAction) -> bool:
-        cmd = action.new_value
-        if not isinstance(cmd, str):
-            logger.error("numactl config_type expects new_value to be a numactl command string")
-            return False
-        result = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode != 0:
-            logger.error(f"numactl command failed: {result.stderr}")
-            return False
         return True
 
     def rollback(self, action: TuningAction) -> bool:

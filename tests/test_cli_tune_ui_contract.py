@@ -18,6 +18,9 @@ class _DummyQuickAgent:
     def enable_llm_prompt_logging(self, path: Path) -> Path:
         return path
 
+    def configure_tuning_prompt(self, **kwargs: object) -> None:
+        _ = kwargs
+
 
 def test_tune_help_includes_ui_mode_option() -> None:
     runner = CliRunner()

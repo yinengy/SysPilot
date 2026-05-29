@@ -140,6 +140,28 @@ def _append_virtual_probe_timeseries_samples(
             )
 
 
+def _virtual_probe_result_value(probe_name: str, probe_result: Any) -> Any:
+    if not isinstance(probe_result, dict):
+        return None
+    value = probe_result.get("value")
+    if value is not None:
+        return value
+    flat = probe_result.get("flat", {})
+    if isinstance(flat, dict):
+        if probe_name in flat:
+            return flat.get(probe_name)
+        if len(flat) == 1:
+            return next(iter(flat.values()))
+    return None
+
+
+def _simplify_virtual_probe_results(virtual_probe_results: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {probe_name: _virtual_probe_result_value(probe_name, probe_result)}
+        for probe_name, probe_result in sorted(virtual_probe_results.items())
+    ]
+
+
 async def execute_profiled_spawn_run(
     agent: SysPilotAgent,
     command_parts: list[str],
@@ -457,22 +479,22 @@ async def execute_profiled_spawn_run(
         "workdir": workdir,
         "launch_env": env,
     }
-    virtual_probe_results = await finish_probe_sessions(probe_sessions, virtual_probe_payload)
-    if virtual_probe_results and periodic_sample_interval_s:
-        _append_virtual_probe_timeseries_samples(periodic_samples, virtual_probe_results)
+    detailed_virtual_probe_results = await finish_probe_sessions(probe_sessions, virtual_probe_payload)
+    if detailed_virtual_probe_results and periodic_sample_interval_s:
+        _append_virtual_probe_timeseries_samples(periodic_samples, detailed_virtual_probe_results)
         periodic_samples.append(
             {
                 "time_offset_s": max(wall, 0.0),
-                "results": virtual_probe_results,
+                "results": detailed_virtual_probe_results,
                 "source": "finish_probe_sessions",
             }
         )
-    for probe_result in virtual_probe_results.values():
+    for probe_result in detailed_virtual_probe_results.values():
         flat = probe_result.get("flat", {}) if isinstance(probe_result, dict) else {}
         if isinstance(flat, dict) and flat:
             refined_runtime_maps = {**refined_runtime_maps, **flat}
 
-    cgroup_probe_result = virtual_probe_results.get("cgroup.memory.events.high", {})
+    cgroup_probe_result = detailed_virtual_probe_results.get("cgroup.memory.events.high", {})
     cgroup_memory_evidence = (
         cgroup_probe_result.get("structured", {})
         if isinstance(cgroup_probe_result, dict)
@@ -495,7 +517,7 @@ async def execute_profiled_spawn_run(
         "refined_runtime_maps": refined_runtime_maps,
         "per_pid_runtime_maps": per_pid_runtime_maps,
         "cgroup_memory_evidence": cgroup_memory_evidence,
-        "virtual_probe_results": virtual_probe_results,
+        "virtual_probe_results": _simplify_virtual_probe_results(detailed_virtual_probe_results),
         "runtime_output": runtime_output,
         "process_tree_targets": process_targets,
         "key_findings": key_findings,
@@ -648,7 +670,7 @@ async def execute_unprofiled_spawn_run(
         "refined_runtime_maps": {},
         "per_pid_runtime_maps": {},
         "cgroup_memory_evidence": {},
-        "virtual_probe_results": {},
+        "virtual_probe_results": [],
         "runtime_output": runtime_output,
         "process_tree_targets": {"target_pids": [pid], "primary_pid": pid, "workers": []},
         "key_findings": ["profiling skipped by --no-profile; use raw stdout/stderr evidence"],

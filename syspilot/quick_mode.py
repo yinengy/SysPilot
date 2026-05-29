@@ -19,7 +19,10 @@ from syspilot.core.agent import SysPilotAgent
 from syspilot.core.llm import LLMError
 from syspilot.fixed_budget import FixedBudgetState
 from syspilot.fixed_goal import fixed_goal_payload, fixed_goal_reached
-from syspilot.prompt_budget import contract_context_json_for_prompt, profiling_json_for_prompt
+from syspilot.prompt_budget import (
+    hypothesis_profiles_yaml_for_prompt,
+    profiling_json_for_prompt,
+)
 from syspilot.ui.output_sink import OutputSink, PlainOutputSink, TuneUIMode, make_output_sink
 
 
@@ -1579,7 +1582,7 @@ def _build_quick_recommendation_prompt(
     window: QuickBaselineWindow,
     max_iterations: int,
     baseline_profiling_json: dict[str, Any],
-    contract_content: str,
+    generated_hypothesis_content: str,
     loaded_manual_content: str,
     manual_hint_content: str,
     fixed_budget_remaining: int | None,
@@ -1588,6 +1591,7 @@ def _build_quick_recommendation_prompt(
     untouched_controls: Sequence[str],
     retry_reason: str,
 ) -> str:
+    action_limit = max(1, min(max_iterations, 5))
     return f"""Analyze this workload for quick screening mode and propose candidate actions.
 
 ## Command
@@ -1635,13 +1639,13 @@ def _build_quick_recommendation_prompt(
   earlier ideas or use untouched candidate controls where supported by evidence.
 - Do not repeat skipped or rejected candidates exactly.
 - Return JSON only.
-- Provide up to {max_iterations} ordered actions.
+- Provide up to {action_limit} ordered actions.
 
 ## Baseline Profiling JSON
 {profiling_json_for_prompt(baseline_profiling_json)}
 
-## Loaded Contract YAML
-{contract_content if contract_content else "(No contract context provided)"}
+## Generated Contract Hypotheses
+{generated_hypothesis_content if generated_hypothesis_content else "(No generated contract hypotheses)"}
 
 ## Loaded Manual Context
 {loaded_manual_content if loaded_manual_content else "(No manual content loaded)"}
@@ -1658,9 +1662,9 @@ def _build_quick_recommendation_prompt(
   "hypothesis_refs": ["optional hypothesis ids to prioritize next profiling round"],
   "actions": [
     {{
-      "config_type": "numactl | env_var | command_prefix | command",
-      "parameter": "required only for env_var",
-      "new_value": "string or token list; for command use full rewritten command",
+      "config_type": "env_var | command_prefix | command",
+      "parameter": "required for env_var; for command use the option/name being changed when applicable",
+      "new_value": "string or token list; for command include only changed tokens relative to the current command, not the full command",
       "reason": "why this action follows from evidence",
       "manual_citation": "optional manual/contract rule supporting this action"
     }}
@@ -1920,6 +1924,12 @@ async def run_quick_tune_loop_async(
 
     cmd_parts, inline_env_overrides = extract_inline_env_assignments(cmd_parts)
     excluded_config_list = list(excluded_config_names or [])
+    loaded_manual_names = sorted(getattr(agent.context, "loaded_manuals", {}).keys())
+    manual_hint_list = list(manual_hints)
+    manual_context_status = (
+        f"Manual context: {len(loaded_manual_names)} loaded, "
+        f"{len(manual_hint_list)} hints provided"
+    )
     hypothesis_profiles = [
         item for item in (initial_hypothesis_profiles or []) if isinstance(item, dict)
     ]
@@ -1937,7 +1947,8 @@ async def run_quick_tune_loop_async(
         "mode": "quick",
         "command": command,
         "contracts": list(contracts),
-        "manual_hints": list(manual_hints),
+        "loaded_manuals": loaded_manual_names,
+        "manual_hints": manual_hint_list,
         "timeout_s": timeout,
         "max_iterations": max_iterations,
         "fixed_goal_threshold": fixed_goal,
@@ -1964,7 +1975,8 @@ async def run_quick_tune_loop_async(
             "fixed_goal_threshold": fixed_goal,
             "timeout_s": timeout,
             "loaded_contracts": list(contracts),
-            "manual_hints": list(manual_hints),
+            "loaded_manuals": loaded_manual_names,
+            "manual_hints": manual_hint_list,
             "excluded_config_names": excluded_config_list,
             "primary_objective_query": primary_objective or "",
             "primary_objective_mode": primary_objective_mode or "",
@@ -1979,7 +1991,7 @@ async def run_quick_tune_loop_async(
         f"Workdir: {workdir or '(current)'}\n"
         f"MemoryHigh: {memory_high or '(none)'}\n"
         f"Contracts: {len(list(contracts))} loaded\n"
-        f"Manual hints: {len(list(manual_hints))} provided\n"
+        f"{manual_context_status}\n"
         f"Primary objective: {primary_objective or '(wall time)'}"
         f"{f' ({primary_objective_mode})' if primary_objective_mode else ''}\n"
         f"Artifact dir: {artifact_dir}",
@@ -2359,11 +2371,7 @@ async def run_quick_tune_loop_async(
             },
         )
 
-        contract_content = (
-            contract_context_json_for_prompt(structured_context_bundle)
-            if structured_context_bundle
-            else ""
-        )
+        generated_hypothesis_content = hypothesis_profiles_yaml_for_prompt(hypothesis_profiles)
         manual_hint_content = _render_spawn_manual_hints(manual_hints)
         loaded_manual_content = _render_loaded_manual_context(agent.context.loaded_manuals)
         excluded_config_content = _render_excluded_config_names(excluded_config_list)
@@ -2387,7 +2395,7 @@ async def run_quick_tune_loop_async(
                 baseline_profiling_json=cast(
                     dict[str, Any], baseline_artifact.get("profiling_json", {})
                 ),
-                contract_content=contract_content,
+                generated_hypothesis_content=generated_hypothesis_content,
                 loaded_manual_content=loaded_manual_content,
                 manual_hint_content=manual_hint_content,
                 fixed_budget_remaining=fixed_budget_state.remaining,

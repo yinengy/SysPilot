@@ -586,7 +586,7 @@ Be conservative and explain each change."""
                 "1. Collect current profiling data\n"
                 "2. Analyze metrics and loaded manuals\n"
                 "3. Recommend tuning actions as a JSON list of objects with keys: "
-                "config_type (sysctl|prlimit|command|env_var|numactl), parameter, "
+                "config_type (sysctl|prlimit|command|env_var), parameter, "
                 "current_value, new_value, reason\n"
                 "4. If no further optimizations are possible, respond with an empty list []"
             )

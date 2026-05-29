@@ -22,6 +22,7 @@ from syspilot.quick_mode import (
     QuickRunMetadata,
     QuickShortResult,
     QuickSignalSpec,
+    _build_quick_recommendation_prompt,
     SampledSignalPoint,
     _build_signal_window_groups,
     _extract_signal_specs,
@@ -62,6 +63,19 @@ class _DummyQuickAgent:
 
     def enable_llm_prompt_logging(self, path: Path) -> Path:
         return path
+
+    def configure_tuning_prompt(
+        self,
+        *,
+        contract_enabled: bool = False,
+        manual_enabled: bool = False,
+        quick_mode: bool = False,
+        profiling_enabled: bool = True,
+    ) -> None:
+        _ = contract_enabled
+        _ = manual_enabled
+        _ = quick_mode
+        _ = profiling_enabled
 
 
 class _LiveProfileAgent(SysPilotAgent):
@@ -978,6 +992,47 @@ def test_materialize_result_uses_exact_baseline_window_end_offset() -> None:
 
     assert result.target_signal_mean == 10.0
     assert result.target_signal_improvement_pct == 50.0
+
+
+def test_quick_recommendation_prompt_includes_generated_contract_hypotheses() -> None:
+    prompt = _build_quick_recommendation_prompt(
+        cmd_parts=["echo", "hi"],
+        inline_env_overrides={},
+        excluded_config_content="(none)",
+        excluded_config_list=[],
+        window=QuickBaselineWindow(
+            window_id="sig-w1",
+            signal_name="rss",
+            signal_ref="demo.sig",
+            hypothesis_name="demo-hypothesis",
+            start_offset_s=0.0,
+            end_offset_s=30.0,
+            duration_s=30.0,
+            sample_count=6,
+            expected_direction="decrease",
+            severity=25.0,
+            abnormality_score=10.0,
+            candidate_controls=["OMP_NUM_THREADS"],
+            window_summary={},
+            global_summary={},
+            reason="rss burst",
+        ),
+        max_iterations=3,
+        baseline_profiling_json={"periodic_probe_samples": []},
+        generated_hypothesis_content="hypotheses:\n- hypothesis_id: demo-hypothesis\n",
+        loaded_manual_content="",
+        manual_hint_content="",
+        fixed_budget_remaining=None,
+        successful_prior_configs=[],
+        skipped_rejected_candidates=[],
+        untouched_controls=["OMP_NUM_THREADS"],
+        retry_reason="",
+    )
+
+    assert "## Generated Contract Hypotheses" in prompt
+    assert "demo-hypothesis" in prompt
+    assert "## Loaded Contract YAML" not in prompt
+    assert "Contract YAML: openmp" not in prompt
 
 
 def test_run_live_profiling_pipeline_marks_intentional_short_stop() -> None:
@@ -2455,6 +2510,9 @@ def test_fixed_budget_quick_no_action_reprompts_empty_actions_then_candidate() -
         agent = _EmptyActionsThenCandidateAgent.instances[-1]
         assert len(agent.prompts) == 2
         retry_prompt = agent.prompts[1]
+        assert '"config_type": "env_var | command_prefix | command"' in retry_prompt
+        assert "not the full command" in retry_prompt
+        assert '"config_type": "numactl' not in retry_prompt
         assert "remaining fixed candidate budget: 1" in retry_prompt
         assert "retry reason: previous recommendation returned no concrete actions" in retry_prompt
         assert "successful prior configs:" in retry_prompt
