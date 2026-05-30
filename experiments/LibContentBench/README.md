@@ -11,32 +11,32 @@ The suite is intentionally synthetic: workloads use generated data and bounded r
 - `hdf5-mpiio-write/` — HPC parallel I/O workspace with native HDF5 probing plus MPI-IO fallback evidence when parallel HDF5 is unavailable.
 - `horovod-tfdata-network/` — optional network-contention workspace with readiness-first blocked reporting.
 - `torchdata-checkpoint-io/` — optional local checkpoint/log write contention workspace using PyTorch DataLoader plus real `torch.save` and TensorBoard writes.
+- `pytorch-h5py-hdf5-dataloader/` — local HDF5 chunk-cache contention workspace using PyTorch DataLoader plus real `h5py` raw-data chunk cache controls.
+- `hf-datasets-tokenizers-dataloader/` — local text-processing contention workspace using Hugging Face `datasets`, Hugging Face `tokenizers`, and PyTorch DataLoader.
+- `dask-zarr-blosc/` — local chunked-array contention workspace using Dask workers, Zarr stores, and real Blosc compression settings.
+- `torchdata-fsspec-s3-ddp/` — optional single-host object-store input workspace using PyTorch DataPipes, `fsspec`/`s3fs`, local MinIO, and PyTorch DDP with loopback-scope caveats.
+- `adios2-bp5-sst/` — local ADIOS2 BP5 file-backed HPC I/O workspace with documented SST readiness/probe scope.
 - `raydata-ddp-network/` — optional single-host-first Ray Data plus PyTorch DDP workspace with explicit loopback/shared-memory caveats.
+- `dali-nvjpeg-pytorch-cudnn/` — optional single-GPU CUDA MPS contention workspace using NVIDIA DALI/nvJPEG-style preprocessing plus PyTorch/cuDNN inference.
 
 ## Common interface
 
-From this suite root, use:
+Suite-level orchestration is now prepare/report only. From this suite root, use:
 
 ```bash
 python3 run_suite.py prepare
-python3 run_suite.py smoke
-python3 run_suite.py run-baseline
-python3 run_suite.py run-application-only
-python3 run_suite.py run-library-aware
-python3 run_suite.py run-oracle
 python3 run_suite.py summarize
 ```
 
-Use `--include-optional` to include the optional benchmark workspaces in suite execution.
+For runnable benchmark commands, use the direct worker command blocks in `summary_repro.md` or the benchmark-local README.
+
+For future LPCL work that maps benchmark-local `BENCHMARK_*` env overrides into original library contracts, follow `LPCL_BENCHMARK_ENV_MAPPING_SKILL.md`.
 
 ## Output contract
 
 Each benchmark workspace owns:
 
 - `prepare.sh`
-- `matrix_smoke.yaml`
-- `matrix.yaml`
-- `run_matrix.py`
 - `build_report.py`
 - `summary.md`
 - `result_table.csv`
@@ -44,7 +44,12 @@ Each benchmark workspace owns:
 - `acceptance_report.json`
 - `runs/` with per-case `result.json`, command, env, stdout/stderr, and metrics artifacts
 
-The suite-level `summary.md` also includes a human-readable per-benchmark section with status, baseline command/config, best archived command/config, and the recorded performance numbers. Those commands are derived from the current benchmark `matrix.yaml` case IDs so they remain reproducible even if old `runs/` artifacts are cleaned up.
+Direct benchmark runners that are used for SysPilot tuning print metric-only JSON to stdout
+(`wall_time_sec`, throughput/rate, latency percentile, or benchmark score fields). Full
+reproducibility details such as benchmark identity, config/env snapshots, resource signals,
+and profiling summaries stay in the `--output-json` artifact instead of terminal stdout.
+
+The suite-level `summary.md` also includes a human-readable per-benchmark section with status, baseline command/config, best archived command/config, and the recorded performance numbers. The direct-only reproduction surface lives in `summary_repro.md`, which keeps runnable benchmark commands stable even if old `runs/` artifacts are cleaned up.
 
 ## Evidence interpretation notes
 
@@ -52,7 +57,10 @@ The suite-level `summary.md` also includes a human-readable per-benchmark sectio
 - For a pristine paper/demo snapshot, regenerate reports from a clean run directory set instead of assuming the checked-in report tables represent only the latest execution wave.
 - On the current validation host, `arrow-dask-duckdb-memspill` remains runnable and useful as a coordination benchmark, but the successful archived runs did not show nonzero DuckDB temp or Dask local spill bytes. Treat its current `no_improvement` result as host-specific evidence that library-aware knobs did not help this workload here, not as proof that the workload exercised strong spill-path pressure.
 - `torchdata-checkpoint-io` intentionally uses the standard PyTorch `DataLoader` path as its default runnable implementation rather than requiring the separate `torchdata` package, because the suite cares about real documented input-pipeline knobs more than a specific package name.
+- `torchdata-fsspec-s3-ddp` uses the PyTorch-provided DataPipe API (`torch.utils.data.datapipes.iter`) because the currently installed `torchdata 0.11` package no longer exposes `torchdata.datapipes`; its object-store path uses a local MinIO container and should be interpreted as single-host/loopback S3-compatible evidence.
+- `adios2-bp5-sst` runs BP5 by default and records SST as readiness/probe metadata only; do not present SST throughput claims until a bounded coupled streaming reader/writer case is added and validated.
 - `raydata-ddp-network` is packaged as a credible single-host distributed benchmark on this host. Even when physical NIC counters change, its checked-in reports still limit the claim to single-host evidence rather than overclaiming inter-machine network contention.
+- `dali-nvjpeg-pytorch-cudnn` is packaged as a runnable GPU benchmark but checked in with scaffold evidence only; do not claim measured DALI/cuDNN throughput until it is run on a CUDA+DALI host with MPS available.
 
 ## Main claim
 

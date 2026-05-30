@@ -96,6 +96,8 @@ manual/*
 contracts/*
 runs/*
 work/*
+*.pdf
+*.csv
 
 # OpenCode
 .sisyphus
@@ -111,4 +113,6 @@ artifacts
 library_sources/*
 
 # Experiments
-experiments
+experiments/*
+!experiments/LibContentBench/
+experiments/LibContentBench/reports/
