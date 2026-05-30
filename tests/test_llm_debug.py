@@ -91,6 +91,24 @@ class FlakyProvider(BaseLLMProvider):
         return _gen()
 
 
+class StreamInternalErrorProvider(FlakyProvider):
+    async def chat(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None = None,
+        **kwargs: Any,
+    ) -> LLMResponse:
+        _ = messages
+        _ = tools
+        _ = kwargs
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError(
+                "stream error: stream ID 177; INTERNAL_ERROR; received from peer"
+            )
+        return LLMResponse(content="recovered")
+
+
 class HangingProvider(BaseLLMProvider):
     async def chat(
         self,
@@ -272,6 +290,7 @@ async def test_llm_interface_retries_transient_chat_failure() -> None:
             api_key="test",
             timeout_seconds=0.05,
             max_retries=1,
+            retry_cooldown_seconds=0,
         )
     )
     provider = FlakyProvider()
@@ -281,6 +300,40 @@ async def test_llm_interface_retries_transient_chat_failure() -> None:
 
     assert response.content == "recovered"
     assert provider.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_llm_interface_retries_openai_stream_internal_error() -> None:
+    llm = LLMInterface(
+        LLMConfig(
+            provider=LLMProvider.OPENAI,
+            model="gpt-5.4(high)",
+            api_key="test",
+            timeout_seconds=0.05,
+            max_retries=5,
+            retry_cooldown_seconds=0,
+        )
+    )
+    provider = StreamInternalErrorProvider()
+    llm._provider = provider
+
+    response = await llm.chat([Message(role="user", content="hello")])
+
+    assert response.content == "recovered"
+    assert provider.calls == 2
+
+
+def test_llm_retry_delay_uses_configured_cooldown() -> None:
+    llm = LLMInterface(
+        LLMConfig(
+            provider=LLMProvider.OPENAI,
+            model="gpt-4o",
+            api_key="test",
+            retry_cooldown_seconds=60,
+        )
+    )
+
+    assert llm._retry_delay_seconds(3) == 60
 
 
 @pytest.mark.asyncio
@@ -455,4 +508,10 @@ async def test_openai_provider_passes_timeout_to_stream_chat_request() -> None:
 def test_empty_stream_message_is_retryable_provider_failure() -> None:
     assert _is_transient_exception(
         RuntimeError("empty_stream: upstream stream closed before first payload")
+    )
+
+
+def test_openai_stream_internal_error_is_retryable_provider_failure() -> None:
+    assert _is_transient_exception(
+        RuntimeError("stream error: stream ID 177; INTERNAL_ERROR; received from peer")
     )

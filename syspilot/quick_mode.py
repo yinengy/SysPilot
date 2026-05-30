@@ -242,7 +242,7 @@ class QuickModeReport:
 
 
 RunExecutor = Callable[..., Awaitable[dict[str, Any]]]
-ParseActions = Callable[[str], dict[str, Any]]
+ParseActions = Callable[..., dict[str, Any]]
 BuildCandidates = Callable[..., list[dict[str, Any]]]
 ExtractHypothesisProfiles = Callable[
     [dict[str, object] | None, list[str] | None], list[dict[str, Any]]
@@ -286,6 +286,20 @@ def _render_excluded_config_names(names: Sequence[str]) -> str:
         f"Keep exactly these controls unchanged: {joined}. Only these exact listed "
         "environment variables, command-line parameters, or config controls are immutable; "
         "related controls with different names remain tunable when supported by evidence."
+    )
+
+
+def _render_tunable_whitelist_names(names: Sequence[str]) -> str:
+    if not names:
+        return (
+            "A tunable whitelist file was provided, but it contained no controls. "
+            "Return no tuning actions."
+        )
+    joined = ", ".join(names)
+    return (
+        f"Change only these exact tunable controls: {joined}. Environment variables, "
+        "command-line parameters, command-prefix parameters, or config controls not listed here "
+        "must remain unchanged even when evidence suggests they may help."
     )
 
 
@@ -1579,6 +1593,8 @@ def _build_quick_recommendation_prompt(
     inline_env_overrides: dict[str, str],
     excluded_config_content: str,
     excluded_config_list: Sequence[str],
+    tunable_whitelist_content: str,
+    tunable_whitelist_list: Sequence[str] | None,
     window: QuickBaselineWindow,
     max_iterations: int,
     baseline_profiling_json: dict[str, Any],
@@ -1600,8 +1616,19 @@ def _build_quick_recommendation_prompt(
 ## Current Environment Overrides
 {json.dumps(inline_env_overrides, indent=2, sort_keys=True) if inline_env_overrides else "(none)"}
 
+## Candidate Base State
+- Every recommended action is applied relative to the Command and Current Environment Overrides
+  shown above.
+- Prior successful, skipped, or rejected candidates are history only; they are not active unless
+  their changes appear in the Command or Current Environment Overrides.
+- If you want to keep an environment or command-parameter value that is not in the current
+  Command/Environment, include it explicitly in this response.
+
 ## Immutable Controls
 {excluded_config_content}
+
+## Tunable Whitelist
+{tunable_whitelist_content}
 
 ## Ranked Abnormal Window
 - signal: {window.signal_name}
@@ -1628,18 +1655,37 @@ def _build_quick_recommendation_prompt(
 {_render_prompt_list(untouched_controls, empty="(unknown or fully explored)")}
 - protected immutable controls:
 {_render_prompt_list(excluded_config_list, empty="(none)")}
+- allowed tunable controls:
+{_render_prompt_list(tunable_whitelist_list or [], empty="(not restricted)")}
 
 ## Rules
 - Short-run ranking must use only target-signal improvement inside the matching window.
 - Do not optimize directly for wall time or the primary objective in the short screen.
 - Keep only the exact immutable controls listed above unchanged; do not treat same-library
   or related controls as immutable unless their exact names are listed.
+- If a tunable whitelist is active, recommend and change only exact controls listed in
+  the Tunable Whitelist section.
 - Keep workload-defining arguments fixed.
 - If this window is being retried under a fixed budget, propose finer-grained variants of
-  earlier ideas or use untouched candidate controls where supported by evidence.
+  earlier ideas or use untouched candidate controls; outputting a candidate is mandatory while
+  any allowed, new, safe candidate can be formed.
+- In any mode, you may ignore whether direct evidence supports the decision, and you do not
+  need to provide evidence to support a candidate.
+- Do not reject or omit a candidate only because evidence is absent or insufficient.
+- If no untouched control seems actionable, try different concrete values for previously tried
+  parameters or environment variables until the allowed value space is exhausted or the fixed
+  budget is exhausted.
 - Do not repeat skipped or rejected candidates exactly.
+- Treat each object in `candidates` as one complete concrete candidate delta from the Candidate
+  Base State, not as a patch on your previous suggestion.
+- To test mixed environment-variable and command-parameter changes together, put them in the same
+  candidate's `changes` object as exact-name-to-value mappings.
+- Keys starting with `-` are command-line parameters; all other keys are environment variables.
+- Separate candidate objects are alternatives; they are not sequential edits to combine into one
+  command.
+- Each materialized candidate is one runnable command plus its environment overrides.
 - Return JSON only.
-- Provide up to {action_limit} ordered actions.
+- Provide up to {action_limit} candidate objects ordered best-first.
 
 ## Baseline Profiling JSON
 {profiling_json_for_prompt(baseline_profiling_json)}
@@ -1656,20 +1702,23 @@ def _build_quick_recommendation_prompt(
 ## JSON Schema
 {{
   "summary": "short decision summary",
-  "manual_citation": "optional concrete rule from loaded manual(s), or empty when\n"
-  "    grounded only in runtime evidence",
-  "evidence": ["concise evidence item", "..."],
+  "manual_citation": "optional concrete rule from loaded manual(s), or empty",
+  "evidence": ["optional concise evidence item; may be empty", "..."],
   "hypothesis_refs": ["optional hypothesis ids to prioritize next profiling round"],
-  "actions": [
+  "candidates": [
     {{
-      "config_type": "env_var | command_prefix | command",
-      "parameter": "required for env_var; for command use the option/name being changed when applicable",
-      "new_value": "string or token list; for command include only changed tokens relative to the current command, not the full command",
-      "reason": "why this action follows from evidence",
-      "manual_citation": "optional manual/contract rule supporting this action"
+      "reason": "why this complete candidate should be tried",
+      "manual_citation": "optional manual/contract rule supporting this candidate",
+      "changes": {{
+        "--exact-command-parameter": "concrete value",
+        "EXACT_ENV_NAME": "concrete value"
+      }}
     }}
   ]
-}}"""
+}}
+
+Do not use placeholder keys in real responses. Do not use bundled or alternation syntax such as
+`AAA|BBB` anywhere. Values must be concrete scalar target values, not arrays or objects."""
 
 
 def _maybe_reprompt_same_window(
@@ -1887,6 +1936,7 @@ async def run_quick_tune_loop_async(
     format_metric_value: FormatMetricValue,
     defaults: QuickModeDefaults | None = None,
     excluded_config_names: Sequence[str] | None = None,
+    tunable_whitelist_names: Sequence[str] | None = None,
 ) -> None:
     tune_started_at = time.time()
     baseline_config_find_wall_time_s = 0.0
@@ -1924,6 +1974,9 @@ async def run_quick_tune_loop_async(
 
     cmd_parts, inline_env_overrides = extract_inline_env_assignments(cmd_parts)
     excluded_config_list = list(excluded_config_names or [])
+    tunable_whitelist_list = (
+        None if tunable_whitelist_names is None else list(tunable_whitelist_names)
+    )
     loaded_manual_names = sorted(getattr(agent.context, "loaded_manuals", {}).keys())
     manual_hint_list = list(manual_hints)
     manual_context_status = (
@@ -1957,6 +2010,7 @@ async def run_quick_tune_loop_async(
         "workdir": workdir,
         "memory_high": memory_high,
         "excluded_config_names": excluded_config_list,
+        "tunable_whitelist_names": tunable_whitelist_list or [],
         "defaults": asdict(resolved_defaults),
         **_fixed_budget_payload(fixed_budget_state),
     }
@@ -1978,6 +2032,7 @@ async def run_quick_tune_loop_async(
             "loaded_manuals": loaded_manual_names,
             "manual_hints": manual_hint_list,
             "excluded_config_names": excluded_config_list,
+            "tunable_whitelist_names": tunable_whitelist_list or [],
             "primary_objective_query": primary_objective or "",
             "primary_objective_mode": primary_objective_mode or "",
             "artifact_dir": str(artifact_dir),
@@ -1991,6 +2046,8 @@ async def run_quick_tune_loop_async(
         f"Workdir: {workdir or '(current)'}\n"
         f"MemoryHigh: {memory_high or '(none)'}\n"
         f"Contracts: {len(list(contracts))} loaded\n"
+        f"Tunable whitelist: "
+        f"{', '.join(tunable_whitelist_list) if tunable_whitelist_list is not None and tunable_whitelist_list else ('(empty)' if tunable_whitelist_list is not None else '(not set)')}\n"
         f"{manual_context_status}\n"
         f"Primary objective: {primary_objective or '(wall time)'}"
         f"{f' ({primary_objective_mode})' if primary_objective_mode else ''}\n"
@@ -2375,6 +2432,11 @@ async def run_quick_tune_loop_async(
         manual_hint_content = _render_spawn_manual_hints(manual_hints)
         loaded_manual_content = _render_loaded_manual_context(agent.context.loaded_manuals)
         excluded_config_content = _render_excluded_config_names(excluded_config_list)
+        tunable_whitelist_content = (
+            _render_tunable_whitelist_names(tunable_whitelist_list)
+            if tunable_whitelist_list is not None
+            else "(not set; all supported non-immutable controls remain tunable)"
+        )
         group_short_results: list[QuickShortResult] = []
         skipped_rejected_candidates: list[str] = []
         attempted_controls: set[str] = set()
@@ -2390,6 +2452,8 @@ async def run_quick_tune_loop_async(
                 inline_env_overrides=inline_env_overrides,
                 excluded_config_content=excluded_config_content,
                 excluded_config_list=excluded_config_list,
+                tunable_whitelist_content=tunable_whitelist_content,
+                tunable_whitelist_list=tunable_whitelist_list,
                 window=window,
                 max_iterations=_max_iteration_trials_remaining(),
                 baseline_profiling_json=cast(
@@ -2407,6 +2471,10 @@ async def run_quick_tune_loop_async(
                     control
                     for control in window.candidate_controls
                     if control not in attempted_controls and control not in excluded_config_list
+                    and (
+                        tunable_whitelist_list is None
+                        or control in tunable_whitelist_list
+                    )
                 ],
                 retry_reason=retry_reason,
             )
@@ -2442,7 +2510,11 @@ async def run_quick_tune_loop_async(
                 provider_failed = True
                 break
 
-            recommendation = parse_spawn_actions(response.content)
+            recommendation = parse_spawn_actions(
+                response.content,
+                baseline_command_tokens=cmd_parts,
+                baseline_env_overrides=inline_env_overrides,
+            )
             if not recommendation.get("valid", False):
                 error_text = str(recommendation.get("error", "")).strip() or "unknown parse error"
                 sink.print(
@@ -2467,14 +2539,15 @@ async def run_quick_tune_loop_async(
                     unfillable_no_action = True
                 break
 
+            candidate_specs = recommendation.get("candidates", [])
             actions = recommendation.get("actions", [])
-            if not isinstance(actions, list) or not actions:
+            if not isinstance(candidate_specs, list) or not candidate_specs:
                 sink.print(
-                    "    [yellow]Window recommendation returned no concrete actions; nothing "
+                    "    [yellow]Window recommendation returned no concrete candidates; nothing "
                     "executable to screen.[/yellow]"
                 )
-                skipped_rejected_candidates.append("recommendation returned no concrete actions")
-                retry_reason = "previous recommendation returned no concrete actions"
+                skipped_rejected_candidates.append("recommendation returned no concrete candidates")
+                retry_reason = "previous recommendation returned no concrete candidates"
                 should_reprompt, exhausted_reprompts = _maybe_reprompt_same_window(
                     fixed_budget_state,
                     same_window_no_action_reprompts,
@@ -2518,10 +2591,11 @@ async def run_quick_tune_loop_async(
                 )
             candidate_plans = build_spawn_candidates(
                 cmd_parts,
-                actions,
+                candidate_specs,
                 candidate_plan_limit,
-                inline_env_overrides,
-                excluded_config_list,
+                base_env_overrides=inline_env_overrides,
+                excluded_config_names=excluded_config_list,
+                tunable_whitelist_names=tunable_whitelist_list,
             )
             if not candidate_plans:
                 sink.print(
@@ -3309,6 +3383,7 @@ def run_quick_tune_loop(
     format_metric_value: FormatMetricValue,
     defaults: QuickModeDefaults | None = None,
     excluded_config_names: Sequence[str] | None = None,
+    tunable_whitelist_names: Sequence[str] | None = None,
 ) -> None:
     asyncio.run(
         run_quick_tune_loop_async(
@@ -3344,5 +3419,6 @@ def run_quick_tune_loop(
             format_metric_value=format_metric_value,
             defaults=defaults,
             excluded_config_names=excluded_config_names,
+            tunable_whitelist_names=tunable_whitelist_names,
         )
     )

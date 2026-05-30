@@ -38,7 +38,8 @@ class LLMConfig:
     temperature: float = 0.1
     max_tokens: int = 4096
     timeout_seconds: float = 30.0
-    max_retries: int = 1
+    max_retries: int = 5
+    retry_cooldown_seconds: float = 60.0
     debug_conversation: bool = False
     debug_markdown_file: str | None = None
     debug_markdown_append: bool = False
@@ -74,7 +75,8 @@ class LLMConfig:
             temperature=config.get("temperature", 0.1),
             max_tokens=config.get("max_tokens", 4096),
             timeout_seconds=config.get("timeout_seconds", 30.0),
-            max_retries=config.get("max_retries", 1),
+            max_retries=config.get("max_retries", 5),
+            retry_cooldown_seconds=config.get("retry_cooldown_seconds", 60.0),
             debug_conversation=config.get("debug_conversation", False),
             debug_markdown_file=config.get("debug_markdown_file"),
             debug_markdown_append=config.get("debug_markdown_append", False),
@@ -227,6 +229,7 @@ class SysPilotConfig:
                 "max_tokens": self.llm.max_tokens,
                 "timeout_seconds": self.llm.timeout_seconds,
                 "max_retries": self.llm.max_retries,
+                "retry_cooldown_seconds": self.llm.retry_cooldown_seconds,
                 "debug_conversation": self.llm.debug_conversation,
                 "debug_markdown_file": self.llm.debug_markdown_file,
                 "debug_markdown_append": self.llm.debug_markdown_append,

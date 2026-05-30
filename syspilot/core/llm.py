@@ -40,6 +40,8 @@ def _is_transient_exception(exc: BaseException) -> bool:
     message = str(exc).lower()
     if "empty_stream" in message or "upstream stream closed before first payload" in message:
         return True
+    if "stream error" in message and "internal_error" in message:
+        return True
 
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError)):
         return True
@@ -562,7 +564,8 @@ class LLMInterface:
         return max(int(self.config.max_retries), 0) + 1
 
     def _retry_delay_seconds(self, attempt: int) -> float:
-        return min(0.5 * attempt, 1.5)
+        _ = attempt
+        return max(float(self.config.retry_cooldown_seconds), 0.0)
 
     def _normalize_provider_error(self, exc: BaseException) -> LLMError:
         if isinstance(exc, LLMError):

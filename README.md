@@ -62,6 +62,9 @@ syspilot tune --command "./benchmark -t 4" --contract numactl --manual "parent p
 # Keep selected controls unchanged while tuning
 syspilot tune --command "./benchmark -t 4" --contract numactl --exclude-config OMP_NUM_THREADS
 
+# Allow tuning only controls listed one-per-line in a file
+syspilot tune --command "./benchmark -t 4" --contract numactl --tunable-whitelist ./tunables.txt
+
 # Skip profiling and ask the LLM to reason from raw stdout/stderr only
 syspilot tune --command "./benchmark -t 4" --no-profile
 
@@ -146,6 +149,7 @@ syspilot tune \
 - `--manual <hint[,hint...]>` adds application-specific natural-language hints directly to the tuning prompt. Manual hints never generate LPCL hypotheses.
 - `--contract` and `--manual` are orthogonal and can be used together in the same tune run.
 - `--exclude-config <name[,name...]>` marks environment variables, command-line parameters, or config controls as immutable for the tuning prompt and candidate validation, so SysPilot keeps controls such as `BENCHMARK_BLOSC_CNAME` unchanged even if the LLM recommends modifying them.
+- `--tunable-whitelist <file>` restricts tuning to newline-separated exact control names from that file, such as `OMP_NUM_THREADS` or `--outer-jobs`. Blank lines are ignored, trailing spaces are trimmed, and bundled alternation entries such as `AAA|BBB` are rejected because each line must name one environment variable, command-line parameter, or config control.
 - When `--primary-objective` is set, SysPilot uses the LLM to extract workload outcome metrics (for example elapsed time, throughput, latency, or bandwidth) from stdout and rank candidates on the resolved metric first.
 - `--primary-objective <query>` is free-form user intent, so phrases like `"wall time"`, `"throughput"`, or even near-miss strings like `"ELAPSED SED"` can resolve onto extracted numeric metrics.
 - `--primary-objective-mode {minimize,maximize}` remains available when the resolved metric is real but its optimization direction is not obvious from the metric name.
@@ -253,11 +257,12 @@ Use OpenAI API mode:
   "temperature": 0.1,
   "max_tokens": 272000,
   "timeout_seconds": 120,
-  "max_retries": 1
+  "max_retries": 5,
+  "retry_cooldown_seconds": 60
 }
 ```
 
-`model` is used for tuning analysis and candidate recommendations. `metric_extraction_model` is optional and only changes the model used for primary-objective metric extraction from workload stdout/stderr; it reuses the same provider, `base_url`, credentials, timeout, retry, and debug settings.
+`model` is used for tuning analysis and candidate recommendations. `metric_extraction_model` is optional and only changes the model used for primary-objective metric extraction from workload stdout/stderr; it reuses the same provider, `base_url`, credentials, timeout, retry, cooldown, and debug settings. `max_retries` is the number of retry attempts after the initial request; the default repo config retries transient provider failures up to 5 times with a 60-second cooldown between attempts.
 
 To switch to ChatGPT OAuth mode, edit the same file:
 
@@ -270,7 +275,8 @@ To switch to ChatGPT OAuth mode, edit the same file:
   "temperature": 0.1,
   "max_tokens": 4096,
   "timeout_seconds": 120,
-  "max_retries": 1
+  "max_retries": 5,
+  "retry_cooldown_seconds": 60
 }
 ```
 

@@ -176,6 +176,26 @@ def test_command_delta_replaces_parameter_option_value(
     assert applied == ["command worker --threads 12 --items 100"]
 
 
+def test_command_delta_replaces_multiple_option_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = ["worker", "--joblib-n-jobs", "6", "--blas-threads", "4"]
+    action = {
+        "config_type": "command",
+        "parameter": "--joblib-n-jobs",
+        "new_value": ["--joblib-n-jobs", "12", "--blas-threads", "1"],
+    }
+
+    monkeypatch.setattr(cli_module, "_discover_supported_cli_options", lambda help_target: None)
+
+    command, env_overrides, applied, skipped = _build_spawn_execution_plan(base, [action])
+
+    assert command == ["worker", "--joblib-n-jobs", "12", "--blas-threads", "1"]
+    assert env_overrides == {}
+    assert skipped == []
+    assert applied == ["command worker --joblib-n-jobs 12 --blas-threads 1"]
+
+
 def test_llama_bench_rewrite_rejects_thread_sweep_values() -> None:
     base = _llama_bench_base_command()
     action = {
@@ -567,6 +587,64 @@ def test_build_spawn_candidates_keeps_allowed_actions_after_excluded_env_var() -
     assert candidates[0]["cmd"] == base
     assert candidates[0]["env_overrides"] == {"A": "1", "B": "3"}
     assert candidates[0]["skipped_actions"] == ["action[0] changes excluded config 'A'"]
+
+
+def test_build_spawn_execution_plan_respects_tunable_whitelist_env_vars() -> None:
+    base = ["worker", "--items", "100"]
+    actions = [
+        {"config_type": "env_var", "parameter": "OMP_NUM_THREADS", "new_value": "4"},
+        {"config_type": "env_var", "parameter": "OPENBLAS_NUM_THREADS", "new_value": "1"},
+    ]
+
+    command, env_overrides, applied, skipped = _build_spawn_execution_plan(
+        base,
+        actions,
+        tunable_whitelist_names=["OMP_NUM_THREADS"],
+    )
+
+    assert command == base
+    assert env_overrides == {"OMP_NUM_THREADS": "4"}
+    assert applied == ["env OMP_NUM_THREADS=4"]
+    assert skipped == ["action[1] changes non-whitelisted config 'OPENBLAS_NUM_THREADS'"]
+
+
+def test_build_spawn_execution_plan_respects_tunable_whitelist_command_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base = ["worker", "--threads", "8", "--items", "100"]
+    actions = [
+        {"config_type": "command", "parameter": "--items", "new_value": "200"},
+        {"config_type": "command", "parameter": "--threads", "new_value": "4"},
+    ]
+
+    monkeypatch.setattr(cli_module, "_discover_supported_cli_options", lambda help_target: None)
+
+    command, env_overrides, applied, skipped = _build_spawn_execution_plan(
+        base,
+        actions,
+        tunable_whitelist_names=["--threads"],
+    )
+
+    assert command == ["worker", "--threads", "4", "--items", "100"]
+    assert env_overrides == {}
+    assert applied == ["command worker --threads 4 --items 100"]
+    assert skipped == [
+        "action[0] command rewrite changes non-whitelisted config(s): --items",
+    ]
+
+
+def test_build_spawn_execution_plan_rejects_bundled_new_value_tokens() -> None:
+    base = ["worker", "--threads", "8"]
+    action = {"config_type": "command", "new_value": ["--threads|--jobs", "4"]}
+
+    command, env_overrides, applied, skipped = _build_spawn_execution_plan(base, [action])
+
+    assert command == base
+    assert env_overrides == {}
+    assert applied == []
+    assert skipped == [
+        "action[0] new_value uses unsupported bundled token syntax: --threads|--jobs"
+    ]
 
 
 def test_python_command_rewrite_rejects_unsupported_script_option_when_help_is_available(

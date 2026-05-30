@@ -358,7 +358,7 @@ class _DummyAgent:
 
     async def step(self, prompt: str) -> _DummyResponse:
         self.prompts.append(prompt)
-        return _DummyResponse('{"summary":"none","manual_citation":"","evidence":[],"actions":[]}')
+        return _DummyResponse('{"summary":"none","manual_citation":"","evidence":[],"candidates":[]}')
 
 
 class _FailingSpawnAgent(_DummyAgent):
@@ -379,10 +379,10 @@ class _ActionThenNoneSpawnAgent(_DummyAgent):
             return _DummyResponse(
                 '{"summary":"try candidate","manual_citation":"rule",'
                 '"evidence":["baseline timed out"],'
-                '"actions":[{"config_type":"env_var","parameter":"OMP_PROC_BIND","new_value":"close",'
-                '"reason":"improve locality","manual_citation":"rule"}]}'
+                '"candidates":[{"reason":"improve locality","manual_citation":"rule",'
+                '"changes":{"OMP_PROC_BIND":"close"}}]}'
             )
-        return _DummyResponse('{"summary":"none","manual_citation":"","evidence":[],"actions":[]}')
+        return _DummyResponse('{"summary":"none","manual_citation":"","evidence":[],"candidates":[]}')
 
 
 class _FixedBudgetRepromptThenActionSpawnAgent(_DummyAgent):
@@ -396,13 +396,12 @@ class _FixedBudgetRepromptThenActionSpawnAgent(_DummyAgent):
         if self._calls == 1:
             return _DummyResponse(
                 '{"summary":"STOP:need_concrete_candidate","manual_citation":"","evidence":'
-                '["need a concrete safe env-only change"],"actions":[]}'
+                '["need a concrete safe env-only change"],"candidates":[]}'
             )
         return _DummyResponse(
             '{"summary":"apply wait policy","manual_citation":"rule","evidence":'
-            '["runtime output shows idle waits"],"actions":[{"config_type":"env_var",'
-            '"parameter":"OMP_WAIT_POLICY","new_value":"ACTIVE","reason":"reduce idle waits",'
-            '"manual_citation":"rule"}]}'
+            '["runtime output shows idle waits"],"candidates":[{"reason":"reduce idle waits",'
+            '"manual_citation":"rule","changes":{"OMP_WAIT_POLICY":"ACTIVE"}}]}'
         )
 
 
@@ -411,7 +410,7 @@ class _FixedBudgetAlwaysNoActionSpawnAgent(_DummyAgent):
         self.prompts.append(prompt)
         return _DummyResponse(
             '{"summary":"STOP:no_safe_candidate","manual_citation":"","evidence":'
-            '["all safe candidates already exhausted"],"actions":[]}'
+            '["all safe candidates already exhausted"],"candidates":[]}'
         )
 
 
@@ -835,8 +834,11 @@ def test_spawn_mode_uses_contract_context_from_contract_option(tmp_path: Path) -
     assert "Generated Contract Hypotheses" in prompt
     assert "evidence:" not in prompt
     assert "OpenMP_doc:chunk_001" not in prompt
-    assert '"config_type": "env_var | command_prefix | command"' in prompt
-    assert "not the full command" in prompt
+    assert '"candidates"' in prompt
+    assert '"changes"' in prompt
+    assert '"--exact-command-parameter"' in prompt
+    assert '"EXACT_ENV_NAME"' in prompt
+    assert "Candidate Base State" in prompt
     assert '"config_type": "numactl' not in prompt
 
 
@@ -906,12 +908,11 @@ def test_spawn_mode_prompt_includes_cumulative_previous_round_findings() -> None
                     '"evidence":["baseline timed out","'
                     + ("x" * 1600)
                     + long_response_marker
-                    + '"],"actions":[{"config_type":"env_var",'
-                    '"parameter":"OMP_PROC_BIND","new_value":"close",'
-                    '"reason":"improve locality","manual_citation":""}]}'
+                    + '"],"candidates":[{"reason":"improve locality",'
+                    '"manual_citation":"","changes":{"OMP_PROC_BIND":"close"}}]}'
                 )
             return _DummyResponse(
-                '{"summary":"none","manual_citation":"","evidence":[],"actions":[]}'
+                '{"summary":"none","manual_citation":"","evidence":[],"candidates":[]}'
             )
 
     async def _profiled_runs(*args: object, **kwargs: object) -> dict[str, object]:
@@ -993,7 +994,7 @@ def test_spawn_mode_prompt_includes_cumulative_previous_round_findings() -> None
     assert "baseline context switches high" in second_prompt
     assert "llm_response:" in second_prompt
     assert '"summary":"try candidate"' in second_prompt
-    assert '"parameter":"OMP_PROC_BIND"' in second_prompt
+    assert '"changes":{"OMP_PROC_BIND":"close"}' in second_prompt
     assert long_response_marker in second_prompt
     assert "round: 1" in second_prompt
     assert "recommendation: try candidate" in second_prompt
@@ -1305,7 +1306,7 @@ def test_spawn_mode_manual_hints_do_not_generate_contract_hypotheses() -> None:
     prompt = _DummyAgent.instances[-1].prompts[0]
     assert "Application Manual Hints" in prompt
     assert "manager process forks workers after warmup" in prompt
-    assert "(No contract context provided)" in prompt
+    assert "(No generated contract hypotheses)" in prompt
 
 
 def test_spawn_mode_manual_hints_support_comma_splitting_and_escaped_commas() -> None:
@@ -1384,6 +1385,80 @@ def test_spawn_mode_prompt_includes_excluded_config_controls() -> None:
     assert "Only these exact listed environment variables" in prompt
     assert "related controls with different names remain tunable" in prompt
     assert "do not treat same-library or related controls as immutable" in prompt
+
+
+def test_spawn_mode_prompt_includes_tunable_whitelist(tmp_path: Path) -> None:
+    runner = CliRunner()
+    _DummyAgent.instances.clear()
+    whitelist = tmp_path / "whitelist.txt"
+    whitelist.write_text(
+        "OMP_NUM_THREADS\nOPENBLAS_NUM_THREADS\n--outer-jobs\n--backend-prefer \n",
+        encoding="utf-8",
+    )
+
+    with (
+        patch("syspilot.cli.SysPilotAgent", _DummyAgent),
+        patch("syspilot.cli._register_default_skills", _noop),
+        patch("syspilot.cli._register_profiling_tools", _noop),
+        patch("syspilot.cli._register_tuning_tools", _noop),
+        patch("syspilot.cli._run_live_profiling_pipeline", _fake_live_profile),
+        patch("syspilot.cli._run_command", _fake_run_command),
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "tune",
+                "--ui-mode",
+                "plain",
+                "--command",
+                "echo hi",
+                "--tunable-whitelist",
+                str(whitelist),
+                "--max-iterations",
+                "1",
+                "--timeout",
+                "1",
+            ],
+        )
+
+    assert result.exit_code == 0
+    prompt = _DummyAgent.instances[-1].prompts[0]
+    assert "## Tunable Whitelist" in prompt
+    assert (
+        "Change only these exact tunable controls: OMP_NUM_THREADS, "
+        "OPENBLAS_NUM_THREADS, --outer-jobs, --backend-prefer"
+    ) in prompt
+    assert "recommend and change only exact controls listed" in prompt
+    assert "AAA|BBB" in prompt
+    assert "## Candidate Base State" in prompt
+    assert "Previous recommendations, skipped candidates, and rejected candidates are history only" in prompt
+    assert '"candidates"' in prompt
+    assert '"changes"' in prompt
+    assert "Separate candidate objects are alternatives" in prompt
+    assert "not as a patch on your previous suggestion" in prompt
+    assert "not the full command" not in prompt
+
+
+def test_spawn_mode_tunable_whitelist_rejects_bundled_entries(tmp_path: Path) -> None:
+    runner = CliRunner()
+    whitelist = tmp_path / "whitelist.txt"
+    whitelist.write_text("OMP_NUM_THREADS|OPENBLAS_NUM_THREADS\n", encoding="utf-8")
+
+    result = runner.invoke(
+        cli,
+        [
+            "tune",
+            "--ui-mode",
+            "plain",
+            "--command",
+            "echo hi",
+            "--tunable-whitelist",
+            str(whitelist),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "use one exact control name per line" in result.output
 
 
 def test_spawn_mode_prompt_includes_effective_cgroup_memory_envelope() -> None:
@@ -1508,7 +1583,7 @@ def test_parse_spawn_actions_preserves_hypothesis_refs() -> None:
                 "manual_citation": "use hypothesis evidence",
                 "evidence": ["validation incomplete"],
                 "hypothesis_refs": ["h_shared_cpu_compute_conflict_openblas_openmp_compute"],
-                "actions": [],
+                "candidates": [],
             }
         )
     )
@@ -1524,16 +1599,14 @@ def test_parse_spawn_actions_allows_evidence_without_manual_citation() -> None:
                 "summary": "runtime evidence supports env trial",
                 "manual_citation": "",
                 "evidence": ["score is DALI-limited and Torch has headroom"],
-                "actions": [
+                "candidates": [
                     {
-                        "config_type": "command_prefix",
-                        "new_value": [
-                            "env",
-                            "BENCHMARK_DALI_MPS_SHARE=70",
-                            "BENCHMARK_TORCH_MPS_SHARE=30",
-                        ],
                         "reason": "rebalance reversible env-only GPU share",
                         "manual_citation": "",
+                        "changes": {
+                            "BENCHMARK_DALI_MPS_SHARE": "70",
+                            "BENCHMARK_TORCH_MPS_SHARE": "30",
+                        },
                     }
                 ],
             }
@@ -1543,6 +1616,52 @@ def test_parse_spawn_actions_allows_evidence_without_manual_citation() -> None:
     assert parsed["valid"] is True
     assert parsed["manual_citation"] == ""
     assert parsed["actions"]
+    assert parsed["candidates"]
+    assert parsed["candidates"][0]["reason"] == "rebalance reversible env-only GPU share"
+    assert parsed["candidates"][0]["manual_citation"] == ""
+
+
+def test_parse_spawn_actions_orders_changes_by_baseline_command() -> None:
+    parsed = _parse_spawn_actions(
+        json.dumps(
+            {
+                "summary": "try mixed ordered candidate",
+                "manual_citation": "",
+                "evidence": ["runtime evidence supports mixed changes"],
+                "candidates": [
+                    {
+                        "reason": "coordinate outer and inner workers",
+                        "changes": {
+                            "OMP_NUM_THREADS": "1",
+                            "--blas-threads": "1",
+                            "--joblib-n-jobs": "8",
+                        },
+                    }
+                ],
+            }
+        ),
+        baseline_command_tokens=[
+            "python",
+            "worker.py",
+            "--joblib-n-jobs",
+            "4",
+            "--blas-threads",
+            "24",
+        ],
+        baseline_env_overrides={"OMP_NUM_THREADS": "24"},
+    )
+
+    assert parsed["valid"] is True
+    assert [action["parameter"] for action in parsed["actions"]] == [
+        "OMP_NUM_THREADS",
+        "",
+    ]
+    assert parsed["actions"][1]["new_value"] == [
+        "--joblib-n-jobs",
+        "8",
+        "--blas-threads",
+        "1",
+    ]
 
 
 def test_parse_spawn_actions_rejects_numactl_config_type() -> None:
@@ -1552,12 +1671,12 @@ def test_parse_spawn_actions_rejects_numactl_config_type() -> None:
                 "summary": "legacy hardcoded placement action",
                 "manual_citation": "",
                 "evidence": ["numa placement needs adjustment"],
-                "actions": [
+                "candidates": [
                     {
-                        "config_type": "numactl",
-                        "parameter": "--cpunodebind",
-                        "new_value": "0",
                         "reason": "legacy placement action",
+                        "changes": {
+                            "numactl|--cpunodebind": "0",
+                        },
                     }
                 ],
             }
@@ -1566,31 +1685,44 @@ def test_parse_spawn_actions_rejects_numactl_config_type() -> None:
 
     assert parsed["valid"] is True
     assert parsed["actions"] == []
-    assert parsed["skipped_actions"] == ["action[0] has unsupported config_type 'numactl'"]
+    assert parsed["candidates"] == []
+    assert parsed["skipped_actions"] == [
+        "candidate[0].changes has invalid control name 'numactl|--cpunodebind'",
+        "candidate[0] has no valid changes",
+    ]
 
 
-def test_parse_spawn_actions_still_rejects_actions_without_evidence() -> None:
+def test_parse_spawn_actions_allows_actions_without_evidence() -> None:
     parsed = _parse_spawn_actions(
         json.dumps(
             {
-                "summary": "unsupported guess",
+                "summary": "try exploratory candidate",
                 "manual_citation": "",
                 "evidence": [],
-                "actions": [
+                "candidates": [
                     {
-                        "config_type": "env_var",
-                        "parameter": "OMP_PROC_BIND",
-                        "new_value": "close",
                         "reason": "guess",
+                        "changes": {
+                            "OMP_PROC_BIND": "close",
+                        },
                     }
                 ],
             }
         )
     )
 
-    assert parsed["valid"] is False
-    assert parsed["error"] == "Actionable recommendations require non-empty evidence"
-    assert parsed["actions"] == []
+    assert parsed["valid"] is True
+    assert parsed["error"] == ""
+    assert parsed["evidence"] == []
+    assert parsed["actions"] == [
+        {
+            "config_type": "env_var",
+            "parameter": "OMP_PROC_BIND",
+            "new_value": "close",
+            "reason": "guess",
+            "manual_citation": "",
+        }
+    ]
 
 
 def test_summarize_spawn_runtime_output_extracts_openmp_signals() -> None:

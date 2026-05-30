@@ -49,10 +49,10 @@ class _DummyQuickAgent:
         return SimpleNamespace(
             content=(
                 '{"summary":"screen env candidates","manual_citation":"rule","evidence":["signal"],'
-                '"actions":['
-                '{"config_type":"env_var","parameter":"OMP_PROC_BIND","new_value":"close","reason":"locality","manual_citation":"rule"},'
-                '{"config_type":"env_var","parameter":"OMP_WAIT_POLICY","new_value":"ACTIVE","reason":"latency","manual_citation":"rule"}'
-                "]}"
+                '"candidates":[{"reason":"signal",'
+                '"manual_citation":"rule",'
+                '"changes":{"OMP_PROC_BIND":"close","OMP_WAIT_POLICY":"ACTIVE"}}]'
+                "}"
             )
         )
 
@@ -1000,6 +1000,8 @@ def test_quick_recommendation_prompt_includes_generated_contract_hypotheses() ->
         inline_env_overrides={},
         excluded_config_content="(none)",
         excluded_config_list=[],
+        tunable_whitelist_content="(not set; all supported non-immutable controls remain tunable)",
+        tunable_whitelist_list=None,
         window=QuickBaselineWindow(
             window_id="sig-w1",
             signal_name="rss",
@@ -1035,6 +1037,59 @@ def test_quick_recommendation_prompt_includes_generated_contract_hypotheses() ->
     assert "Contract YAML: openmp" not in prompt
 
 
+def test_quick_recommendation_prompt_includes_tunable_whitelist() -> None:
+    prompt = _build_quick_recommendation_prompt(
+        cmd_parts=["python", "worker.py", "--outer-jobs", "4"],
+        inline_env_overrides={},
+        excluded_config_content="(none)",
+        excluded_config_list=[],
+        tunable_whitelist_content=(
+            "Change only these exact tunable controls: OMP_NUM_THREADS, --outer-jobs."
+        ),
+        tunable_whitelist_list=["OMP_NUM_THREADS", "--outer-jobs"],
+        window=QuickBaselineWindow(
+            window_id="sig-w1",
+            signal_name="rss",
+            signal_ref="demo.sig",
+            hypothesis_name="demo-hypothesis",
+            start_offset_s=0.0,
+            end_offset_s=30.0,
+            duration_s=30.0,
+            sample_count=6,
+            expected_direction="decrease",
+            severity=25.0,
+            abnormality_score=10.0,
+            candidate_controls=["OMP_NUM_THREADS", "--outer-jobs"],
+            window_summary={},
+            global_summary={},
+            reason="rss burst",
+        ),
+        max_iterations=3,
+        baseline_profiling_json={"periodic_probe_samples": []},
+        generated_hypothesis_content="",
+        loaded_manual_content="",
+        manual_hint_content="",
+        fixed_budget_remaining=None,
+        successful_prior_configs=[],
+        skipped_rejected_candidates=[],
+        untouched_controls=["OMP_NUM_THREADS", "--outer-jobs"],
+        retry_reason="",
+    )
+
+    assert "## Tunable Whitelist" in prompt
+    assert "Change only these exact tunable controls: OMP_NUM_THREADS, --outer-jobs" in prompt
+    assert "allowed tunable controls:" in prompt
+    assert "- OMP_NUM_THREADS" in prompt
+    assert "- --outer-jobs" in prompt
+    assert "AAA|BBB" in prompt
+    assert "## Candidate Base State" in prompt
+    assert "Prior successful, skipped, or rejected candidates are history only" in prompt
+    assert '"candidates"' in prompt
+    assert '"changes"' in prompt
+    assert "Separate candidate objects are alternatives" in prompt
+    assert "not as a patch on your previous suggestion" in prompt
+
+
 def test_run_live_profiling_pipeline_marks_intentional_short_stop() -> None:
     agent = _LiveProfileAgent()
 
@@ -1054,12 +1109,14 @@ def test_run_live_profiling_pipeline_marks_intentional_short_stop() -> None:
     assert artifact["stop_reason"] == "screen_budget_reached"
 
 
-def test_quick_mode_dispatches_from_cli() -> None:
+def test_quick_mode_dispatches_from_cli(tmp_path: Path) -> None:
     runner = CliRunner()
     called = {"quick": 0, "default": 0}
+    whitelist = tmp_path / "whitelist.txt"
+    whitelist.write_text("OMP_NUM_THREADS\n--outer-jobs\n", encoding="utf-8")
 
     def _fake_quick(**kwargs: object) -> None:
-        _ = kwargs
+        assert kwargs["tunable_whitelist_names"] == ["OMP_NUM_THREADS", "--outer-jobs"]
         called["quick"] += 1
 
     def _fake_default(*args: object, **kwargs: object) -> None:
@@ -1077,7 +1134,16 @@ def test_quick_mode_dispatches_from_cli() -> None:
     ):
         result = runner.invoke(
             cli,
-            ["tune", "--quick-mode", "--ui-mode", "plain", "--command", "echo hi"],
+            [
+                "tune",
+                "--quick-mode",
+                "--ui-mode",
+                "plain",
+                "--command",
+                "echo hi",
+                "--tunable-whitelist",
+                str(whitelist),
+            ],
         )
 
     assert result.exit_code == 0
@@ -1090,13 +1156,13 @@ def test_quick_mode_end_to_end_writes_structured_artifacts_and_objective_winner(
     class _ObjectiveQuickAgent(_DummyQuickAgent):
         async def step(self, prompt: str) -> SimpleNamespace:
             _ = prompt
-            actions = [
+            candidates = [
                 {
-                    "config_type": "env_var",
-                    "parameter": f"VAR_{idx}",
-                    "new_value": str(idx),
                     "reason": f"candidate {idx}",
                     "manual_citation": "rule",
+                    "changes": {
+                        "OMP_PROC_BIND" if idx % 2 else "OMP_WAIT_POLICY": f"value-{idx}"
+                    },
                 }
                 for idx in range(1, 11)
             ]
@@ -1106,7 +1172,7 @@ def test_quick_mode_end_to_end_writes_structured_artifacts_and_objective_winner(
                         "summary": "screen many env candidates",
                         "manual_citation": "rule",
                         "evidence": ["signal"],
-                        "actions": actions,
+                        "candidates": candidates,
                     }
                 )
             )
@@ -1288,7 +1354,7 @@ def test_quick_mode_end_to_end_writes_structured_artifacts_and_objective_winner(
                     "--contract",
                     "demo",
                     "--max-iterations",
-                    "10",
+                    "12",
                     "--timeout",
                     "5",
                 ],
@@ -1349,13 +1415,11 @@ def test_quick_mode_uses_completed_short_run_as_validated_objective_evidence() -
                         "summary": "screen one env candidate",
                         "manual_citation": "rule",
                         "evidence": ["signal"],
-                        "actions": [
+                        "candidates": [
                             {
-                                "config_type": "env_var",
-                                "parameter": "OMP_NUM_THREADS",
-                                "new_value": "1",
                                 "reason": "reduce contention",
                                 "manual_citation": "rule",
+                                "changes": {"OMP_NUM_THREADS": "1"},
                             }
                         ],
                     }
@@ -1531,13 +1595,11 @@ def test_quick_mode_fixed_budget_counts_one_short_and_one_full_then_stops() -> N
                         "summary": f"screen {parameter}",
                         "manual_citation": "rule",
                         "evidence": [parameter],
-                        "actions": [
+                        "candidates": [
                             {
-                                "config_type": "env_var",
-                                "parameter": parameter,
-                                "new_value": value,
                                 "reason": "budgeted check",
                                 "manual_citation": "rule",
+                                "changes": {parameter: value},
                             }
                         ],
                     }
@@ -1801,13 +1863,11 @@ def test_quick_mode_fixed_budget_auto_validated_short_consumes_one_slot() -> Non
                         "summary": "screen one env candidate",
                         "manual_citation": "rule",
                         "evidence": ["signal"],
-                        "actions": [
+                        "candidates": [
                             {
-                                "config_type": "env_var",
-                                "parameter": "OMP_NUM_THREADS",
-                                "new_value": "1",
                                 "reason": "reduce contention",
                                 "manual_citation": "rule",
+                                "changes": {"OMP_NUM_THREADS": "1"},
                             }
                         ],
                     }
@@ -2124,7 +2184,7 @@ def test_quick_mode_fixed_budget_counts_materialized_duplicate_candidate_without
                     "--contract",
                     "demo",
                     "--max-iterations",
-                    "3",
+                    "8",
                     "--timeout",
                     "5",
                 ],
@@ -2159,13 +2219,14 @@ def test_quick_mode_continues_after_significant_full_improvement() -> None:
             _ = prompt
             self.window_call_count += 1
             prefix = "RSS" if self.window_call_count == 1 else "QUEUE"
-            actions = [
+            candidates = [
                 {
-                    "config_type": "env_var",
-                    "parameter": f"{prefix}_VAR_{idx}",
-                    "new_value": str(idx),
                     "reason": f"{prefix.lower()} candidate {idx}",
                     "manual_citation": "rule",
+                    "changes": {
+                        f"{prefix}_VAR_{item_idx}": str(item_idx)
+                        for item_idx in range(1, idx + 1)
+                    },
                 }
                 for idx in range(1, 4)
             ]
@@ -2175,7 +2236,7 @@ def test_quick_mode_continues_after_significant_full_improvement() -> None:
                         "summary": f"screen {prefix.lower()} candidates",
                         "manual_citation": "rule",
                         "evidence": [prefix.lower()],
-                        "actions": actions,
+                        "candidates": candidates,
                     }
                 )
             )
@@ -2380,7 +2441,7 @@ def test_quick_mode_continues_after_significant_full_improvement() -> None:
                     "--contract",
                     "demo",
                     "--max-iterations",
-                    "3",
+                    "8",
                     "--timeout",
                     "5",
                 ],
@@ -2425,7 +2486,7 @@ def test_fixed_budget_quick_no_action_reprompts_empty_actions_then_candidate() -
                             "summary": "no action yet",
                             "manual_citation": "",
                             "evidence": ["signal"],
-                            "actions": [],
+                            "candidates": [],
                         }
                     )
                 )
@@ -2435,13 +2496,11 @@ def test_fixed_budget_quick_no_action_reprompts_empty_actions_then_candidate() -
                         "summary": "screen one candidate",
                         "manual_citation": "rule",
                         "evidence": ["signal"],
-                        "actions": [
+                        "candidates": [
                             {
-                                "config_type": "env_var",
-                                "parameter": "OMP_NUM_THREADS",
-                                "new_value": "1",
                                 "reason": "reduce contention",
                                 "manual_citation": "rule",
+                                "changes": {"OMP_NUM_THREADS": "1"},
                             }
                         ],
                     }
@@ -2510,14 +2569,15 @@ def test_fixed_budget_quick_no_action_reprompts_empty_actions_then_candidate() -
         agent = _EmptyActionsThenCandidateAgent.instances[-1]
         assert len(agent.prompts) == 2
         retry_prompt = agent.prompts[1]
-        assert '"config_type": "env_var | command_prefix | command"' in retry_prompt
-        assert "not the full command" in retry_prompt
+        assert '"changes"' in retry_prompt
+        assert '"EXACT_ENV_NAME"' in retry_prompt
+        assert "exact-name-to-value mappings" in retry_prompt
         assert '"config_type": "numactl' not in retry_prompt
         assert "remaining fixed candidate budget: 1" in retry_prompt
-        assert "retry reason: previous recommendation returned no concrete actions" in retry_prompt
+        assert "retry reason: previous recommendation returned no concrete candidates" in retry_prompt
         assert "successful prior configs:" in retry_prompt
         assert "(none yet)" in retry_prompt
-        assert "recommendation returned no concrete actions" in retry_prompt
+        assert "recommendation returned no concrete candidates" in retry_prompt
         assert "untouched candidate controls for this window:" in retry_prompt
         assert "OMP_NUM_THREADS" in retry_prompt
         assert "OMP_PROC_BIND" in retry_prompt
@@ -2550,13 +2610,11 @@ def test_fixed_budget_quick_no_action_reprompts_invalid_parse_then_candidate() -
                         "summary": "screen one candidate",
                         "manual_citation": "rule",
                         "evidence": ["signal"],
-                        "actions": [
+                        "candidates": [
                             {
-                                "config_type": "env_var",
-                                "parameter": "OMP_NUM_THREADS",
-                                "new_value": "1",
                                 "reason": "reduce contention",
                                 "manual_citation": "rule",
+                                "changes": {"OMP_NUM_THREADS": "1"},
                             }
                         ],
                     }
@@ -2835,12 +2893,12 @@ def test_fixed_budget_quick_unfillable_no_action_exits_without_spending_budget()
             self.prompts.append(prompt)
             return SimpleNamespace(
                 content=json.dumps(
-                    {
-                        "summary": "still no action",
-                        "manual_citation": "",
-                        "evidence": ["signal"],
-                        "actions": [],
-                    }
+                        {
+                            "summary": "still no action",
+                            "manual_citation": "",
+                            "evidence": ["signal"],
+                            "candidates": [],
+                        }
                 )
             )
 
@@ -2919,13 +2977,11 @@ def test_fixed_budget_quick_candidate_space_exhausted_reports_stop_reason() -> N
                         "summary": "screen env candidate",
                         "manual_citation": "rule",
                         "evidence": ["signal"],
-                        "actions": [
+                        "candidates": [
                             {
-                                "config_type": "env_var",
-                                "parameter": "OMP_NUM_THREADS",
-                                "new_value": "1",
                                 "reason": "bounded candidate",
                                 "manual_citation": "rule",
+                                "changes": {"OMP_NUM_THREADS": "1"},
                             }
                         ],
                     }
@@ -3064,7 +3120,7 @@ def test_fixed_budget_quick_no_action_reprompt_cap_is_per_window_not_global() ->
                             "summary": "no action yet",
                             "manual_citation": "",
                             "evidence": ["signal"],
-                            "actions": [],
+                            "candidates": [],
                         }
                     )
                 )
@@ -3075,13 +3131,11 @@ def test_fixed_budget_quick_no_action_reprompt_cap_is_per_window_not_global() ->
                         "summary": f"screen {parameter}",
                         "manual_citation": "rule",
                         "evidence": ["signal"],
-                        "actions": [
+                        "candidates": [
                             {
-                                "config_type": "env_var",
-                                "parameter": parameter,
-                                "new_value": "1",
                                 "reason": "reduce contention",
                                 "manual_citation": "rule",
+                                "changes": {parameter: "1"},
                             }
                         ],
                     }

@@ -129,6 +129,7 @@ def _merge_llm_config_with_repo_defaults(data: dict[str, Any]) -> LLMConfig:
         "max_tokens": repo_llm.max_tokens,
         "timeout_seconds": repo_llm.timeout_seconds,
         "max_retries": repo_llm.max_retries,
+        "retry_cooldown_seconds": repo_llm.retry_cooldown_seconds,
         "debug_conversation": repo_llm.debug_conversation,
         "debug_markdown_file": repo_llm.debug_markdown_file,
         "debug_markdown_append": repo_llm.debug_markdown_append,
@@ -600,6 +601,22 @@ def _normalize_multi_value_option(values: Sequence[str]) -> list[str]:
     return normalized
 
 
+def _load_tunable_whitelist(path: Path) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        name = line.strip()
+        if not name or name in seen:
+            continue
+        if "|" in name:
+            raise ValueError(
+                f"invalid tunable whitelist entry {name!r}; use one exact control name per line"
+            )
+        names.append(name)
+        seen.add(name)
+    return names
+
+
 def _looks_like_inline_manual_hint(value: str) -> bool:
     return any(char.isspace() for char in value)
 
@@ -635,6 +652,20 @@ def _render_excluded_config_names(names: Sequence[str]) -> str:
         f"Keep exactly these controls unchanged: {joined}. Only these exact listed "
         "environment variables, command-line parameters, or config controls are immutable; "
         "related controls with different names remain tunable when supported by evidence."
+    )
+
+
+def _render_tunable_whitelist_names(names: Sequence[str]) -> str:
+    if not names:
+        return (
+            "A tunable whitelist file was provided, but it contained no controls. "
+            "Return no tuning actions."
+        )
+    joined = ", ".join(names)
+    return (
+        f"Change only these exact tunable controls: {joined}. Environment variables, "
+        "command-line parameters, command-prefix parameters, or config controls not listed here "
+        "must remain unchanged even when evidence suggests they may help."
     )
 
 
@@ -1409,6 +1440,14 @@ def skills() -> None:
     ),
 )
 @click.option(
+    "--tunable-whitelist",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help=(
+        "File containing newline-separated environment variables, command-line parameters, "
+        "or config controls that tune is allowed to change."
+    ),
+)
+@click.option(
     "--fixed-budget",
     type=click.IntRange(min=1),
     help="Positive cap on total candidate trial budget across tune mode.",
@@ -1549,6 +1588,7 @@ def tune(
     contract: tuple[str, ...],
     manual: tuple[str, ...],
     exclude_config: tuple[str, ...],
+    tunable_whitelist: Path | None,
     fixed_budget: int | None,
     fixed_goal: float | None,
     max_iterations: int,
@@ -1592,6 +1632,13 @@ def tune(
     contract_names = _normalize_multi_value_option(contract)
     manual_inputs = _normalize_multi_value_option(manual)
     excluded_config_names = _normalize_multi_value_option(exclude_config)
+    tunable_whitelist_names: list[str] | None = None
+    if tunable_whitelist is not None:
+        try:
+            tunable_whitelist_names = _load_tunable_whitelist(tunable_whitelist)
+        except (OSError, ValueError) as exc:
+            sink.print(f"[red]Error: could not read --tunable-whitelist: {exc}[/red]")
+            raise SystemExit(1) from exc
     if primary_objective is not None:
         resolved_primary_objective = primary_objective.strip()
         if not resolved_primary_objective:
@@ -1696,6 +1743,10 @@ def tune(
             f"{', '.join(excluded_config_names)}[/cyan]"
         )
 
+    if tunable_whitelist_names is not None:
+        whitelist_display = ", ".join(tunable_whitelist_names) or "(empty)"
+        sink.print(f"[cyan]Restricting tunable controls to: {whitelist_display}[/cyan]")
+
     if initial_hypothesis_profiles:
         sink.print(
             "[cyan]Generated "
@@ -1752,6 +1803,7 @@ def tune(
                 initial_hypothesis_profiles=initial_hypothesis_profiles,
                 defaults=quick_mode_defaults,
                 excluded_config_names=excluded_config_names,
+                tunable_whitelist_names=tunable_whitelist_names,
             )
         else:
             _run_spawn_tune_loop(
@@ -1777,6 +1829,7 @@ def tune(
                 ),
                 initial_hypothesis_profiles,
                 excluded_config_names,
+                tunable_whitelist_names,
             )
     finally:
         if logger_forward_handler is not None:
@@ -2821,6 +2874,56 @@ def _parse_cli_command_signature(
     return options, positionals
 
 
+def _baseline_control_order(
+    baseline_command_tokens: Sequence[str] | None = None,
+    baseline_env_overrides: dict[str, str] | None = None,
+) -> dict[str, int]:
+    order: dict[str, int] = {}
+
+    def _remember(name: str) -> None:
+        if name and name not in order:
+            order[name] = len(order)
+
+    if baseline_env_overrides:
+        for env_name in baseline_env_overrides:
+            _remember(str(env_name))
+
+    command_tokens = list(baseline_command_tokens or [])
+    normalized_command, inline_env = _extract_inline_env_assignments(command_tokens)
+    for env_name in inline_env:
+        _remember(str(env_name))
+
+    idx = 1
+    while idx < len(normalized_command):
+        token = normalized_command[idx]
+        if not _is_option_token(token):
+            idx += 1
+            continue
+        option_name = token.split("=", 1)[0]
+        _remember(option_name)
+        idx += 1
+        if idx < len(normalized_command):
+            next_token = normalized_command[idx]
+            if not _is_option_token(next_token) or _looks_like_numeric_token(next_token):
+                idx += 1
+
+    return order
+
+
+def _control_sort_key(
+    control_name: str,
+    baseline_order: dict[str, int],
+    fallback_index: int = 0,
+) -> tuple[int, int | str, int]:
+    normalized = control_name.strip()
+    if normalized.startswith("env."):
+        normalized = normalized[4:]
+    normalized = normalized.split("=", 1)[0]
+    if normalized in baseline_order:
+        return (0, baseline_order[normalized], fallback_index)
+    return (1, normalized, fallback_index)
+
+
 def _help_target_tokens(command_tokens: list[str]) -> tuple[str, ...]:
     if not command_tokens:
         return tuple()
@@ -2977,6 +3080,7 @@ def _retry_spawn_candidate_without_unsupported_options(
     base_env_overrides: dict[str, str] | None,
     unsupported_options: list[str],
     excluded_config_names: Sequence[str] | None = None,
+    tunable_whitelist_names: Sequence[str] | None = None,
 ) -> tuple[dict[str, Any] | None, list[str]]:
     if not unsupported_options:
         return None, []
@@ -2999,6 +3103,7 @@ def _retry_spawn_candidate_without_unsupported_options(
         retry_actions,
         base_env_overrides=base_env_overrides,
         excluded_config_names=excluded_config_names,
+        tunable_whitelist_names=tunable_whitelist_names,
     )
     if not tuned_cmd:
         return None, removed_options
@@ -3209,7 +3314,12 @@ def _validate_spawn_command_rewrite(
     return issues
 
 
-def _parse_spawn_actions(response: str) -> dict[str, Any]:
+def _parse_spawn_actions(
+    response: str,
+    *,
+    baseline_command_tokens: Sequence[str] | None = None,
+    baseline_env_overrides: dict[str, str] | None = None,
+) -> dict[str, Any]:
     parsed = _extract_json_object(response)
     if not parsed:
         return {
@@ -3219,6 +3329,7 @@ def _parse_spawn_actions(response: str) -> dict[str, Any]:
             "manual_citation": "",
             "evidence": [],
             "actions": [],
+            "candidates": [],
             "skipped_actions": [],
         }
 
@@ -3241,66 +3352,126 @@ def _parse_spawn_actions(response: str) -> dict[str, Any]:
             if value:
                 hypothesis_refs.append(value)
 
-    actions_raw = parsed.get("actions", [])
-    if not isinstance(actions_raw, list):
+    if "candidates" not in parsed:
         return {
             "valid": False,
-            "error": "Field 'actions' must be a list",
+            "error": "Field 'candidates' must be present and must be a list",
             "summary": summary,
             "manual_citation": manual_citation,
             "evidence": evidence,
             "hypothesis_refs": hypothesis_refs,
             "actions": [],
+            "candidates": [],
             "skipped_actions": [],
         }
 
-    supported_types = {"env_var", "command_prefix", "command"}
-    normalized_actions: list[dict[str, Any]] = []
-    skipped_actions: list[str] = []
-
-    for idx, action in enumerate(actions_raw):
-        if not isinstance(action, dict):
-            skipped_actions.append(f"action[{idx}] is not an object")
-            continue
-
-        config_type = str(action.get("config_type", "")).strip().lower()
-        if config_type not in supported_types:
-            skipped_actions.append(f"action[{idx}] has unsupported config_type '{config_type}'")
-            continue
-
-        parameter = str(action.get("parameter", "")).strip()
-        reason = str(action.get("reason", "")).strip()
-        action_manual_citation = str(action.get("manual_citation", manual_citation)).strip()
-
-        if "new_value" not in action:
-            skipped_actions.append(f"action[{idx}] is missing new_value")
-            continue
-
-        if config_type == "env_var" and (not parameter or "=" in parameter or " " in parameter):
-            skipped_actions.append(f"action[{idx}] has invalid env var name '{parameter}'")
-            continue
-
-        normalized_actions.append(
-            {
-                "config_type": config_type,
-                "parameter": parameter,
-                "new_value": action.get("new_value"),
-                "reason": reason,
-                "manual_citation": action_manual_citation,
-            }
-        )
-
-    if normalized_actions and not evidence:
+    candidates_raw = parsed.get("candidates", [])
+    if not isinstance(candidates_raw, list):
         return {
             "valid": False,
-            "error": "Actionable recommendations require non-empty evidence",
+            "error": "Field 'candidates' must be a list",
             "summary": summary,
             "manual_citation": manual_citation,
             "evidence": evidence,
             "hypothesis_refs": hypothesis_refs,
             "actions": [],
-            "skipped_actions": skipped_actions,
+            "candidates": [],
+            "skipped_actions": [],
         }
+
+    candidate_fields = {"changes"}
+    normalized_actions: list[dict[str, Any]] = []
+    normalized_candidates: list[dict[str, Any]] = []
+    skipped_actions: list[str] = []
+    baseline_order = _baseline_control_order(baseline_command_tokens, baseline_env_overrides)
+
+    for candidate_idx, candidate in enumerate(candidates_raw):
+        if not isinstance(candidate, dict):
+            skipped_actions.append(f"candidate[{candidate_idx}] is not an object")
+            continue
+
+        candidate_reason = str(candidate.get("reason", "")).strip()
+        candidate_manual_citation = str(candidate.get("manual_citation", manual_citation)).strip()
+        candidate_actions: list[dict[str, Any]] = []
+
+        unknown_candidate_fields = sorted(
+            key
+            for key in candidate.keys()
+            if key not in {"reason", "manual_citation", *candidate_fields}
+        )
+        for field_name in unknown_candidate_fields:
+            skipped_actions.append(f"candidate[{candidate_idx}] has unsupported field '{field_name}'")
+
+        changes_raw = candidate.get("changes", {})
+        if not isinstance(changes_raw, dict):
+            skipped_actions.append(f"candidate[{candidate_idx}].changes must be an object")
+            changes_raw = {}
+
+        command_delta_tokens: list[str] = []
+        sorted_changes = sorted(
+            enumerate(changes_raw.items()),
+            key=lambda item: _control_sort_key(str(item[1][0]).strip(), baseline_order, item[0]),
+        )
+        for _, (raw_name, raw_value) in sorted_changes:
+            control_name = str(raw_name).strip()
+            if not control_name or "|" in control_name:
+                skipped_actions.append(
+                    f"candidate[{candidate_idx}].changes has invalid control name '{control_name}'"
+                )
+                continue
+            if isinstance(raw_value, (dict, list)):
+                skipped_actions.append(
+                    f"candidate[{candidate_idx}].changes['{control_name}'] must be a concrete scalar value"
+                )
+                continue
+            control_value = str(raw_value).strip()
+            if "|" in control_value:
+                skipped_actions.append(
+                    f"candidate[{candidate_idx}].changes['{control_name}'] uses unsupported bundled value syntax"
+                )
+                continue
+            if _is_option_token(control_name):
+                command_delta_tokens.extend([control_name, control_value])
+                continue
+
+            env_name = control_name
+            if "=" in env_name or " " in env_name:
+                skipped_actions.append(
+                    f"candidate[{candidate_idx}].changes has invalid env var name '{env_name}'"
+                )
+                continue
+            action = {
+                "config_type": "env_var",
+                "parameter": env_name,
+                "new_value": control_value,
+                "reason": candidate_reason,
+                "manual_citation": candidate_manual_citation,
+            }
+            candidate_actions.append(action)
+            normalized_actions.append(action)
+
+        if command_delta_tokens:
+            action = {
+                "config_type": "command",
+                "parameter": "",
+                "new_value": command_delta_tokens,
+                "reason": candidate_reason,
+                "manual_citation": candidate_manual_citation,
+            }
+            candidate_actions.append(action)
+            normalized_actions.append(action)
+
+        if not candidate_actions:
+            skipped_actions.append(f"candidate[{candidate_idx}] has no valid changes")
+            continue
+
+        normalized_candidates.append(
+            {
+                "reason": candidate_reason,
+                "manual_citation": candidate_manual_citation,
+                "actions": candidate_actions,
+            }
+        )
 
     return {
         "valid": True,
@@ -3310,6 +3481,7 @@ def _parse_spawn_actions(response: str) -> dict[str, Any]:
         "evidence": evidence,
         "hypothesis_refs": hypothesis_refs,
         "actions": normalized_actions,
+        "candidates": normalized_candidates,
         "skipped_actions": skipped_actions,
     }
 
@@ -3433,6 +3605,87 @@ def _excluded_command_option_changes(
     return changed
 
 
+def _config_name_is_whitelisted(name: str, tunable_whitelist_names: Sequence[str] | None) -> bool:
+    if tunable_whitelist_names is None:
+        return True
+    return _matching_excluded_config_name(name, tunable_whitelist_names) is not None
+
+
+def _tokens_with_disallowed_alternation_syntax(tokens: Sequence[str]) -> list[str]:
+    return [token for token in tokens if "|" in token]
+
+
+def _non_whitelisted_inline_env_changes(
+    env_updates: dict[str, str],
+    base_env_overrides: dict[str, str],
+    tunable_whitelist_names: Sequence[str] | None,
+) -> list[str]:
+    if tunable_whitelist_names is None:
+        return []
+    changed: list[str] = []
+    for name, value in env_updates.items():
+        if base_env_overrides.get(name) == value:
+            continue
+        if not _config_name_is_whitelisted(name, tunable_whitelist_names):
+            changed.append(name)
+    return changed
+
+
+def _non_whitelisted_env_assignments_in_tokens(
+    tokens: list[str],
+    tunable_whitelist_names: Sequence[str] | None,
+) -> list[str]:
+    if tunable_whitelist_names is None:
+        return []
+    changed: list[str] = []
+    idx = 1 if tokens and tokens[0] == "env" else 0
+    while idx < len(tokens) and _is_env_assignment_token(tokens[idx]):
+        name, _ = tokens[idx].split("=", 1)
+        if not _config_name_is_whitelisted(name, tunable_whitelist_names):
+            changed.append(name)
+        idx += 1
+    return changed
+
+
+def _non_whitelisted_option_tokens_in_tokens(
+    tokens: list[str],
+    tunable_whitelist_names: Sequence[str] | None,
+) -> list[str]:
+    if tunable_whitelist_names is None:
+        return []
+    changed: list[str] = []
+    for token in tokens:
+        if not _is_option_token(token):
+            continue
+        option_name = token.split("=", 1)[0]
+        if not _config_name_is_whitelisted(option_name, tunable_whitelist_names):
+            changed.append(option_name)
+    return changed
+
+
+def _non_whitelisted_command_changes(
+    base_command: list[str],
+    candidate_command: list[str],
+    tunable_whitelist_names: Sequence[str] | None,
+) -> list[str]:
+    if tunable_whitelist_names is None:
+        return []
+    base_options, base_positionals = _parse_cli_command_signature(base_command)
+    candidate_options, candidate_positionals = _parse_cli_command_signature(candidate_command)
+    changed: list[str] = []
+    for option_name in sorted(set(base_options) | set(candidate_options)):
+        if base_options.get(option_name) == candidate_options.get(option_name):
+            continue
+        if not _config_name_is_whitelisted(option_name, tunable_whitelist_names):
+            changed.append(option_name)
+    if candidate_positionals != base_positionals and not _config_name_is_whitelisted(
+        "positionals",
+        tunable_whitelist_names,
+    ):
+        changed.append("positionals")
+    return changed
+
+
 def _replace_command_option_delta(
     base_command: list[str],
     option_name: str,
@@ -3457,6 +3710,38 @@ def _replace_command_option_delta(
     return [*base_command, *replacement_tokens]
 
 
+def _split_command_option_delta_groups(tokens: list[str]) -> list[list[str]]:
+    groups: list[list[str]] = []
+    idx = 0
+    while idx < len(tokens):
+        token = tokens[idx]
+        if not _is_option_token(token):
+            return []
+        group = [token]
+        idx += 1
+        while idx < len(tokens) and (
+            not _is_option_token(tokens[idx]) or _looks_like_numeric_token(tokens[idx])
+        ):
+            group.append(tokens[idx])
+            idx += 1
+        groups.append(group)
+    return groups
+
+
+def _apply_command_option_delta_groups(
+    base_command: list[str],
+    delta_tokens: list[str],
+) -> list[str]:
+    groups = _split_command_option_delta_groups(delta_tokens)
+    if not groups:
+        return []
+    updated_command = list(base_command)
+    for group in groups:
+        option_name = group[0].split("=", 1)[0]
+        updated_command = _replace_command_option_delta(updated_command, option_name, group)
+    return updated_command
+
+
 def _apply_command_delta(
     base_command: list[str],
     parameter: str,
@@ -3470,10 +3755,11 @@ def _apply_command_delta(
             if value_tokens[0] == parameter or value_tokens[0].startswith(f"{parameter}=")
             else [parameter, *value_tokens]
         )
+        if any(_is_option_token(token) for token in replacement_tokens[1:]):
+            return _apply_command_option_delta_groups(base_command, replacement_tokens)
         return _replace_command_option_delta(base_command, parameter, replacement_tokens)
     if not parameter and _is_option_token(value_tokens[0]):
-        option_name = value_tokens[0].split("=", 1)[0]
-        return _replace_command_option_delta(base_command, option_name, value_tokens)
+        return _apply_command_option_delta_groups(base_command, value_tokens)
     if parameter:
         try:
             token_index = base_command.index(parameter, 1)
@@ -3488,6 +3774,7 @@ def _build_spawn_execution_plan(
     actions: list[dict[str, Any]],
     base_env_overrides: dict[str, str] | None = None,
     excluded_config_names: Sequence[str] | None = None,
+    tunable_whitelist_names: Sequence[str] | None = None,
 ) -> tuple[list[str], dict[str, str], list[str], list[str]]:
     if not base_command:
         return [], {}, [], ["base command was empty"]
@@ -3499,17 +3786,28 @@ def _build_spawn_execution_plan(
     applied: list[str] = []
     skipped: list[str] = []
     excluded_controls = list(excluded_config_names or [])
+    tunable_whitelist = None if tunable_whitelist_names is None else list(tunable_whitelist_names)
 
     for idx, action in enumerate(actions):
         config_type = str(action.get("config_type", "")).strip().lower()
         parameter = str(action.get("parameter", "")).strip()
         new_value = action.get("new_value")
+        if "|" in parameter:
+            skipped.append(
+                f"action[{idx}] parameter uses unsupported bundled control syntax '{parameter}'"
+            )
+            continue
 
         if config_type == "env_var":
             matched_excluded = _matching_excluded_config_name(parameter, excluded_controls)
             if matched_excluded is not None:
                 skipped.append(
                     f"action[{idx}] changes excluded config '{matched_excluded}'"
+                )
+                continue
+            if not _config_name_is_whitelisted(parameter, tunable_whitelist):
+                skipped.append(
+                    f"action[{idx}] changes non-whitelisted config '{parameter}'"
                 )
                 continue
             if new_value is None:
@@ -3523,6 +3821,13 @@ def _build_spawn_execution_plan(
         tokens = _to_token_list(new_value)
         if not tokens:
             skipped.append(f"action[{idx}] produced no command tokens")
+            continue
+        disallowed_tokens = _tokens_with_disallowed_alternation_syntax(tokens)
+        if disallowed_tokens:
+            skipped.append(
+                f"action[{idx}] new_value uses unsupported bundled token syntax: "
+                f"{', '.join(disallowed_tokens)}"
+            )
             continue
 
         if config_type == "command":
@@ -3557,6 +3862,18 @@ def _build_spawn_execution_plan(
                 )
                 continue
 
+            non_whitelisted_env_changes = _non_whitelisted_inline_env_changes(
+                inline_env_overrides,
+                env_overrides,
+                tunable_whitelist,
+            )
+            if non_whitelisted_env_changes:
+                skipped.append(
+                    f"action[{idx}] command rewrite changes non-whitelisted config(s): "
+                    f"{', '.join(non_whitelisted_env_changes)}"
+                )
+                continue
+
             if Path(normalized_tokens[0]).name != Path(base_command[0]).name:
                 skipped.append(
                     f"action[{idx}] command replacement must keep executable '{base_command[0]}'"
@@ -3581,6 +3898,18 @@ def _build_spawn_execution_plan(
                 )
                 continue
 
+            non_whitelisted_command_changes = _non_whitelisted_command_changes(
+                base_command,
+                normalized_tokens,
+                tunable_whitelist,
+            )
+            if non_whitelisted_command_changes:
+                skipped.append(
+                    f"action[{idx}] command rewrite changes non-whitelisted config(s): "
+                    f"{', '.join(non_whitelisted_command_changes)}"
+                )
+                continue
+
             command_tokens = normalized_tokens
             env_overrides.update(inline_env_overrides)
             command_replaced = True
@@ -3595,6 +3924,34 @@ def _build_spawn_execution_plan(
                 skipped.append(
                     f"action[{idx}] command prefix changes excluded config(s): "
                     f"{', '.join(excluded_changes)}"
+                )
+                continue
+            non_whitelisted_env_changes = _non_whitelisted_env_assignments_in_tokens(
+                tokens,
+                tunable_whitelist,
+            )
+            non_whitelisted_options = _non_whitelisted_option_tokens_in_tokens(
+                tokens,
+                tunable_whitelist,
+            )
+            if non_whitelisted_env_changes or non_whitelisted_options:
+                non_whitelisted_changes = [
+                    *non_whitelisted_env_changes,
+                    *non_whitelisted_options,
+                ]
+                skipped.append(
+                    f"action[{idx}] command prefix changes non-whitelisted config(s): "
+                    f"{', '.join(non_whitelisted_changes)}"
+                )
+                continue
+            if tunable_whitelist is not None and not (
+                non_whitelisted_env_changes
+                or non_whitelisted_options
+                or _excluded_env_assignments_in_tokens(tokens, tunable_whitelist)
+                or _excluded_option_tokens_in_tokens(tokens, tunable_whitelist)
+            ):
+                skipped.append(
+                    f"action[{idx}] command prefix contains no whitelisted tunable controls"
                 )
                 continue
             prefix_tokens.extend(tokens)
@@ -3622,9 +3979,26 @@ def _build_spawn_candidates(
     max_candidates: int,
     base_env_overrides: dict[str, str] | None = None,
     excluded_config_names: Sequence[str] | None = None,
+    tunable_whitelist_names: Sequence[str] | None = None,
 ) -> list[dict[str, Any]]:
     if max_candidates < 1:
         return []
+
+    if actions and all(
+        isinstance(action, dict)
+        and "config_type" not in action
+        and isinstance(action.get("actions"), list)
+        for action in actions
+    ):
+        attempts = _materialize_spawn_candidate_attempts_from_candidate_sets(
+            base_command,
+            actions,
+            max_attempts=max_candidates,
+            base_env_overrides=base_env_overrides,
+            excluded_config_names=excluded_config_names,
+            tunable_whitelist_names=tunable_whitelist_names,
+        )
+        return [attempt for attempt in attempts if attempt.get("materialized_status") == "ready"]
 
     alternative_action_types = {"command", "command_prefix"}
     shared_actions: list[dict[str, Any]] = []
@@ -3654,6 +4028,7 @@ def _build_spawn_candidates(
             action_set,
             base_env_overrides=base_env_overrides,
             excluded_config_names=excluded_config_names,
+            tunable_whitelist_names=tunable_whitelist_names,
         )
         if not tuned_cmd:
             continue
@@ -3682,12 +4057,77 @@ def _build_spawn_candidates(
     return candidates
 
 
+def _materialize_spawn_candidate_attempts_from_candidate_sets(
+    base_command: list[str],
+    candidates: list[dict[str, Any]],
+    max_attempts: int,
+    base_env_overrides: dict[str, str] | None = None,
+    excluded_config_names: Sequence[str] | None = None,
+    tunable_whitelist_names: Sequence[str] | None = None,
+) -> list[dict[str, Any]]:
+    if max_attempts < 1:
+        return []
+
+    attempts: list[dict[str, Any]] = []
+    seen_materialized: set[tuple[tuple[str, ...], tuple[tuple[str, str], ...]]] = set()
+    base_env = dict(base_env_overrides or {})
+
+    for candidate_idx, candidate in enumerate(candidates):
+        action_set = [
+            dict(action)
+            for action in candidate.get("actions", [])
+            if isinstance(action, dict)
+        ]
+        tuned_cmd, env_overrides, applied_actions, skipped_actions = _build_spawn_execution_plan(
+            base_command,
+            action_set,
+            base_env_overrides=base_env_overrides,
+            excluded_config_names=excluded_config_names,
+            tunable_whitelist_names=tunable_whitelist_names,
+        )
+        label = str(candidate.get("label", "")).strip()
+        if not label:
+            label = ", ".join(applied_actions) if applied_actions else f"candidate {candidate_idx + 1}"
+        key = _command_key(tuned_cmd, env_overrides) if tuned_cmd else None
+        materialized_status = "ready"
+        materialized_reason = "candidate materialized"
+
+        if not tuned_cmd:
+            materialized_status = "rejected"
+            materialized_reason = "candidate materialization produced no executable command"
+        elif tuned_cmd == base_command and env_overrides == base_env:
+            materialized_status = "rejected"
+            materialized_reason = "candidate materialized with no effective change"
+        elif key in seen_materialized:
+            materialized_status = "duplicate"
+            materialized_reason = "candidate duplicated an earlier materialized attempt"
+        else:
+            seen_materialized.add(cast(tuple[tuple[str, ...], tuple[tuple[str, str], ...]], key))
+
+        attempts.append(
+            {
+                "cmd": tuned_cmd,
+                "env_overrides": env_overrides,
+                "label": label,
+                "skipped_actions": skipped_actions,
+                "actions": action_set,
+                "materialized_status": materialized_status,
+                "materialized_reason": materialized_reason,
+            }
+        )
+        if len(attempts) >= max_attempts:
+            break
+
+    return attempts
+
+
 def _materialize_spawn_candidate_attempts(
     base_command: list[str],
     actions: list[dict[str, Any]],
     max_attempts: int,
     base_env_overrides: dict[str, str] | None = None,
     excluded_config_names: Sequence[str] | None = None,
+    tunable_whitelist_names: Sequence[str] | None = None,
 ) -> list[dict[str, Any]]:
     if max_attempts < 1:
         return []
@@ -3721,6 +4161,7 @@ def _materialize_spawn_candidate_attempts(
             action_set,
             base_env_overrides=base_env_overrides,
             excluded_config_names=excluded_config_names,
+            tunable_whitelist_names=tunable_whitelist_names,
         )
         label = ", ".join(applied_actions) if applied_actions else "(none)"
         key = _command_key(tuned_cmd, env_overrides) if tuned_cmd else None
@@ -4321,6 +4762,7 @@ async def _run_spawn_tune_loop_async(
     structured_context_bundle: dict[str, object] | None = None,
     initial_hypothesis_profiles: list[dict[str, Any]] | None = None,
     excluded_config_names: Sequence[str] | None = None,
+    tunable_whitelist_names: Sequence[str] | None = None,
 ) -> None:
     tune_started_at = time.time()
     best_config_find_wall_time_s = 0.0
@@ -4406,6 +4848,9 @@ async def _run_spawn_tune_loop_async(
     loaded_contract_names = list(contracts)
     manual_hint_list = list(manual_hints)
     excluded_config_list = list(excluded_config_names or [])
+    tunable_whitelist_list = (
+        None if tunable_whitelist_names is None else list(tunable_whitelist_names)
+    )
     loaded_manual_names = sorted(agent.context.loaded_manuals.keys())
     manual_context_status = (
         f"Manual context: {len(loaded_manual_names)} loaded, "
@@ -4428,6 +4873,7 @@ async def _run_spawn_tune_loop_async(
             "loaded_manuals": loaded_manual_names,
             "manual_hints": manual_hint_list,
             "excluded_config_names": excluded_config_list,
+            "tunable_whitelist_names": tunable_whitelist_list or [],
             "baseline_env_overrides": dict(inline_env_overrides),
             "startup_hypothesis_profile_count": len(initial_hypothesis_profiles or []),
             "primary_objective_query": primary_objective or "",
@@ -4453,6 +4899,8 @@ async def _run_spawn_tune_loop_async(
         f"Candidate Trial Limit: {candidate_trial_limit_display}\n"
         f"Timeout: {timeout}s\n"
         f"Contracts: {len(loaded_contract_names)} loaded\n"
+        f"Tunable whitelist: "
+        f"{', '.join(tunable_whitelist_list) if tunable_whitelist_list is not None and tunable_whitelist_list else ('(empty)' if tunable_whitelist_list is not None else '(not set)')}\n"
         f"{manual_context_status}",
         title="Starting",
     )
@@ -4460,6 +4908,11 @@ async def _run_spawn_tune_loop_async(
     manual_hint_content = _render_spawn_manual_hints(manual_hint_list)
     loaded_manual_content = _render_loaded_manual_context(agent.context.loaded_manuals)
     excluded_config_content = _render_excluded_config_names(excluded_config_list)
+    tunable_whitelist_content = (
+        _render_tunable_whitelist_names(tunable_whitelist_list)
+        if tunable_whitelist_list is not None
+        else "(not set; all supported non-immutable controls remain tunable)"
+    )
 
     benchmark_deterministic = _is_env_flag_enabled("SYSPILOT_BENCH_DETERMINISTIC")
     if benchmark_deterministic:
@@ -4980,6 +5433,8 @@ async def _run_spawn_tune_loop_async(
             return "true"
         return ", ".join(value if value else "true" for value in values)
 
+    baseline_change_order = _baseline_control_order(cmd_parts, inline_env_overrides)
+
     def _baseline_relative_changes(
         command_parts: Sequence[str],
         env_pairs: Sequence[tuple[str, str]],
@@ -4990,7 +5445,11 @@ async def _run_spawn_tune_loop_async(
         base_env = {str(name): str(value) for name, value in inline_env_overrides.items()}
         changes: list[dict[str, str]] = []
 
-        for name in sorted(set(base_env) | set(candidate_env)):
+        env_names = sorted(
+            set(base_env) | set(candidate_env),
+            key=lambda name: _control_sort_key(name, baseline_change_order),
+        )
+        for name in env_names:
             if candidate_env.get(name) != base_env.get(name):
                 changes.append({"name": f"env.{name}", "new_value": candidate_env.get(name, "(unset)")})
 
@@ -4999,7 +5458,11 @@ async def _run_spawn_tune_loop_async(
 
         base_options, base_positionals = _parse_cli_command_signature(cmd_parts)
         candidate_options, candidate_positionals = _parse_cli_command_signature(main_command)
-        for name in sorted(set(base_options) | set(candidate_options)):
+        option_names = sorted(
+            set(base_options) | set(candidate_options),
+            key=lambda name: _control_sort_key(name, baseline_change_order),
+        )
+        for name in option_names:
             if candidate_options.get(name) != base_options.get(name):
                 changes.append(
                     {
@@ -5013,7 +5476,15 @@ async def _run_spawn_tune_loop_async(
                 {"name": "positionals", "new_value": " ".join(candidate_positionals)}
             )
 
-        return sorted(changes, key=lambda item: item["name"])
+        return [
+            change
+            for _, change in sorted(
+                enumerate(changes),
+                key=lambda item: _control_sort_key(
+                    item[1]["name"], baseline_change_order, item[0]
+                ),
+            )
+        ]
 
     def _tried_config_deltas() -> list[dict[str, Any]]:
         entries: list[dict[str, Any]] = []
@@ -5197,7 +5668,11 @@ async def _run_spawn_tune_loop_async(
         stall_reprompts_used: int,
     ) -> str:
         untouched_controls = sorted(
-            set(current_env_overrides.keys())
+            (
+                set(current_env_overrides.keys())
+                if tunable_whitelist_list is None
+                else set(tunable_whitelist_list)
+            )
             - attempted_control_names
             - set(excluded_config_list)
         )
@@ -5222,15 +5697,24 @@ async def _run_spawn_tune_loop_async(
             f"Successful configs: {json.dumps(_successful_configs_snapshot(), indent=2)}\n"
             f"Untouched current controls (where known): {json.dumps(untouched_controls)}\n"
             f"Protected/excluded controls: {json.dumps(excluded_config_list)}\n\n"
+            "Allowed tunable controls: "
+            f"{json.dumps(tunable_whitelist_list) if tunable_whitelist_list is not None else '(not restricted)'}\n\n"
             "## Re-prompt Requirements\n"
             "- Budget is fixed and only materialized concrete candidate attempts consume it.\n"
             "- Return at least one concrete safe action that can materialize into a new executable "
-            "candidate if such an action exists.\n"
-            "- Do not repeat previously tried or rejected candidates.\n"
+            "candidate; outputting a candidate is mandatory while any allowed, new, safe candidate "
+            "can be formed.\n"
+            "- For this re-prompt only, you may ignore whether direct evidence supports the "
+            "decision, and you do not need to provide evidence to support the candidate.\n"
+            "- If you think no untouched action exists, first try different concrete values for "
+            "previously tried parameters or environment variables, as long as the resulting "
+            "candidate is new, allowed, and safe. Continue exploring value variants until the "
+            "allowed value space is exhausted or the budget is exhausted.\n"
+            "- Do not repeat previously tried or rejected candidates exactly.\n"
             "- Keep the current command, current environment, immutable controls, and primary "
             "objective constraints in mind.\n"
-            "- If no safe concrete action can be materialized, return the same JSON schema with "
-            '"summary": "STOP:<machine_readable_reason>", empty "actions", and concise "evidence" '
+            "- If no safe concrete candidate can be materialized, return the same JSON schema with "
+            '"summary": "STOP:<machine_readable_reason>", empty "candidates", and concise "evidence" '
             "explaining why no candidate can be formed.\n"
         )
 
@@ -5275,17 +5759,26 @@ async def _run_spawn_tune_loop_async(
             "- Keep only the exact immutable controls listed above unchanged; do not treat "
             "same-library or related controls as immutable unless their exact names are listed."
         )
+        tunable_whitelist_rule = (
+            "- A tunable whitelist is active: recommend and change only exact controls listed in "
+            "the Tunable Whitelist section. Return no actions if no listed control is supported "
+            "by evidence."
+            if tunable_whitelist_list is not None
+            else "- No tunable whitelist is active; supported non-immutable controls may be changed."
+        )
         evidence_heading = (
             "Refined Profiling Evidence" if profiling_enabled else "Raw Runtime Output Evidence"
         )
         evidence_rule = (
-            "- Use only profiling evidence, generated contract hypotheses, "
-            "contract validation findings, loaded manual context, and application manual hints."
+            "- You may use profiling evidence, generated contract hypotheses, contract validation "
+            "findings, loaded manual context, and application manual hints, but evidence is "
+            "optional and a candidate does not need evidence support."
             if profiling_enabled
             else (
-                "- Profiling is disabled by --no-profile; use raw stdout/stderr, loaded "
+                "- Profiling is disabled by --no-profile; you may use raw stdout/stderr, loaded "
                 "manual context, generated contract hypotheses, contract validation findings, "
-                "and application manual hints."
+                "and application manual hints, but evidence is optional and a candidate does "
+                "not need evidence support."
             )
         )
         profiled_run_rule = (
@@ -5306,8 +5799,19 @@ async def _run_spawn_tune_loop_async(
 ## Current Environment Overrides
 {json.dumps(current_env_overrides, indent=2, sort_keys=True) if current_env_overrides else "(none)"}
 
+## Candidate Base State
+- Every recommended action is applied relative to the Current Command and Current Environment
+  Overrides shown above.
+- Previous recommendations, skipped candidates, and rejected candidates are history only; they are
+  not active unless their changes appear in the Current Command or Current Environment Overrides.
+- If you want to keep an environment or command-parameter value that is not in the Current
+  Command/Environment, include it explicitly in this response.
+
 ## Immutable Controls
 {excluded_config_content}
+
+## Tunable Whitelist
+{tunable_whitelist_content}
 
 {memory_envelope_block}
 
@@ -5347,37 +5851,54 @@ async def _run_spawn_tune_loop_async(
 
 ## Rules
 {evidence_rule}
-- Generated contract hypotheses are the contract-derived plan; use their controls,
+- Generated contract hypotheses are the contract-derived plan; you may use their controls,
   signals, recipes, and hypothesis ids together with runtime validation evidence.
 - Contract hypothesis validation, when present, is runtime-generated structured evidence.
   Prefer it over inferring raw DSL semantics yourself.
 {profiled_run_rule}
 - Avoid recommending exact commands already tried.
 {immutable_controls_rule}
+{tunable_whitelist_rule}
+- Treat each object in `candidates` as one complete concrete candidate delta from the Candidate
+  Base State, not as a patch on your previous suggestion.
+- To test mixed environment-variable and command-parameter changes together, put them in the same
+  candidate's `changes` object as exact-name-to-value mappings.
+- Keys starting with `-` are command-line parameters; all other keys are environment variables.
+- Separate candidate objects are alternatives; they are not sequential edits to combine into one
+  command.
+- Each materialized candidate is one runnable command plus its environment overrides.
 - Keep workload-defining arguments fixed (model/input/token counts/repetitions/output mode)
   so comparisons stay fair.
 - Recommend only options that are valid for the target executable.
-- If evidence is insufficient, return no actions.
+- Do not reject or omit a candidate only because evidence is absent or insufficient.
+- If evidence is absent or insufficient for an untouched control, try a different concrete value
+  for a previously tried tunable control when that value has not produced an exact candidate before.
+- Return no actions only after no safe new value variant remains within the allowed controls.
+- Prefer new concrete values for already tried tunable controls over stopping early when the
+  remaining budget can still test safe variants.
 - Return JSON only (no markdown, no prose).
-- Provide up to 3 candidates ordered best-first.
+- Provide up to 3 candidate objects ordered best-first.
 
 ## JSON Schema
 {{
   "summary": "short decision summary",
-  "manual_citation": "optional concrete rule from loaded manual(s), or empty when\n"
-  "    grounded only in runtime evidence",
-  "evidence": ["concise evidence item", "..."],
+  "manual_citation": "optional concrete rule from loaded manual(s), or empty",
+  "evidence": ["optional concise evidence item; may be empty", "..."],
   "hypothesis_refs": ["optional hypothesis ids to prioritize next profiling round"],
-  "actions": [
+    "candidates": [
     {{
-      "config_type": "env_var | command_prefix | command",
-      "parameter": "required for env_var; for command use the option/name being changed when applicable",
-      "new_value": "string or token list; for command include only changed tokens relative to the current command, not the full command",
-      "reason": "why this action follows from evidence",
-      "manual_citation": "optional manual/contract rule supporting this action"
+      "reason": "why this complete candidate should be tried",
+      "manual_citation": "optional manual/contract rule supporting this candidate",
+      "changes": {{
+        "--exact-command-parameter": "concrete value",
+        "EXACT_ENV_NAME": "concrete value"
+      }}
     }}
   ]
 }}
+
+Do not use placeholder keys in real responses. Do not use bundled or alternation syntax such as
+`AAA|BBB` anywhere. Values must be concrete scalar target values, not arrays or objects.
 """
 
         recommendation: dict[str, Any]
@@ -5408,6 +5929,7 @@ async def _run_spawn_tune_loop_async(
                     "evidence": ["SYSPILOT_BENCH_DETERMINISTIC=1"],
                     "hypothesis_refs": [],
                     "actions": [],
+                    "candidates": [],
                     "skipped_actions": [],
                 }
                 round_llm_response_text = str(recommendation["summary"])
@@ -5431,6 +5953,7 @@ async def _run_spawn_tune_loop_async(
                         "evidence": [],
                         "hypothesis_refs": [],
                         "actions": [],
+                        "candidates": [],
                         "skipped_actions": [],
                     }
                     round_llm_response_text = str(recommendation["summary"])
@@ -5438,7 +5961,11 @@ async def _run_spawn_tune_loop_async(
                     analysis_wall_time_s = time.time() - analysis_started_at
                     sink.print(f"\n[dim]{response.content}[/dim]")
                     round_llm_response_text = response.content
-                    recommendation = _parse_spawn_actions(response.content)
+                    recommendation = _parse_spawn_actions(
+                        response.content,
+                        baseline_command_tokens=cmd_parts,
+                        baseline_env_overrides=inline_env_overrides,
+                    )
 
             if not recommendation["valid"]:
                 _emit_tune_event(
@@ -5530,6 +6057,7 @@ async def _run_spawn_tune_loop_async(
                 "summary": summary,
                 "manual_citation": recommendation["manual_citation"],
                 "evidence": recommendation["evidence"][:5],
+                "candidate_count": len(recommendation["candidates"]),
                 "action_count": len(recommendation["actions"]),
             }
             if next_action_display:
@@ -5559,8 +6087,9 @@ async def _run_spawn_tune_loop_async(
             else:
                 candidate_hypothesis_profiles = startup_hypothesis_profiles
 
+            candidate_specs = recommendation["candidates"]
             actions = recommendation["actions"]
-            if not actions:
+            if not candidate_specs:
                 if (
                     _bounded_search_active()
                     and not analysis_unavailable
@@ -5635,12 +6164,13 @@ async def _run_spawn_tune_loop_async(
                     cast(int, fixed_budget_state.remaining),
                 )
 
-            candidate_attempts = _materialize_spawn_candidate_attempts(
+            candidate_attempts = _materialize_spawn_candidate_attempts_from_candidate_sets(
                 current_command_parts,
-                actions,
+                candidate_specs,
                 max_attempts=candidate_attempt_limit,
                 base_env_overrides=current_env_overrides,
                 excluded_config_names=excluded_config_list,
+                tunable_whitelist_names=tunable_whitelist_list,
             )
 
             if candidate_attempts:
@@ -5945,6 +6475,7 @@ async def _run_spawn_tune_loop_async(
                     cast(list[dict[str, Any]], trial_actions),
                     base_env_overrides=current_env_overrides,
                     excluded_config_names=excluded_config_list,
+                    tunable_whitelist_names=tunable_whitelist_list,
                     unsupported_options=_extract_runtime_unsupported_options(
                         trial_stdout,
                         trial_stderr,
@@ -6710,6 +7241,7 @@ def _run_spawn_tune_loop(
     structured_context_bundle: dict[str, object] | None = None,
     initial_hypothesis_profiles: list[dict[str, Any]] | None = None,
     excluded_config_names: Sequence[str] | None = None,
+    tunable_whitelist_names: Sequence[str] | None = None,
 ) -> None:
     workdir_str = str(workdir) if workdir else None
     asyncio.run(
@@ -6732,6 +7264,7 @@ def _run_spawn_tune_loop(
             structured_context_bundle=structured_context_bundle,
             initial_hypothesis_profiles=initial_hypothesis_profiles,
             excluded_config_names=excluded_config_names,
+            tunable_whitelist_names=tunable_whitelist_names,
         )
     )
 
@@ -6756,6 +7289,7 @@ def _run_quick_tune_loop(
     initial_hypothesis_profiles: list[dict[str, Any]] | None,
     defaults: QuickModeDefaults | None,
     excluded_config_names: Sequence[str] | None = None,
+    tunable_whitelist_names: Sequence[str] | None = None,
 ) -> None:
     from syspilot.quick_mode import run_quick_tune_loop
 
@@ -6792,6 +7326,7 @@ def _run_quick_tune_loop(
         format_metric_value=_format_metric_value,
         defaults=defaults,
         excluded_config_names=excluded_config_names,
+        tunable_whitelist_names=tunable_whitelist_names,
     )
 
 
