@@ -32,6 +32,8 @@ For runnable benchmark commands, use the direct worker command blocks in `summar
 
 For future LPCL work that maps benchmark-local `BENCHMARK_*` env overrides into original library contracts, follow `LPCL_BENCHMARK_ENV_MAPPING_SKILL.md`.
 
+For OpenTuner-based fixed-workload search over the supported direct workers, see [`OPENTUNER.md`](OPENTUNER.md).
+
 ## Output contract
 
 Each benchmark workspace owns:

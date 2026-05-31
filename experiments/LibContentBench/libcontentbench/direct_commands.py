@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import shlex
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Sequence
-
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SUITE_ROOT = REPO_ROOT / "experiments/LibContentBench"
@@ -52,7 +52,9 @@ class DirectCommandSpec:
 
     @property
     def python_relpath(self) -> Path:
-        return Path("experiments/LibContentBench") / self.workspace_name / "artifact/venv/bin/python"
+        return (
+            Path("experiments/LibContentBench") / self.workspace_name / "artifact/venv/bin/python"
+        )
 
     @property
     def runner_relpath(self) -> Path:
@@ -66,20 +68,26 @@ def _stringify(value: Any) -> str:
 
 
 def _default_repo_relative_output_json(spec: DirectCommandSpec) -> str:
-    return str(Path("experiments/LibContentBench") / spec.workspace_name / "work/direct_result.json")
+    return str(
+        Path("experiments/LibContentBench") / spec.workspace_name / "work/direct_result.json"
+    )
 
 
 def _default_repo_relative_case_output_dir(spec: DirectCommandSpec) -> str:
-    return str(Path("experiments/LibContentBench") / spec.workspace_name / "work/direct_case_output")
+    return str(
+        Path("experiments/LibContentBench") / spec.workspace_name / "work/direct_case_output"
+    )
 
 
-def _canonical_command_payload(spec: DirectCommandSpec, source: Mapping[str, Any]) -> dict[str, Any]:
+def _canonical_command_payload(
+    spec: DirectCommandSpec, source: Mapping[str, Any]
+) -> dict[str, Any]:
     payload = dict(spec.defaults)
     payload.update(source)
     payload.setdefault("benchmark", spec.benchmark_id)
-    payload["output_json"] = _default_repo_relative_output_json(spec)
+    payload.setdefault("output_json", _default_repo_relative_output_json(spec))
     if any(field.field_name == "case_output_dir" for field in spec.cli_fields):
-        payload["case_output_dir"] = _default_repo_relative_case_output_dir(spec)
+        payload.setdefault("case_output_dir", _default_repo_relative_case_output_dir(spec))
     return payload
 
 
@@ -90,7 +98,10 @@ def _field_value(payload: Mapping[str, Any], field_name: str) -> Any:
 
 
 def _build_env_tokens(spec: DirectCommandSpec, payload: Mapping[str, Any]) -> list[str]:
-    env_tokens = [f"{field.env_name}={_stringify(_field_value(payload, field.field_name))}" for field in spec.env_fields]
+    env_tokens = [
+        f"{field.env_name}={_stringify(_field_value(payload, field.field_name))}"
+        for field in spec.env_fields
+    ]
     if not env_tokens:
         return []
     return ["env", *env_tokens]
@@ -108,7 +119,9 @@ def _build_cli_tokens(spec: DirectCommandSpec, payload: Mapping[str, Any]) -> li
     for repeated_field in spec.repeated_cli_fields:
         values = _field_value(payload, repeated_field.field_name)
         if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
-            raise TypeError(f"Repeated field {repeated_field.field_name!r} must be a sequence of values")
+            raise TypeError(
+                f"Repeated field {repeated_field.field_name!r} must be a sequence of values"
+            )
         for value in values:
             tokens.extend([repeated_field.option, _stringify(value)])
     return tokens
@@ -120,11 +133,11 @@ DIRECT_COMMAND_SPECS: dict[str, DirectCommandSpec] = {
         workspace_name="nestedcpu-blas",
         runner_name="run_nestedcpu_blas_case.py",
         env_fields=(
-            EnvVarSpec("blas_threads", "OMP_NUM_THREADS"),
-            EnvVarSpec("blas_threads", "OPENBLAS_NUM_THREADS"),
-            EnvVarSpec("blas_threads", "MKL_NUM_THREADS"),
-            EnvVarSpec("blas_threads", "BLIS_NUM_THREADS"),
-            EnvVarSpec("blas_threads", "NUMEXPR_NUM_THREADS"),
+            EnvVarSpec("omp_threads", "OMP_NUM_THREADS"),
+            EnvVarSpec("openblas_threads", "OPENBLAS_NUM_THREADS"),
+            EnvVarSpec("mkl_threads", "MKL_NUM_THREADS"),
+            EnvVarSpec("blis_threads", "BLIS_NUM_THREADS"),
+            EnvVarSpec("numexpr_threads", "NUMEXPR_NUM_THREADS"),
         ),
         cli_fields=(
             CliFieldSpec("case_id", "--case-id"),
@@ -137,7 +150,14 @@ DIRECT_COMMAND_SPECS: dict[str, DirectCommandSpec] = {
             CliFieldSpec("outer_jobs", "--joblib-n-jobs"),
             CliFieldSpec("backend_prefer", "--backend-prefer"),
         ),
-        defaults={"backend_prefer": "processes"},
+        defaults={
+            "backend_prefer": "processes",
+            "omp_threads": 6,
+            "openblas_threads": 6,
+            "mkl_threads": 1,
+            "blis_threads": 1,
+            "numexpr_threads": 1,
+        },
     ),
     "arrow-dask-duckdb-memspill": DirectCommandSpec(
         benchmark_id="arrow-dask-duckdb-memspill",
@@ -192,7 +212,9 @@ DIRECT_COMMAND_SPECS: dict[str, DirectCommandSpec] = {
         runner_name="run_horovod_tfdata_case.py",
         env_fields=(
             EnvVarSpec("tfdata_target_workers", "BENCHMARK_TFDATA_TARGET_WORKERS"),
-            EnvVarSpec("tfdata_max_outstanding_requests", "BENCHMARK_TFDATA_MAX_OUTSTANDING_REQUESTS"),
+            EnvVarSpec(
+                "tfdata_max_outstanding_requests", "BENCHMARK_TFDATA_MAX_OUTSTANDING_REQUESTS"
+            ),
             EnvVarSpec("tfdata_compression", "BENCHMARK_TFDATA_COMPRESSION"),
             EnvVarSpec("horovod_fusion_threshold_mb", "BENCHMARK_HOROVOD_FUSION_THRESHOLD_MB"),
             EnvVarSpec("horovod_cycle_time_ms", "BENCHMARK_HOROVOD_CYCLE_TIME_MS"),
@@ -436,7 +458,9 @@ DIRECT_COMMAND_SPECS: dict[str, DirectCommandSpec] = {
         ),
         bool_cli_fields=(
             BoolCliFieldSpec("use_gpu", "--use-gpu", "--no-use-gpu"),
-            BoolCliFieldSpec("materialize_dataset", "--materialize-dataset", "--no-materialize-dataset"),
+            BoolCliFieldSpec(
+                "materialize_dataset", "--materialize-dataset", "--no-materialize-dataset"
+            ),
         ),
         repeated_cli_fields=(RepeatedCliFieldSpec("nic_names", "--nic-name"),),
         defaults={
@@ -484,8 +508,12 @@ DIRECT_COMMAND_SPECS: dict[str, DirectCommandSpec] = {
             CliFieldSpec("benchmark", "--benchmark"),
         ),
         bool_cli_fields=(
-            BoolCliFieldSpec("torch_channels_last", "--torch-channels-last", "--no-torch-channels-last"),
-            BoolCliFieldSpec("torch_cudnn_benchmark", "--torch-cudnn-benchmark", "--no-torch-cudnn-benchmark"),
+            BoolCliFieldSpec(
+                "torch_channels_last", "--torch-channels-last", "--no-torch-channels-last"
+            ),
+            BoolCliFieldSpec(
+                "torch_cudnn_benchmark", "--torch-cudnn-benchmark", "--no-torch-cudnn-benchmark"
+            ),
         ),
         defaults={"benchmark": "dali-nvjpeg-pytorch-cudnn"},
     ),
