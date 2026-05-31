@@ -18,16 +18,16 @@ The static workflow metadata lives in `opentuner_integration/specs.py`. That mod
 - NestedCPU alias handling is normalized onto runtime controls only:
   - `--joblib-n-jobs` is the canonical OpenTuner parameter for `outer_jobs`
   - `--outer-jobs` is treated as a whitelist alias for the same field
-  - BLAS/OpenMP env vars are exposed separately so the seeded medium workload keeps `OMP_NUM_THREADS=6`, `OPENBLAS_NUM_THREADS=6`, `MKL_NUM_THREADS=1`, `BLIS_NUM_THREADS=1`, and `NUMEXPR_NUM_THREADS=1`
+  - BLAS/OpenMP env vars are exposed separately so the seeded small workload keeps `OMP_NUM_THREADS=6`, `OPENBLAS_NUM_THREADS=6`, `MKL_NUM_THREADS=1`, `BLIS_NUM_THREADS=1`, and `NUMEXPR_NUM_THREADS=1`
 
 ## Fixed workloads
 
-The harness uses checked-in fixed workload payloads derived from the suite's documented direct-worker shapes:
+The harness uses checked-in fixed workload payloads derived from `docs/libcontentbench_selected_benchmark_workflow_details.md`, which selects the workflow-size catalog's small tier for every supported benchmark except DALI/cuDNN and the medium tier for DALI/cuDNN:
 
-- `nestedcpu-blas`: medium fixed shape from `workflow_size_commands.md`
-- `arrow-dask-duckdb-memspill`: medium fixed shape from `workflow_size_commands.md`
-- `hf-datasets-tokenizers-dataloader`: medium fixed shape from `workflow_size_commands.md`
-- `torchdata-fsspec-s3-ddp`: medium fixed shape from `workflow_size_commands.md`
+- `nestedcpu-blas`: small fixed shape from `workflow_size_commands.md`
+- `arrow-dask-duckdb-memspill`: small fixed shape from `workflow_size_commands.md`
+- `hf-datasets-tokenizers-dataloader`: small fixed shape from `workflow_size_commands.md`
+- `torchdata-fsspec-s3-ddp`: small fixed shape from `workflow_size_commands.md`
 - `dali-nvjpeg-pytorch-cudnn`: medium fixed shape from `workflow_size_commands.md`
 
 Only the whitelist-approved runtime/library controls vary across trials.
@@ -82,6 +82,6 @@ The older `experiments/LibContentBench/run_opentuner.py` path is kept as a compa
 
 ## Optional-workflow caveats
 
-- `torchdata-fsspec-s3-ddp` still depends on Docker/MinIO and PyTorch DDP at runtime; tests for this harness mock subprocess execution and do not launch containers. The harness pins the MinIO image to a fixed release tag instead of using `latest`.
+- `torchdata-fsspec-s3-ddp` still depends on Docker/MinIO and PyTorch DDP at runtime; tests for this harness mock subprocess execution and do not launch containers. The harness follows the selected small workflow's `quay.io/minio/minio:latest` image instead of Docker Hub's `minio/minio:latest`.
 - `dali-nvjpeg-pytorch-cudnn` still depends on CUDA, DALI, and MPS for real runs; tests mock subprocess execution and do not import CUDA libraries or execute GPU work.
 - Static spec inspection and unit tests stay host-safe and do not require OpenTuner to import until the runtime harness or CLI actually runs.
