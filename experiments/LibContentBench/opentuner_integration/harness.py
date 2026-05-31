@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import time
 from pathlib import Path
 from typing import Any
@@ -170,6 +171,7 @@ class LibContentBenchOpenTunerInterface(MeasurementInterface):
         output_json_path = trial_dir / "output.json"
         case_output_dir = trial_dir / "case_output"
         runtime_root = trial_dir / "runtime"
+        runtime_base = Path("/var/tmp/libcontentbench/tuner-runtime") / self.output_dir.name / trial_name
         config_data = dict(desired_result.configuration.data)
 
         payload = dict(self.workflow_spec.fixed_workload_payload)
@@ -185,11 +187,14 @@ class LibContentBenchOpenTunerInterface(MeasurementInterface):
             field.field_name == "case_output_dir"
             for field in self.workflow_spec.direct_spec.cli_fields
         ):
+            if self.workflow_spec.workflow_id == "torchdata-fsspec-s3-ddp":
+                case_output_dir = runtime_base / "case_output"
             payload["case_output_dir"] = str(case_output_dir)
         if any(
             field.field_name == "runtime_root"
             for field in self.workflow_spec.direct_spec.cli_fields
         ):
+            runtime_root = runtime_base / "runtime"
             payload["runtime_root"] = str(runtime_root)
 
         for tunable in self.workflow_spec.tunables:
@@ -256,6 +261,8 @@ class LibContentBenchOpenTunerInterface(MeasurementInterface):
             "output_json_payload": fallback_payload,
         }
         write_json(trial_dir / "trial_artifact.json", artifact)
+        if self.workflow_spec.workflow_id in {"dali-nvjpeg-pytorch-cudnn", "torchdata-fsspec-s3-ddp"}:
+            shutil.rmtree(runtime_root.parent, ignore_errors=True)
         print(
             "LibContentBench trial "
             f"{self._trial_index}: state={state}, "

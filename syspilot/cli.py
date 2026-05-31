@@ -4347,6 +4347,7 @@ def _extract_literal_numeric_metrics(output: str) -> dict[str, Any]:
         "bandwidth",
         "ops_per_sec",
         "bytes_per_sec",
+        "score",
         "loss",
         "accuracy",
     )

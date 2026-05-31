@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import numbers
 import os
+import shutil
 import shlex
 import subprocess
 import threading
@@ -132,6 +133,7 @@ class TrialEvaluator:
         trial_dir = self.trials_dir / trial_name
         trial_dir.mkdir(parents=True, exist_ok=True)
         output_json_path = trial_dir / "output.json"
+        runtime_base = Path("/var/tmp/libcontentbench/tuner-runtime") / self.output_dir.name / trial_name
 
         per_trial: dict[str, Any] = {
             "case_id": trial_name,
@@ -141,9 +143,12 @@ class TrialEvaluator:
         }
         direct_field_names = {f.field_name for f in self.spec.direct_spec.cli_fields}
         if "runtime_root" in direct_field_names:
-            per_trial["runtime_root"] = str(trial_dir / "runtime")
+            per_trial["runtime_root"] = str(runtime_base / "runtime")
         if "case_output_dir" in direct_field_names:
-            per_trial["case_output_dir"] = str(trial_dir / "case_output")
+            if self.spec.workflow_id == "torchdata-fsspec-s3-ddp":
+                per_trial["case_output_dir"] = str(runtime_base / "case_output")
+            else:
+                per_trial["case_output_dir"] = str(trial_dir / "case_output")
 
         payload = build_trial_payload(self.spec, self.size, config_values, per_trial)
         command = build_direct_command(self.spec.workflow_id, payload)
@@ -233,6 +238,8 @@ class TrialEvaluator:
             "stdout_json": stdout_payload,
         }
         write_json(trial_dir / "trial_artifact.json", artifact)
+        if self.spec.workflow_id in {"dali-nvjpeg-pytorch-cudnn", "torchdata-fsspec-s3-ddp"} and "runtime_root" in payload:
+            shutil.rmtree(Path(str(payload["runtime_root"])).parent, ignore_errors=True)
 
         with self._lock:
             self.records.append(

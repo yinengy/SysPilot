@@ -85,9 +85,9 @@ def _canonical_command_payload(
     payload = dict(spec.defaults)
     payload.update(source)
     payload.setdefault("benchmark", spec.benchmark_id)
-    payload["output_json"] = _default_repo_relative_output_json(spec)
+    payload.setdefault("output_json", _default_repo_relative_output_json(spec))
     if any(field.field_name == "case_output_dir" for field in spec.cli_fields):
-        payload["case_output_dir"] = _default_repo_relative_case_output_dir(spec)
+        payload.setdefault("case_output_dir", _default_repo_relative_case_output_dir(spec))
     return payload
 
 
