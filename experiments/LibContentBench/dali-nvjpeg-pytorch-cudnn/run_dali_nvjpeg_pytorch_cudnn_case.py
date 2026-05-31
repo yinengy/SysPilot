@@ -14,6 +14,7 @@ import site
 import subprocess
 import sys
 import time
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -143,6 +144,43 @@ ENV_SPECS: dict[str, tuple[str, type]] = {
 }
 
 
+class _BooleanOptionalAction(argparse.Action):
+    def __init__(
+        self,
+        option_strings: list[str],
+        dest: str,
+        default: bool | None = None,
+        required: bool = False,
+        help: str | None = None,
+    ) -> None:
+        expanded_options: list[str] = []
+        for option in option_strings:
+            expanded_options.append(option)
+            if option.startswith("--"):
+                expanded_options.append(f"--no-{option[2:]}")
+        super().__init__(
+            option_strings=expanded_options,
+            dest=dest,
+            nargs=0,
+            default=default,
+            required=required,
+            help=help,
+        )
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: str | Sequence[Any] | None,
+        option_string: str | None = None,
+    ) -> None:
+        del parser, values
+        setattr(namespace, self.dest, not str(option_string).startswith("--no-"))
+
+
+BOOLEAN_OPTIONAL_ACTION = getattr(argparse, "BooleanOptionalAction", _BooleanOptionalAction)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run a DALI/nvJPEG + PyTorch/cuDNN GPU contention case."
@@ -170,12 +208,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--torch-precision", default=DEFAULTS["torch_precision"])
     parser.add_argument(
         "--torch-channels-last",
-        action=argparse.BooleanOptionalAction,
+        action=BOOLEAN_OPTIONAL_ACTION,
         default=DEFAULTS["torch_channels_last"],
     )
     parser.add_argument(
         "--torch-cudnn-benchmark",
-        action=argparse.BooleanOptionalAction,
+        action=BOOLEAN_OPTIONAL_ACTION,
         default=DEFAULTS["torch_cudnn_benchmark"],
     )
     parser.add_argument(
