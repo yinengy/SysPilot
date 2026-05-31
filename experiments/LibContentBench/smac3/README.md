@@ -20,15 +20,15 @@ scripts** — see [Quick start](#quick-start).
 | `torchdata-fsspec-s3-ddp` | `samples_per_sec` | object-store + DDP knobs over `fsspec`/`s3fs` + Gloo DDP | **Docker** (local MinIO) |
 | `dali-nvjpeg-pytorch-cudnn` | `score` | single-GPU sharing: DALI/nvJPEG preprocessing vs PyTorch/cuDNN inference under CUDA MPS | **GPU + CUDA + NVIDIA DALI + MPS** |
 
-`score` = `min(DALI_pair/DALI_solo, Torch_pair/Torch_solo)` — how well the two GPU
-libraries co-exist while sharing one device under MPS (higher is better). The CPU
-workflows run anywhere; `torchdata` and `dali` are auto-skipped by the sweep when
-their dependency (Docker / GPU) is absent.
+`score` = `pair_dali_images_per_sec + pair_torch_images_per_sec` from the joint
+DALI + PyTorch MPS run (higher is better). The CPU workflows run anywhere;
+`torchdata` and `dali` are auto-skipped by the sweep when their dependency
+(Docker / GPU) is absent.
 
 The metric per workflow and the parameter/whitelist sources follow
 [`docs/fixed_budget_exp_prompt.md`](../../../docs/fixed_budget_exp_prompt.md):
-the SMAC3 `--budget` is the analogue of that doc's `--fixed-budget` (number of
-trials), and `--metric`/direction default to the per-benchmark
+the SMAC3 `--budget` is the total number of benchmark executions, including
+the baseline seed, and `--metric`/direction default to the per-benchmark
 `--primary-objective` values listed there.
 
 ## Layout
@@ -187,7 +187,7 @@ $PY .../smac3/cli.py --workflow torchdata-fsspec-s3-ddp --size small --budget 20
 |---|---|---|
 | `--workflow` | — | one of the four ids (required unless `--list-workflows`) |
 | `--size` | `medium` | `small` \| `medium` \| `large` workload tier |
-| `--budget` | `20` | number of **search trials, excluding the baseline** (== SysPilot `--fixed-budget`); total executions = `budget + 1` |
+| `--budget` | `20` | number of **total benchmark executions, including the baseline seed**; `--budget 1` runs only the baseline |
 | `--metric` | per-workflow primary | metric key parsed from the runner |
 | `--metric-mode` | per-workflow (`maximize`) | optimization direction |
 | `--output-dir` | — | where artifacts + reports are written (required to tune) |
@@ -211,7 +211,8 @@ target function (`runner.py`):
    so trials don't share state;
 4. parses the metric-only JSON from stdout (falls back to the `--output-json`
    artifact);
-5. returns the SMAC *cost* = `-metric` (because every objective is maximize), or
+5. prints the per-trial wall time and objective value as soon as the trial completes;
+6. returns the SMAC *cost* = `-metric` (because every objective is maximize), or
    `--crash-cost` on failure/timeout.
 
 **Failed trials are expected and handled.** Some configurations the optimizer
@@ -220,12 +221,13 @@ arrow workflow makes the Dask workers exceed their memory budget and get killed
 (*"N workers died while trying to run it"*), which is exactly the memory/spill
 contention the benchmark probes. Such a trial is recorded with `state=ERROR`
 (or `TIMEOUT`/`NO_METRIC`) and the configured `crash_cost`, and the search
-continues. So a run reporting **fewer OK trials than its budget is normal**, not
+continues. So a run reporting **fewer OK trials than its total execution budget is normal**, not
 a bug; inspect `trials.csv` / `trials/trial_XXXX/trial_artifact.json` for the
 per-trial state and stderr.
 
 The baseline (seed) configuration — each workflow's documented default knobs — is
-injected as an additional initial-design point and used as the speedup denominator.
+injected as the first initial-design point, consumes one budgeted execution, and is
+used as the speedup denominator.
 
 ## Fair comparison with SysPilot (budget, round vs trial)
 
@@ -236,12 +238,7 @@ SysPilot protocol **except the tunable value ranges** — read the two ⚠️ ca
 just below this section (**Known difference #1 — search-space bounds** and
 **#2 — doc pitfall**) before reconciling numbers against SysPilot.
 
-- **Budget excludes the baseline.** SysPilot runs the baseline once as "Round 0"
-  *before* the loop, and that baseline does **not** consume `--fixed-budget`. So
-  `--fixed-budget N` buys N candidate trials on top of a free baseline (N+1 total
-  executions). This harness matches that exactly: `--budget N` = **N search
-  trials**, the baseline is measured once for free, and the SMAC scenario runs
-  `n_trials = N + 1`. At the same `N`, both tools explore N configurations.
+- **Budget includes the baseline.** `--budget N` is the total number of benchmark executions SMAC3 may run. The baseline seed consumes one execution, so `--budget 1` runs only the baseline and `--budget N` leaves at most `N - 1` searched candidates.
 - **Round vs trial.** SysPilot has two levels — a *round* is one LLM reasoning
   step that may emit several *candidate trials*; the budget counts candidate
   trials. SMAC evaluates exactly **one configuration per ask/tell step**, so for
@@ -270,12 +267,13 @@ just below this section (**Known difference #1 — search-space bounds** and
 >
 > SMAC, by contrast, **requires a bounded `ConfigSpace`**, so this harness
 > declares explicit ranges: integer thread/worker knobs `1..min(cpu,64)`,
-> `prefetch_factor 1..8`, `ddp_bucket_cap_mb 1..64`, DALI batch `16..256`, and
-> categorical option sets (`worker_memory_limit ∈ {128MB,256MB,512MB,1GB}`,
-> `s3_block_size ∈ {4096..1048576}`, `dali_hw_decoder_load ∈ {0.25..0.9}`, …).
+> `prefetch_factor 1..8`, `ddp_bucket_cap_mb 1..64`, DALI batch `16..256`,
+> continuous DALI hardware-decoder load `0.0..1.0`, and categorical option sets
+> (`worker_memory_limit ∈ {128MB,256MB,512MB,1GB}`,
+> `s3_cache_type ∈ {none,bytes,readahead,mmap}`, …).
 > These bounds come from **this repo's OpenTuner integration
-> (`opentuner_integration/specs.py`)**, whose enum option sets are in turn taken
-> from each benchmark's documented values / runner defaults — they are **our
+> (`opentuner_integration/specs.py`)**, whose parameter ranges and option sets are
+> in turn taken from each benchmark's documented values / runner defaults — they are **our
 > choice, not inherited from SysPilot**.
 >
 > Consequence: SMAC and SysPilot do **not** search literally the same space. This
@@ -308,7 +306,7 @@ for easy cross-run concatenation into the SysPilot-style spreadsheet:
 | SysPilot report item | `summary.json` field |
 |---|---|
 | 1. command | `command` (baseline seed command) |
-| 2. total trials / rounds | `n_search_trials` / `n_rounds` (equal) |
+| 2. total trials / rounds | `total_executions` / `n_rounds` (equal) |
 | 3. trials / rounds to best | `trials_to_best` / `rounds_to_best` (0 if baseline is best) |
 | 4. wall time of optimizer | `wall_time_sec` |
 | 5. wall time to best | `wall_time_to_best_sec` |

@@ -12,7 +12,7 @@ Print the baseline command + search space without running (host-safe)::
     python3 experiments/LibContentBench/smac3/cli.py \\
         --workflow nestedcpu-blas --size small --dry-run
 
-Tune a workflow (mirrors fixed-budget: ``--budget`` == number of trials)::
+Tune a workflow (``--budget`` == total executions including baseline)::
 
     python3 experiments/LibContentBench/smac3/cli.py \\
         --workflow nestedcpu-blas --size small --budget 20 \\
@@ -46,9 +46,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=20,
         help=(
-            "Number of SEARCH trials, EXCLUDING the baseline (matches SysPilot "
-            "--fixed-budget N). The baseline is measured once for free, so total "
-            "benchmark executions = budget + 1. Default: 20"
+            "Total benchmark executions, INCLUDING the baseline seed. "
+            "With --budget 1, only the baseline runs. Default: 20"
         ),
     )
     parser.add_argument(
@@ -159,14 +158,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"workflow:      {spec.workflow_id}")
         print(f"size:          {args.size}")
         print(f"metric:        {metric_name} ({metric_mode})")
-        print(f"budget:        {args.budget} search trials (+1 free baseline = "
-              f"{args.budget + 1} executions)")
+        print(f"budget:        {args.budget} total executions (baseline included; "
+              f"up to {max(0, args.budget - 1)} searched candidates)")
         print(f"timeout:       {timeout_seconds}s per trial")
         print(f"cpu bound:     {spec.tunables[0].max_value if spec.tunables else 'n/a'}")
         print("search space:")
         for tunable in spec.tunables:
             if tunable.kind == "integer":
                 domain = f"int[{tunable.min_value}, {tunable.max_value}]"
+            elif tunable.kind == "float":
+                domain = f"float[{tunable.min_value}, {tunable.max_value}]"
             else:
                 domain = f"categorical{list(tunable.options)}"
             default = tunable.encode_default(spec.baseline_runtime[tunable.field_name])
@@ -194,8 +195,8 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"workflow:            {summary['workflow']} ({summary['size']}, budget {summary['budget']})")
     print(f"metric:              {summary['metric']} ({summary['metric_mode']})")
-    print(f"search trials:       {summary['n_search_trials']} (+1 baseline = "
-          f"{summary['total_executions']} executions)")
+    print(f"total executions:    {summary['total_executions']} (baseline included; "
+          f"searched candidates: {summary['n_search_trials']})")
     print(f"executions ok:       {summary['n_trials_ok']} / {summary['total_executions']}")
     print(f"trials to best:      {summary['trials_to_best']} "
           f"(rounds==trials for SMAC)")

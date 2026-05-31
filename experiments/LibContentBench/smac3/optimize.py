@@ -6,26 +6,13 @@ default. Trials are run **sequentially** (``n_workers=1``) by default because th
 benchmarks measure cross-library resource contention; running trials in parallel
 would let trials contend with each other and corrupt the timing signal.
 
-Fair comparison with SysPilot's ``tune --fixed-budget``
--------------------------------------------------------
-SysPilot runs the baseline once as "Round 0" *before* the search loop and the
-baseline does NOT consume the fixed budget; ``--fixed-budget N`` therefore buys
-N *candidate trials* (benchmark executions) on top of the free baseline, i.e.
-N+1 total executions and N searched configurations.
-
-To match that exactly, ``--budget N`` here means **N search trials, excluding the
-baseline**. Internally the SMAC scenario gets ``n_trials = N + 1``; the baseline
-(seed) config is injected as an additional initial-design configuration (the free
-"+1"), leaving N executions for SMAC to search. So both tools, at the same
-``N``, explore N configurations and measure the baseline once.
-
-Round vs trial
---------------
-SysPilot has two levels: a *round* is one LLM reasoning step that may propose
-several *candidate trials*; ``--fixed-budget`` counts candidate trials (executions).
-SMAC has no multi-candidate round — it evaluates exactly one configuration per
-ask/tell step — so for SMAC a "round" == a "trial" == one benchmark execution.
-The comparable budget unit across both tools is therefore the **trial**.
+Budget accounting
+-----------------
+``--budget N`` is the total benchmark-execution budget for SMAC3. The
+baseline seed configuration is one of those executions, so ``--budget 1`` runs
+only the baseline and performs no searched candidate trial. SMAC evaluates one
+configuration per ask/tell step, so for SMAC a "round" == a "trial" == one
+benchmark execution.
 """
 
 from __future__ import annotations
@@ -104,8 +91,8 @@ def run_smac(
     baseline_cfg = baseline_configuration(cs, spec)
     baseline_values = baseline_config_values(spec)
 
-    # Fairness: baseline is free (SysPilot Round 0), budget = N searched configs.
-    n_trials = budget + 1
+    # The baseline seed consumes one SMAC trial; budget is total executions.
+    n_trials = budget
 
     evaluator = TrialEvaluator(
         spec=spec,
@@ -139,12 +126,11 @@ def run_smac(
     def target_function(config: Any, seed: int = 0) -> float:
         return evaluator(config, seed)
 
-    # The baseline seed is one additional initial-design config (the free "+1"),
-    # leaving ``budget`` executions for SMAC to search. The facade's max_ratio
-    # clamp still bounds the Sobol portion; passing n_configs=budget only ensures
-    # the baseline always fits (n_configs_after_clamp + 1 <= n_trials).
+    # The baseline seed is part of the trial budget. With budget=1, the initial
+    # design contains only the baseline; larger budgets leave budget-1 searched
+    # configurations after the baseline is measured.
     initial_design = HyperparameterOptimizationFacade.get_initial_design(
-        scenario, n_configs=max(0, budget), additional_configs=[baseline_cfg]
+        scenario, n_configs=max(0, budget - 1), additional_configs=[baseline_cfg]
     )
     smac = HyperparameterOptimizationFacade(
         scenario,
@@ -175,9 +161,8 @@ def run_smac(
     best_trial_index = best_record["trial_index"] if best_record else None
     wall_time_to_best_sec = best_record["cumulative_wall_sec"] if best_record else None
 
-    # Search trials = everything except the baseline seed (matches SysPilot's
-    # "candidate trials"). trials_to_best = # of search trials up to & incl. the
-    # best; 0 if the baseline itself is best (no search beat it).
+    # Search trials = everything except the baseline seed. trials_to_best = # of
+    # searched trials up to & incl. the best; 0 if the baseline itself is best.
     search_records = [r for r in records if not r["is_baseline"]]
     n_search_trials = len(search_records)
     if best_record is None:
@@ -212,10 +197,10 @@ def run_smac(
         "workflow": spec.workflow_id,
         "size": size,
         "mode": "smac3",
-        # budget accounting (fair vs SysPilot --fixed-budget)
-        "budget": budget,  # N search trials, EXCLUDING baseline
-        "n_search_trials": n_search_trials,  # should equal budget
-        "total_executions": len(records),  # search + baseline (== budget + 1)
+        # budget accounting: budget is total executions, including the baseline
+        "budget": budget,
+        "n_search_trials": n_search_trials,
+        "total_executions": len(records),
         "metric": metric_name,
         "metric_mode": metric_mode,
         "seed": seed,
@@ -226,8 +211,8 @@ def run_smac(
         # ----- SysPilot-aligned report items (see README mapping table) -----
         "report": {
             "1_command": baseline_command,
-            "2_total_trials": n_search_trials,
-            "2_total_rounds": n_search_trials,  # SMAC: 1 candidate/round => rounds == trials
+            "2_total_trials": len(records),
+            "2_total_rounds": len(records),  # SMAC: 1 execution/round => rounds == trials
             "3_trials_to_best": trials_to_best,
             "3_rounds_to_best": trials_to_best,
             "4_wall_time_sec": round(wall_time_sec, 4),
@@ -242,7 +227,7 @@ def run_smac(
         },
         # flat duplicates for convenience
         "command": baseline_command,
-        "n_rounds": n_search_trials,
+        "n_rounds": len(records),
         "trials_to_best": trials_to_best,
         "rounds_to_best": trials_to_best,
         "wall_time_sec": round(wall_time_sec, 4),
@@ -258,9 +243,8 @@ def run_smac(
         "speedup_vs_baseline": speedup,
         "round_trial_note": (
             "SMAC evaluates one configuration per ask/tell step, so a 'round' == a "
-            "'trial' == one benchmark execution. --budget N = N search trials, "
-            "EXCLUDING the free baseline (matches SysPilot --fixed-budget N); total "
-            "executions = N + 1."
+            "'trial' == one benchmark execution. --budget N = N total executions, "
+            "including the baseline seed; searched candidates are at most N - 1."
         ),
         "trials": trial_rows,
     }
@@ -319,8 +303,8 @@ def run_smac(
                 "size": size,
                 "mode": "smac3",
                 "budget": budget,
-                "total_trials": n_search_trials,
-                "total_rounds": n_search_trials,
+                "total_trials": len(records),
+                "total_rounds": len(records),
                 "trials_to_best": trials_to_best,
                 "rounds_to_best": trials_to_best,
                 "wall_time_sec": round(wall_time_sec, 4),

@@ -160,6 +160,6 @@ Path("work/runtime_plan.json").write_text(json.dumps({
 }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 Path("work/workload_lock.json").write_text(json.dumps({
     "fairness_rule": "dataset image count/size range, resize/crop, DALI output dtype, PyTorch model/input/precision stay fixed for fixed-baseline comparisons",
-    "primary_score": "min(DALI_pair/DALI_solo, Torch_pair/Torch_solo)",
+    "primary_score": "pair_dali_images_per_sec + pair_torch_images_per_sec",
 }, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 PY

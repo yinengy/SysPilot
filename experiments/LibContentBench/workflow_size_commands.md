@@ -40,7 +40,6 @@ mkdir -p experiments/LibContentBench/nestedcpu-blas/work/size_sweeps && \
 env OMP_NUM_THREADS=6 OPENBLAS_NUM_THREADS=6 MKL_NUM_THREADS=1 BLIS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 \
   experiments/LibContentBench/nestedcpu-blas/artifact/venv/bin/python \
   experiments/LibContentBench/nestedcpu-blas/run_nestedcpu_blas_case.py \
-  --case-id size_small --label 'size small' --mode size_sweep \
   --output-json experiments/LibContentBench/nestedcpu-blas/work/size_sweeps/small.json \
   --matrix-size 320 --task-count 800 --repetitions 6 \
   --joblib-n-jobs 6 --backend-prefer processes
@@ -53,7 +52,6 @@ mkdir -p experiments/LibContentBench/nestedcpu-blas/work/size_sweeps && \
 env OMP_NUM_THREADS=6 OPENBLAS_NUM_THREADS=6 MKL_NUM_THREADS=1 BLIS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 \
   experiments/LibContentBench/nestedcpu-blas/artifact/venv/bin/python \
   experiments/LibContentBench/nestedcpu-blas/run_nestedcpu_blas_case.py \
-  --case-id size_medium --label 'size medium' --mode size_sweep \
   --output-json experiments/LibContentBench/nestedcpu-blas/work/size_sweeps/medium.json \
   --matrix-size 320 --task-count 1600 --repetitions 6 \
   --joblib-n-jobs 6 --backend-prefer processes
@@ -66,7 +64,6 @@ mkdir -p experiments/LibContentBench/nestedcpu-blas/work/size_sweeps && \
 env OMP_NUM_THREADS=6 OPENBLAS_NUM_THREADS=6 MKL_NUM_THREADS=1 BLIS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 \
   experiments/LibContentBench/nestedcpu-blas/artifact/venv/bin/python \
   experiments/LibContentBench/nestedcpu-blas/run_nestedcpu_blas_case.py \
-  --case-id size_large --label 'size large' --mode size_sweep \
   --output-json experiments/LibContentBench/nestedcpu-blas/work/size_sweeps/large.json \
   --matrix-size 320 --task-count 3200 --repetitions 6 \
   --joblib-n-jobs 6 --backend-prefer processes
@@ -90,7 +87,6 @@ env BENCHMARK_N_WORKERS=24 BENCHMARK_THREADS_PER_WORKER=24 \
   BENCHMARK_DUCKDB_THREADS=1 BENCHMARK_PATH_LAYOUT=shared \
   experiments/LibContentBench/arrow-dask-duckdb-memspill/artifact/venv/bin/python \
   experiments/LibContentBench/arrow-dask-duckdb-memspill/run_arrow_dask_duckdb_case.py \
-  --case-id size_small --label 'size small' --mode size_sweep \
   --output-json experiments/LibContentBench/arrow-dask-duckdb-memspill/work/size_sweeps/small.json \
   --runtime-root /var/tmp/libcontentbench/arrow-dask-duckdb-memspill-size-small \
   --num-files 10 --rows-per-file 20000 --row-group-size 5000
@@ -106,7 +102,6 @@ env BENCHMARK_N_WORKERS=24 BENCHMARK_THREADS_PER_WORKER=24 \
   BENCHMARK_DUCKDB_THREADS=1 BENCHMARK_PATH_LAYOUT=shared \
   experiments/LibContentBench/arrow-dask-duckdb-memspill/artifact/venv/bin/python \
   experiments/LibContentBench/arrow-dask-duckdb-memspill/run_arrow_dask_duckdb_case.py \
-  --case-id size_medium --label 'size medium' --mode size_sweep \
   --output-json experiments/LibContentBench/arrow-dask-duckdb-memspill/work/size_sweeps/medium.json \
   --runtime-root /var/tmp/libcontentbench/arrow-dask-duckdb-memspill-size-medium \
   --num-files 12 --rows-per-file 100000 --row-group-size 10000
@@ -122,7 +117,6 @@ env BENCHMARK_N_WORKERS=24 BENCHMARK_THREADS_PER_WORKER=24 \
   BENCHMARK_DUCKDB_THREADS=1 BENCHMARK_PATH_LAYOUT=shared \
   experiments/LibContentBench/arrow-dask-duckdb-memspill/artifact/venv/bin/python \
   experiments/LibContentBench/arrow-dask-duckdb-memspill/run_arrow_dask_duckdb_case.py \
-  --case-id size_large --label 'size large' --mode size_sweep \
   --output-json experiments/LibContentBench/arrow-dask-duckdb-memspill/work/size_sweeps/large.json \
   --runtime-root /var/tmp/libcontentbench/arrow-dask-duckdb-memspill-size-large \
   --num-files 12 --rows-per-file 250000 --row-group-size 25000
@@ -145,7 +139,6 @@ env BENCHMARK_TORCH_NUM_THREADS=24 BENCHMARK_DATASETS_NUM_PROC=24 \
   BENCHMARK_PREFETCH_FACTOR=1 BENCHMARK_PERSISTENT_WORKERS=true \
   experiments/LibContentBench/hf-datasets-tokenizers-dataloader/artifact/venv/bin/python \
   experiments/LibContentBench/hf-datasets-tokenizers-dataloader/run_hf_datasets_tokenizers_case.py \
-  --case-id size_small --label 'size small' --mode size_sweep \
   --output-json experiments/LibContentBench/hf-datasets-tokenizers-dataloader/work/size_sweeps/small.json \
   --runtime-root /var/tmp/libcontentbench/hf-datasets-tokenizers-dataloader-size-small \
   --dataset-rows 4096 --tokens-per-row 32 --max-length 64 --tokenizer-vocab-size 1024 \
@@ -162,7 +155,6 @@ env BENCHMARK_TORCH_NUM_THREADS=24 BENCHMARK_DATASETS_NUM_PROC=24 \
   BENCHMARK_PREFETCH_FACTOR=1 BENCHMARK_PERSISTENT_WORKERS=true \
   experiments/LibContentBench/hf-datasets-tokenizers-dataloader/artifact/venv/bin/python \
   experiments/LibContentBench/hf-datasets-tokenizers-dataloader/run_hf_datasets_tokenizers_case.py \
-  --case-id size_medium --label 'size medium' --mode size_sweep \
   --output-json experiments/LibContentBench/hf-datasets-tokenizers-dataloader/work/size_sweeps/medium.json \
   --runtime-root /var/tmp/libcontentbench/hf-datasets-tokenizers-dataloader-size-medium \
   --dataset-rows 8192 --tokens-per-row 48 --max-length 96 --tokenizer-vocab-size 2048 \
@@ -179,7 +171,6 @@ env BENCHMARK_TORCH_NUM_THREADS=24 BENCHMARK_DATASETS_NUM_PROC=24 \
   BENCHMARK_PREFETCH_FACTOR=1 BENCHMARK_PERSISTENT_WORKERS=true \
   experiments/LibContentBench/hf-datasets-tokenizers-dataloader/artifact/venv/bin/python \
   experiments/LibContentBench/hf-datasets-tokenizers-dataloader/run_hf_datasets_tokenizers_case.py \
-  --case-id size_large --label 'size large' --mode size_sweep \
   --output-json experiments/LibContentBench/hf-datasets-tokenizers-dataloader/work/size_sweeps/large.json \
   --runtime-root /var/tmp/libcontentbench/hf-datasets-tokenizers-dataloader-size-large \
   --dataset-rows 16384 --tokens-per-row 64 --max-length 128 --tokenizer-vocab-size 4096 \
@@ -204,7 +195,6 @@ env BENCHMARK_TORCH_NUM_THREADS=24 BENCHMARK_S3_BLOCK_SIZE=65536 \
   BENCHMARK_DDP_BUCKET_CAP_MB=1 \
   experiments/LibContentBench/torchdata-fsspec-s3-ddp/artifact/venv/bin/python \
   experiments/LibContentBench/torchdata-fsspec-s3-ddp/run_torchdata_fsspec_s3_ddp_case.py \
-  --case-id size_small --label 'size small' --mode size_sweep \
   --output-json experiments/LibContentBench/torchdata-fsspec-s3-ddp/work/size_sweeps/small.json \
   --case-output-dir experiments/LibContentBench/torchdata-fsspec-s3-ddp/work/size_sweeps/small \
   --runtime-root /var/tmp/libcontentbench/torchdata-fsspec-s3-ddp-size-small \
@@ -222,7 +212,6 @@ env BENCHMARK_TORCH_NUM_THREADS=24 BENCHMARK_S3_BLOCK_SIZE=65536 \
   BENCHMARK_DDP_BUCKET_CAP_MB=1 \
   experiments/LibContentBench/torchdata-fsspec-s3-ddp/artifact/venv/bin/python \
   experiments/LibContentBench/torchdata-fsspec-s3-ddp/run_torchdata_fsspec_s3_ddp_case.py \
-  --case-id size_medium --label 'size medium' --mode size_sweep \
   --output-json experiments/LibContentBench/torchdata-fsspec-s3-ddp/work/size_sweeps/medium.json \
   --case-output-dir experiments/LibContentBench/torchdata-fsspec-s3-ddp/work/size_sweeps/medium \
   --runtime-root /var/tmp/libcontentbench/torchdata-fsspec-s3-ddp-size-medium \
@@ -240,7 +229,6 @@ env BENCHMARK_TORCH_NUM_THREADS=24 BENCHMARK_S3_BLOCK_SIZE=65536 \
   BENCHMARK_DDP_BUCKET_CAP_MB=1 \
   experiments/LibContentBench/torchdata-fsspec-s3-ddp/artifact/venv/bin/python \
   experiments/LibContentBench/torchdata-fsspec-s3-ddp/run_torchdata_fsspec_s3_ddp_case.py \
-  --case-id size_large --label 'size large' --mode size_sweep \
   --output-json experiments/LibContentBench/torchdata-fsspec-s3-ddp/work/size_sweeps/large.json \
   --case-output-dir experiments/LibContentBench/torchdata-fsspec-s3-ddp/work/size_sweeps/large \
   --runtime-root /var/tmp/libcontentbench/torchdata-fsspec-s3-ddp-size-large \
@@ -253,8 +241,8 @@ env BENCHMARK_TORCH_NUM_THREADS=24 BENCHMARK_S3_BLOCK_SIZE=65536 \
 
 Workload-size flags: `--dataset-images`, `--image-min-size`, `--image-max-size`,
 `--warmup-seconds`, `--measure-seconds`, and `--timeout-seconds`. These commands
-intentionally keep the current medium run's library/runtime controls fixed through
-`BENCHMARK_*` env vars (`DALI b96 prefetch2 hw0.65 threads4 MPS50/50, Torch batch256`)
+intentionally keep the requested DALI baseline library/runtime controls fixed through
+`BENCHMARK_*` env vars (`DALI b16 prefetch1 hw0.65 threads1 MPS50/50, Torch batch16`)
 and keep class count plus CNN spatial input (`resize/crop=224`) stable, so the size tiers
 primarily change synthetic JPEG volume/resolution and measurement budget.
 
@@ -265,13 +253,12 @@ validation, append `--scaffold-only`; scaffold results are not throughput eviden
 
 ```bash
 mkdir -p experiments/LibContentBench/dali-nvjpeg-pytorch-cudnn/work/size_sweeps/small && \
-env BENCHMARK_DALI_BATCH_SIZE=96 BENCHMARK_DALI_PREFETCH_QUEUE_DEPTH=2 \
-  BENCHMARK_DALI_HW_DECODER_LOAD=0.65 BENCHMARK_DALI_NUM_THREADS=4 \
+env BENCHMARK_DALI_BATCH_SIZE=16 BENCHMARK_DALI_PREFETCH_QUEUE_DEPTH=1 \
+  BENCHMARK_DALI_HW_DECODER_LOAD=0.65 BENCHMARK_DALI_NUM_THREADS=1 \
   BENCHMARK_DALI_MPS_SHARE=50 BENCHMARK_TORCH_MPS_SHARE=50 \
-  BENCHMARK_TORCH_BATCH_SIZE=256 \
+  BENCHMARK_TORCH_BATCH_SIZE=16 \
   experiments/LibContentBench/dali-nvjpeg-pytorch-cudnn/artifact/venv/bin/python \
   experiments/LibContentBench/dali-nvjpeg-pytorch-cudnn/run_dali_nvjpeg_pytorch_cudnn_case.py \
-  --case-id size_small --label 'size small' --mode size_sweep \
   --output-json experiments/LibContentBench/dali-nvjpeg-pytorch-cudnn/work/size_sweeps/small.json \
   --case-output-dir experiments/LibContentBench/dali-nvjpeg-pytorch-cudnn/work/size_sweeps/small \
   --runtime-root /var/tmp/libcontentbench/dali-nvjpeg-pytorch-cudnn-size-small \
@@ -286,13 +273,12 @@ env BENCHMARK_DALI_BATCH_SIZE=96 BENCHMARK_DALI_PREFETCH_QUEUE_DEPTH=2 \
 
 ```bash
 mkdir -p experiments/LibContentBench/dali-nvjpeg-pytorch-cudnn/work/size_sweeps/medium && \
-env BENCHMARK_DALI_BATCH_SIZE=96 BENCHMARK_DALI_PREFETCH_QUEUE_DEPTH=2 \
-  BENCHMARK_DALI_HW_DECODER_LOAD=0.65 BENCHMARK_DALI_NUM_THREADS=4 \
+env BENCHMARK_DALI_BATCH_SIZE=16 BENCHMARK_DALI_PREFETCH_QUEUE_DEPTH=1 \
+  BENCHMARK_DALI_HW_DECODER_LOAD=0.65 BENCHMARK_DALI_NUM_THREADS=1 \
   BENCHMARK_DALI_MPS_SHARE=50 BENCHMARK_TORCH_MPS_SHARE=50 \
-  BENCHMARK_TORCH_BATCH_SIZE=256 \
+  BENCHMARK_TORCH_BATCH_SIZE=16 \
   experiments/LibContentBench/dali-nvjpeg-pytorch-cudnn/artifact/venv/bin/python \
   experiments/LibContentBench/dali-nvjpeg-pytorch-cudnn/run_dali_nvjpeg_pytorch_cudnn_case.py \
-  --case-id size_medium --label 'size medium' --mode size_sweep \
   --output-json experiments/LibContentBench/dali-nvjpeg-pytorch-cudnn/work/size_sweeps/medium.json \
   --case-output-dir experiments/LibContentBench/dali-nvjpeg-pytorch-cudnn/work/size_sweeps/medium \
   --runtime-root /var/tmp/libcontentbench/dali-nvjpeg-pytorch-cudnn-size-medium \
@@ -307,13 +293,12 @@ env BENCHMARK_DALI_BATCH_SIZE=96 BENCHMARK_DALI_PREFETCH_QUEUE_DEPTH=2 \
 
 ```bash
 mkdir -p experiments/LibContentBench/dali-nvjpeg-pytorch-cudnn/work/size_sweeps/large && \
-env BENCHMARK_DALI_BATCH_SIZE=96 BENCHMARK_DALI_PREFETCH_QUEUE_DEPTH=2 \
-  BENCHMARK_DALI_HW_DECODER_LOAD=0.65 BENCHMARK_DALI_NUM_THREADS=4 \
+env BENCHMARK_DALI_BATCH_SIZE=16 BENCHMARK_DALI_PREFETCH_QUEUE_DEPTH=1 \
+  BENCHMARK_DALI_HW_DECODER_LOAD=0.65 BENCHMARK_DALI_NUM_THREADS=1 \
   BENCHMARK_DALI_MPS_SHARE=50 BENCHMARK_TORCH_MPS_SHARE=50 \
-  BENCHMARK_TORCH_BATCH_SIZE=256 \
+  BENCHMARK_TORCH_BATCH_SIZE=16 \
   experiments/LibContentBench/dali-nvjpeg-pytorch-cudnn/artifact/venv/bin/python \
   experiments/LibContentBench/dali-nvjpeg-pytorch-cudnn/run_dali_nvjpeg_pytorch_cudnn_case.py \
-  --case-id size_large --label 'size large' --mode size_sweep \
   --output-json experiments/LibContentBench/dali-nvjpeg-pytorch-cudnn/work/size_sweeps/large.json \
   --case-output-dir experiments/LibContentBench/dali-nvjpeg-pytorch-cudnn/work/size_sweeps/large \
   --runtime-root /var/tmp/libcontentbench/dali-nvjpeg-pytorch-cudnn-size-large \

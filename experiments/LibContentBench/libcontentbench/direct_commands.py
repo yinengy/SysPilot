@@ -85,9 +85,9 @@ def _canonical_command_payload(
     payload = dict(spec.defaults)
     payload.update(source)
     payload.setdefault("benchmark", spec.benchmark_id)
-    payload.setdefault("output_json", _default_repo_relative_output_json(spec))
+    payload["output_json"] = _default_repo_relative_output_json(spec)
     if any(field.field_name == "case_output_dir" for field in spec.cli_fields):
-        payload.setdefault("case_output_dir", _default_repo_relative_case_output_dir(spec))
+        payload["case_output_dir"] = _default_repo_relative_case_output_dir(spec)
     return payload
 
 
@@ -140,9 +140,6 @@ DIRECT_COMMAND_SPECS: dict[str, DirectCommandSpec] = {
             EnvVarSpec("numexpr_threads", "NUMEXPR_NUM_THREADS"),
         ),
         cli_fields=(
-            CliFieldSpec("case_id", "--case-id"),
-            CliFieldSpec("label", "--label"),
-            CliFieldSpec("mode", "--mode"),
             CliFieldSpec("output_json", "--output-json"),
             CliFieldSpec("matrix_size", "--matrix-size"),
             CliFieldSpec("task_count", "--task-count"),
@@ -154,9 +151,9 @@ DIRECT_COMMAND_SPECS: dict[str, DirectCommandSpec] = {
             "backend_prefer": "processes",
             "omp_threads": 6,
             "openblas_threads": 6,
-            "mkl_threads": 1,
-            "blis_threads": 1,
-            "numexpr_threads": 1,
+            "mkl_threads": 6,
+            "blis_threads": 6,
+            "numexpr_threads": 6,
         },
     ),
     "arrow-dask-duckdb-memspill": DirectCommandSpec(
@@ -174,9 +171,6 @@ DIRECT_COMMAND_SPECS: dict[str, DirectCommandSpec] = {
             EnvVarSpec("path_layout", "BENCHMARK_PATH_LAYOUT"),
         ),
         cli_fields=(
-            CliFieldSpec("case_id", "--case-id"),
-            CliFieldSpec("label", "--label"),
-            CliFieldSpec("mode", "--mode"),
             CliFieldSpec("output_json", "--output-json"),
             CliFieldSpec("runtime_root", "--runtime-root"),
             CliFieldSpec("num_files", "--num-files"),
@@ -196,9 +190,6 @@ DIRECT_COMMAND_SPECS: dict[str, DirectCommandSpec] = {
             EnvVarSpec("romio_ds_write", "BENCHMARK_ROMIO_DS_WRITE"),
         ),
         cli_fields=(
-            CliFieldSpec("case_id", "--case-id"),
-            CliFieldSpec("label", "--label"),
-            CliFieldSpec("mode", "--mode"),
             CliFieldSpec("output_json", "--output-json"),
             CliFieldSpec("runtime_root", "--runtime-root"),
             CliFieldSpec("mpi_ranks", "--mpi-ranks"),
@@ -220,9 +211,6 @@ DIRECT_COMMAND_SPECS: dict[str, DirectCommandSpec] = {
             EnvVarSpec("horovod_cycle_time_ms", "BENCHMARK_HOROVOD_CYCLE_TIME_MS"),
         ),
         cli_fields=(
-            CliFieldSpec("case_id", "--case-id"),
-            CliFieldSpec("label", "--label"),
-            CliFieldSpec("mode", "--mode"),
             CliFieldSpec("output_json", "--output-json"),
             CliFieldSpec("case_output_dir", "--case-output-dir"),
             CliFieldSpec("timeout_seconds", "--timeout-seconds"),
@@ -254,9 +242,6 @@ DIRECT_COMMAND_SPECS: dict[str, DirectCommandSpec] = {
             EnvVarSpec("flush_writer_on_checkpoint", "BENCHMARK_FLUSH_WRITER_ON_CHECKPOINT"),
         ),
         cli_fields=(
-            CliFieldSpec("case_id", "--case-id"),
-            CliFieldSpec("label", "--label"),
-            CliFieldSpec("mode", "--mode"),
             CliFieldSpec("output_json", "--output-json"),
             CliFieldSpec("runtime_root", "--runtime-root"),
             CliFieldSpec("dataset_shards", "--dataset-shards"),
@@ -283,9 +268,6 @@ DIRECT_COMMAND_SPECS: dict[str, DirectCommandSpec] = {
             EnvVarSpec("hdf5_rdcc_w0", "BENCHMARK_HDF5_RDCC_W0"),
         ),
         cli_fields=(
-            CliFieldSpec("case_id", "--case-id"),
-            CliFieldSpec("label", "--label"),
-            CliFieldSpec("mode", "--mode"),
             CliFieldSpec("output_json", "--output-json"),
             CliFieldSpec("runtime_root", "--runtime-root"),
             CliFieldSpec("dataset_rows", "--dataset-rows"),
@@ -313,9 +295,6 @@ DIRECT_COMMAND_SPECS: dict[str, DirectCommandSpec] = {
             EnvVarSpec("persistent_workers", "BENCHMARK_PERSISTENT_WORKERS"),
         ),
         cli_fields=(
-            CliFieldSpec("case_id", "--case-id"),
-            CliFieldSpec("label", "--label"),
-            CliFieldSpec("mode", "--mode"),
             CliFieldSpec("output_json", "--output-json"),
             CliFieldSpec("runtime_root", "--runtime-root"),
             CliFieldSpec("dataset_rows", "--dataset-rows"),
@@ -347,9 +326,6 @@ DIRECT_COMMAND_SPECS: dict[str, DirectCommandSpec] = {
             EnvVarSpec("zarr_write_empty_chunks", "BENCHMARK_ZARR_WRITE_EMPTY_CHUNKS"),
         ),
         cli_fields=(
-            CliFieldSpec("case_id", "--case-id"),
-            CliFieldSpec("label", "--label"),
-            CliFieldSpec("mode", "--mode"),
             CliFieldSpec("output_json", "--output-json"),
             CliFieldSpec("runtime_root", "--runtime-root"),
             CliFieldSpec("array_rows", "--array-rows"),
@@ -377,9 +353,6 @@ DIRECT_COMMAND_SPECS: dict[str, DirectCommandSpec] = {
             EnvVarSpec("ddp_bucket_cap_mb", "BENCHMARK_DDP_BUCKET_CAP_MB"),
         ),
         cli_fields=(
-            CliFieldSpec("case_id", "--case-id"),
-            CliFieldSpec("label", "--label"),
-            CliFieldSpec("mode", "--mode"),
             CliFieldSpec("output_json", "--output-json"),
             CliFieldSpec("case_output_dir", "--case-output-dir"),
             CliFieldSpec("runtime_root", "--runtime-root"),
@@ -412,9 +385,6 @@ DIRECT_COMMAND_SPECS: dict[str, DirectCommandSpec] = {
             EnvVarSpec("metadata_threads", "BENCHMARK_METADATA_THREADS"),
         ),
         cli_fields=(
-            CliFieldSpec("case_id", "--case-id"),
-            CliFieldSpec("label", "--label"),
-            CliFieldSpec("mode", "--mode"),
             CliFieldSpec("output_json", "--output-json"),
             CliFieldSpec("case_output_dir", "--case-output-dir"),
             CliFieldSpec("runtime_root", "--runtime-root"),
@@ -431,9 +401,6 @@ DIRECT_COMMAND_SPECS: dict[str, DirectCommandSpec] = {
         workspace_name="raydata-ddp-network",
         runner_name="run_raydata_ddp_network_case.py",
         cli_fields=(
-            CliFieldSpec("case_id", "--case-id"),
-            CliFieldSpec("label", "--label"),
-            CliFieldSpec("mode", "--mode"),
             CliFieldSpec("output_json", "--output-json"),
             CliFieldSpec("case_output_dir", "--case-output-dir"),
             CliFieldSpec("runtime_root", "--runtime-root"),
@@ -484,9 +451,6 @@ DIRECT_COMMAND_SPECS: dict[str, DirectCommandSpec] = {
             EnvVarSpec("torch_mps_share", "BENCHMARK_TORCH_MPS_SHARE"),
         ),
         cli_fields=(
-            CliFieldSpec("case_id", "--case-id"),
-            CliFieldSpec("label", "--label"),
-            CliFieldSpec("mode", "--mode"),
             CliFieldSpec("output_json", "--output-json"),
             CliFieldSpec("case_output_dir", "--case-output-dir"),
             CliFieldSpec("runtime_root", "--runtime-root"),
@@ -575,3 +539,23 @@ def rewrite_syspilot_command_value(command: str, inner_command: str) -> str:
             del tokens[index + 1 : trailing_command_end]
             return shlex.join(tokens)
     raise ValueError("No --command argument found to rewrite")
+
+
+def strip_removed_metadata_options(command: str) -> str:
+    tokens = shlex.split(command)
+    if not tokens:
+        return command
+    stripped: list[str] = []
+    skip_next = False
+    removed_options = {"--case-id", "--label", "--mode"}
+    for token in tokens:
+        if skip_next:
+            skip_next = False
+            continue
+        if token in removed_options:
+            skip_next = True
+            continue
+        if any(token.startswith(f"{option}=") for option in removed_options):
+            continue
+        stripped.append(token)
+    return shlex.join(stripped)

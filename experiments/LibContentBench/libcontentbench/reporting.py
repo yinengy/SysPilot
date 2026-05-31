@@ -4,7 +4,11 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from .common import load_json_object
-from .direct_commands import build_direct_command_from_row, rewrite_syspilot_command_value
+from .direct_commands import (
+    build_direct_command_from_row,
+    rewrite_syspilot_command_value,
+    strip_removed_metadata_options,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -55,7 +59,10 @@ def best_successful_row(rows: Iterable[dict[str, Any] | None]) -> dict[str, Any]
 def row_repro_command(workspace_root: Path, row: dict[str, Any] | None) -> str | None:
     if row is None:
         return None
-    return build_direct_command_from_row(workspace_root.name, row)
+    try:
+        return build_direct_command_from_row(workspace_root.name, row)
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def rewrite_tune_command_with_row(
@@ -65,9 +72,12 @@ def rewrite_tune_command_with_row(
 ) -> str:
     command_text = "" if tune_command is None else tune_command.strip()
     if not command_text or row is None:
-        return command_text
-    inner_command = build_direct_command_from_row(benchmark_id, row)
-    return rewrite_syspilot_command_value(command_text, inner_command)
+        return strip_removed_metadata_options(command_text)
+    try:
+        inner_command = build_direct_command_from_row(benchmark_id, row)
+    except (KeyError, TypeError, ValueError):
+        return strip_removed_metadata_options(command_text)
+    return strip_removed_metadata_options(rewrite_syspilot_command_value(command_text, inner_command))
 
 
 def load_workspace_quick_mode_report(workspace_root: Path) -> dict[str, Any] | None:
@@ -95,7 +105,7 @@ def _append_case_section(lines: list[str], *, heading: str, row: dict[str, Any] 
         ]
     )
     if command is not None:
-        lines.extend(["```bash", command, "```", ""])
+        lines.extend(["```bash", strip_removed_metadata_options(command), "```", ""])
     else:
         lines.extend(["No stable direct command can be derived from the current archived benchmark row.", ""])
 
@@ -123,7 +133,7 @@ def _append_quick_mode_section(
 
     lines.extend(["#### Quick-mode baseline rerun", "", "- Tune command from repo root:", ""])
     if tune_command:
-        lines.extend(["```bash", tune_command, "```", ""])
+        lines.extend(["```bash", strip_removed_metadata_options(tune_command), "```", ""])
     else:
         lines.extend(["No persistent quick-mode tune command was recorded.", ""])
     lines.append(f"- Quick baseline objective: `{format_metric(baseline_objective if isinstance(baseline_objective, (int, float)) else None)}` {metric_label}.")
@@ -172,7 +182,7 @@ def _append_direct_tune_section(
 
     lines.extend(["#### Direct SysPilot fixed-baseline rerun", "", "- Tune command from repo root:", ""])
     if tune_command:
-        lines.extend(["```bash", tune_command, "```", ""])
+        lines.extend(["```bash", strip_removed_metadata_options(tune_command), "```", ""])
     else:
         lines.extend(["No persistent direct-tune command was recorded.", ""])
     lines.append(f"- Direct baseline objective: `{format_metric(baseline_objective if isinstance(baseline_objective, (int, float)) else None)}` {metric_label}.")
@@ -187,7 +197,7 @@ def _append_direct_tune_section(
     lines.append("- Selected tuned command:")
     lines.append("")
     if selected_tuned_command:
-        lines.extend(["```bash", selected_tuned_command, "```", ""])
+        lines.extend(["```bash", strip_removed_metadata_options(selected_tuned_command), "```", ""])
     else:
         lines.extend(["No validated tuned command was recorded.", ""])
     reason_suffix = f" — {conclusion_reason}" if conclusion_reason else ""

@@ -114,7 +114,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--budgets",
         type=_int_list,
         default=list(DEFAULT_BUDGETS),
-        help="comma-separated search-trial budgets, excl. baseline (default: 10,20,30)",
+        help="comma-separated total execution budgets, baseline included (default: 10,20,30)",
     )
     parser.add_argument(
         "--output-root",

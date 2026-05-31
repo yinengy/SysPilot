@@ -247,4 +247,9 @@ class TrialEvaluator:
                 }
             )
 
+        print(
+            f"[smac3 trial {trial_index}] state={state} "
+            f"wall_time_sec={elapsed_sec:.4f} goal_value={metric_value}",
+            flush=True,
+        )
         return float(cost)

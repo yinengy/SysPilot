@@ -374,13 +374,17 @@ def blocked_result(
 
 
 def scaffold_result(config: CaseConfig, env_overrides: dict[str, Any]) -> dict[str, Any]:
-    solo_dali = float(config.dali_batch_size * 40)
-    solo_torch = float(config.torch_batch_size * 85)
-    pair_dali = solo_dali * max(0.05, config.dali_mps_share / 100.0) * 0.92
-    pair_torch = solo_torch * max(0.05, config.torch_mps_share / 100.0) * 0.94
-    dali_norm = pair_dali / solo_dali
-    torch_norm = pair_torch / solo_torch
-    score = min(dali_norm, torch_norm)
+    pair_dali = (
+        float(config.dali_batch_size * 40)
+        * max(0.05, config.dali_mps_share / 100.0)
+        * 0.92
+    )
+    pair_torch = (
+        float(config.torch_batch_size * 85)
+        * max(0.05, config.torch_mps_share / 100.0)
+        * 0.94
+    )
+    score = pair_dali + pair_torch
     return {
         "benchmark": BENCHMARK_ID,
         "case_id": config.case_id,
@@ -391,12 +395,8 @@ def scaffold_result(config: CaseConfig, env_overrides: dict[str, Any]) -> dict[s
         "implementation_status": "host_safe_scaffold_no_gpu_measurement",
         "throughput": score,
         "score": score,
-        "solo_dali_images_per_sec": solo_dali,
-        "solo_torch_images_per_sec": solo_torch,
         "pair_dali_images_per_sec": pair_dali,
         "pair_torch_images_per_sec": pair_torch,
-        "dali_norm": dali_norm,
-        "torch_norm": torch_norm,
         "wall_time_sec": 0.0,
         "resource_signal_primary": "gpu.compute/memory/copy shared under CUDA MPS",
         "config_summary": format_config_summary(config),
@@ -416,6 +416,18 @@ def format_config_summary(config: CaseConfig) -> str:
         f"hw{config.dali_hw_decoder_load:g} "
         f"MPS {config.dali_mps_share}/{config.torch_mps_share}"
     )
+
+
+DIRECT_STDOUT_KEYS = (
+    "wall_time_sec",
+    "pair_torch_images_per_sec",
+    "pair_dali_images_per_sec",
+    "score",
+)
+
+
+def direct_stdout_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return {key: payload[key] for key in DIRECT_STDOUT_KEYS if key in payload}
 
 
 def generate_dataset(config: CaseConfig, dataset_root: Path) -> None:
@@ -673,29 +685,6 @@ def _worker_env(config: CaseConfig, paths: dict[str, Path], share: int) -> dict[
     return env
 
 
-def run_worker_subprocess(
-    config: CaseConfig, worker: str, share: int, *, mps: bool
-) -> dict[str, Any]:
-    paths = case_paths(config)
-    output_json = paths["worker_dir"] / f"{worker}_{'mps' if mps else 'solo'}.json"
-    command = _base_worker_command(config, worker, output_json)
-    env = _worker_env(config, paths, share) if mps else _configured_subprocess_env(config)
-    if not mps:
-        for field_name, (env_name, _caster) in ENV_SPECS.items():
-            env[env_name] = str(getattr(config, field_name))
-    completed = subprocess.run(
-        command,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=config.timeout_seconds,
-        check=False,
-    )
-    if completed.returncode != 0:
-        raise RuntimeError(f"{worker} worker failed: {completed.stderr[-2000:]}")
-    return json.loads(output_json.read_text(encoding="utf-8"))
-
-
 def start_mps(config: CaseConfig, paths: dict[str, Path]) -> bool:
     if shutil.which("nvidia-cuda-mps-control") is None:
         return False
@@ -850,8 +839,7 @@ def write_timeseries(case_dir: Path, payload: dict[str, Any]) -> None:
         writer = csv.DictWriter(handle, fieldnames=["metric", "value"])
         writer.writeheader()
         for key in (
-            "solo_dali_images_per_sec",
-            "solo_torch_images_per_sec",
+            "wall_time_sec",
             "pair_dali_images_per_sec",
             "pair_torch_images_per_sec",
             "score",
@@ -869,14 +857,10 @@ def run_benchmark(config: CaseConfig, env_overrides: dict[str, Any]) -> dict[str
     initial_mps_pids = set()
     start = time.time()
     generate_dataset(config, paths["dataset_root"])
-    solo_dali = run_worker_subprocess(config, "dali", 100, mps=False)
-    solo_torch = run_worker_subprocess(config, "torch", 100, mps=False)
     pair_dali, pair_torch = run_pair(config, initial_mps_pids)
-    dali_norm = float(pair_dali["images_per_sec"]) / max(float(solo_dali["images_per_sec"]), 1e-9)
-    torch_norm = float(pair_torch["images_per_sec"]) / max(
-        float(solo_torch["images_per_sec"]), 1e-9
-    )
-    score = min(dali_norm, torch_norm)
+    pair_dali_images_per_sec = float(pair_dali["images_per_sec"])
+    pair_torch_images_per_sec = float(pair_torch["images_per_sec"])
+    score = pair_dali_images_per_sec + pair_torch_images_per_sec
     payload = {
         "benchmark": BENCHMARK_ID,
         "case_id": config.case_id,
@@ -886,16 +870,12 @@ def run_benchmark(config: CaseConfig, env_overrides: dict[str, Any]) -> dict[str
         "status": "ok",
         "throughput": score,
         "score": score,
-        "solo_dali_images_per_sec": solo_dali["images_per_sec"],
-        "solo_torch_images_per_sec": solo_torch["images_per_sec"],
-        "pair_dali_images_per_sec": pair_dali["images_per_sec"],
-        "pair_torch_images_per_sec": pair_torch["images_per_sec"],
-        "dali_norm": dali_norm,
-        "torch_norm": torch_norm,
+        "pair_dali_images_per_sec": pair_dali_images_per_sec,
+        "pair_torch_images_per_sec": pair_torch_images_per_sec,
         "wall_time_sec": time.time() - start,
         "resource_signal_primary": "gpu_shared_resource_contention",
         "config_summary": format_config_summary(config),
-        "notes": "score = min(DALI_pair/DALI_solo, Torch_pair/Torch_solo)",
+        "notes": "score = pair_dali_images_per_sec + pair_torch_images_per_sec",
         "config_snapshot": asdict(config),
         "env_overrides": env_overrides,
         "readiness": ready,
@@ -918,7 +898,7 @@ def main() -> int:
     else:
         payload = run_benchmark(config, env_overrides)
     write_json(Path(config.output_json), payload)
-    print(json.dumps(performance_metrics_payload(payload), sort_keys=True))
+    print(json.dumps(direct_stdout_payload(payload), sort_keys=True))
     return (
         0 if payload.get("success") or payload.get("status") in {"blocked", "scaffold_only"} else 1
     )

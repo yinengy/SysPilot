@@ -13,7 +13,8 @@ The benchmark uses synthetic JPEGs because the claim is about decode, GPU prepro
 - Real runs require CUDA, NVIDIA DALI, PyTorch, and `nvidia-cuda-mps-control` on the host.
 - `--scaffold-only` validates CLI/env/report plumbing without importing GPU libraries or claiming performance.
 - Fixed-baseline comparisons keep JPEG count/size range, resize/crop, output dtype, DALI decode backend, PyTorch model/spatial input shape, precision, and measurement windows fixed while exposing PyTorch batch size as a runtime tuning knob.
-- The primary score is `min(DALI_pair/DALI_solo, Torch_pair/Torch_solo)`, so a run must protect both the preprocessing worker and the main cuDNN worker.
+- The runner starts directly with the joint DALI + PyTorch MPS pair run after dataset preparation; it no longer performs solo calibration runs.
+- The primary score is `pair_dali_images_per_sec + pair_torch_images_per_sec`, so throughput from both the preprocessing worker and the cuDNN worker contributes directly.
 
 ## Layout
 
@@ -52,6 +53,15 @@ artifact/venv/bin/python run_dali_nvjpeg_pytorch_cudnn_case.py \
 ```
 
 For host-only validation, append `--scaffold-only`.
+
+The direct runner prints only metric JSON on stdout, with these fields:
+
+- `wall_time_sec`
+- `pair_torch_images_per_sec`
+- `pair_dali_images_per_sec`
+- `score`
+
+Full reproducibility metadata remains in the `--output-json` artifact.
 
 `prepare.sh` isolates the benchmark venv from any outer `PYTHONPATH` and chooses CUDA-family Python wheels from `nvidia-smi` by default:
 

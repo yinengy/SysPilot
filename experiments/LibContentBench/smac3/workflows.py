@@ -65,10 +65,10 @@ class Tunable:
 
     field_name: str
     whitelist_name: str
-    kind: str  # "integer" | "categorical"
+    kind: str  # "integer" | "float" | "categorical"
     value_type: str = "str"  # "int" | "str" | "bool" | "float"
-    min_value: int | None = None
-    max_value: int | None = None
+    min_value: int | float | None = None
+    max_value: int | float | None = None
     options: tuple[str, ...] = ()
 
     def encode_default(self, baseline: Any) -> Any:
@@ -80,7 +80,15 @@ class Tunable:
         """
         if self.kind == "integer":
             value = int(baseline)
+            assert self.min_value is not None
+            assert self.max_value is not None
             lo, hi = int(self.min_value), int(self.max_value)
+            return max(lo, min(hi, value))
+        if self.kind == "float":
+            value = float(baseline)
+            assert self.min_value is not None
+            assert self.max_value is not None
+            lo, hi = float(self.min_value), float(self.max_value)
             return max(lo, min(hi, value))
         if self.value_type == "bool":
             truthy = baseline is True or str(baseline).strip().lower() in {
@@ -102,6 +110,8 @@ class Tunable:
         """Convert a ConfigSpace value into the typed payload value."""
         if self.kind == "integer":
             return int(raw)
+        if self.kind == "float":
+            return float(raw)
         if self.value_type == "bool":
             return str(raw).strip().lower() == "true"
         if self.value_type == "int":
@@ -143,7 +153,7 @@ class WorkflowSpec:
         """
         inner = self.size_payloads[size].get("timeout_seconds")
         if isinstance(inner, int):
-            return inner + 180
+            return max(600, inner + 180)
         return 600
 
 
@@ -165,6 +175,19 @@ def _int(
         whitelist_name=whitelist_name,
         kind="integer",
         value_type="int",
+        min_value=minimum,
+        max_value=maximum,
+    )
+
+
+def _float(
+    field_name: str, whitelist_name: str, minimum: float, maximum: float
+) -> Tunable:
+    return Tunable(
+        field_name=field_name,
+        whitelist_name=whitelist_name,
+        kind="float",
+        value_type="float",
         min_value=minimum,
         max_value=maximum,
     )
@@ -240,7 +263,6 @@ SUPPORTED_WORKFLOWS: dict[str, WorkflowSpec] = {
                 "256MB",
                 "512MB",
                 "1GB",
-                "2GB",
             ),
             _int("duckdb_threads", "BENCHMARK_DUCKDB_THREADS", 1, CPU),
             _enum("path_layout", "BENCHMARK_PATH_LAYOUT", "shared", "isolated"),
@@ -311,7 +333,7 @@ SUPPORTED_WORKFLOWS: dict[str, WorkflowSpec] = {
                 value_type="bool",
             ),
             _int("num_workers", "BENCHMARK_NUM_WORKERS", 0, CPU),
-            _int("prefetch_factor", "BENCHMARK_PREFETCH_FACTOR", 1, 8),
+            _int("prefetch_factor", "BENCHMARK_PREFETCH_FACTOR", 1, CPU),
             _enum(
                 "persistent_workers",
                 "BENCHMARK_PERSISTENT_WORKERS",
@@ -376,16 +398,7 @@ SUPPORTED_WORKFLOWS: dict[str, WorkflowSpec] = {
         },
         tunables=(
             _int("torch_num_threads", "BENCHMARK_TORCH_NUM_THREADS", 1, CPU),
-            _enum(
-                "s3_block_size",
-                "BENCHMARK_S3_BLOCK_SIZE",
-                "4096",
-                "16384",
-                "65536",
-                "262144",
-                "1048576",
-                value_type="int",
-            ),
+            _int("s3_block_size", "BENCHMARK_S3_BLOCK_SIZE", 4096, 1048576),
             _enum(
                 "s3_cache_type",
                 "BENCHMARK_S3_CACHE_TYPE",
@@ -409,9 +422,6 @@ SUPPORTED_WORKFLOWS: dict[str, WorkflowSpec] = {
         primary_metric="score",
         metric_mode="maximize",
         whitelist_path=SUITE_ROOT / "dali-nvjpeg-pytorch-cudnn/tunable_whitelist.txt",
-        # GPU workflow: requires CUDA + NVIDIA DALI + CUDA MPS at run time.
-        # ``score`` = min(DALI_pair/DALI_solo, Torch_pair/Torch_solo): how well the
-        # two libraries co-exist while sharing one GPU under MPS (higher is better).
         size_payloads={
             "small": {
                 "timeout_seconds": 300,
@@ -472,30 +482,21 @@ SUPPORTED_WORKFLOWS: dict[str, WorkflowSpec] = {
             },
         },
         baseline_runtime={
-            "dali_batch_size": 96,
-            "dali_prefetch_queue_depth": 2,
+            "dali_batch_size": 16,
+            "dali_prefetch_queue_depth": 1,
             "dali_hw_decoder_load": 0.65,
-            "dali_num_threads": 4,
+            "dali_num_threads": 1,
             "dali_mps_share": 50,
-            "torch_batch_size": 256,
+            "torch_batch_size": 16,
             "torch_mps_share": 50,
         },
         tunables=(
-            _int("dali_batch_size", "BENCHMARK_DALI_BATCH_SIZE", 16, 256),
-            _int("dali_prefetch_queue_depth", "BENCHMARK_DALI_PREFETCH_QUEUE_DEPTH", 1, 4),
-            _enum(
-                "dali_hw_decoder_load",
-                "BENCHMARK_DALI_HW_DECODER_LOAD",
-                "0.25",
-                "0.5",
-                "0.65",
-                "0.75",
-                "0.9",
-                value_type="float",
-            ),
-            _int("dali_num_threads", "BENCHMARK_DALI_NUM_THREADS", 1, 16),
+            _int("dali_batch_size", "BENCHMARK_DALI_BATCH_SIZE", 1, 512),
+            _int("dali_prefetch_queue_depth", "BENCHMARK_DALI_PREFETCH_QUEUE_DEPTH", 1, CPU),
+            _float("dali_hw_decoder_load", "BENCHMARK_DALI_HW_DECODER_LOAD", 0.0, 1.0),
+            _int("dali_num_threads", "BENCHMARK_DALI_NUM_THREADS", 1, CPU),
             _int("dali_mps_share", "BENCHMARK_DALI_MPS_SHARE", 1, 100),
-            _int("torch_batch_size", "BENCHMARK_TORCH_BATCH_SIZE", 16, 256),
+            _int("torch_batch_size", "BENCHMARK_TORCH_BATCH_SIZE", 1, 512),
             _int("torch_mps_share", "BENCHMARK_TORCH_MPS_SHARE", 1, 100),
         ),
     ),
@@ -537,7 +538,7 @@ def build_trial_payload(
 
     payload = fixed workload-shape fields (per size)
             + coerced tunable knobs (from the SMAC config)
-            + per-trial identity/output fields (case_id, label, mode, paths)
+            + per-trial output/isolation fields (paths)
     """
     if size not in spec.size_payloads:
         raise KeyError(f"Unknown size {size!r} for {spec.workflow_id}")
