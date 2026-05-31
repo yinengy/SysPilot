@@ -20,8 +20,8 @@ class OpenTunerParameterSpec:
     parameter_name: str
     field_name: str
     parameter_kind: str
-    min_value: int | None = None
-    max_value: int | None = None
+    min_value: int | float | None = None
+    max_value: int | float | None = None
     options: tuple[str, ...] = ()
     aliases: tuple[str, ...] = ()
     value_type: str = "str"
@@ -83,6 +83,25 @@ def _integer_parameter(
         max_value=maximum,
         aliases=aliases,
         value_type="int",
+    )
+
+
+def _float_parameter(
+    parameter_name: str,
+    field_name: str,
+    minimum: float,
+    maximum: float,
+    *,
+    aliases: tuple[str, ...] = (),
+) -> OpenTunerParameterSpec:
+    return OpenTunerParameterSpec(
+        parameter_name=parameter_name,
+        field_name=field_name,
+        parameter_kind="float",
+        min_value=minimum,
+        max_value=maximum,
+        aliases=aliases,
+        value_type="float",
     )
 
 
@@ -159,7 +178,7 @@ SUPPORTED_WORKFLOWS: dict[str, OpenTunerWorkflowSpec] = {
                 parameter_name="BENCHMARK_DUCKDB_MEMORY_LIMIT",
                 field_name="duckdb_memory_limit",
                 parameter_kind="enum",
-                options=("128MB", "256MB", "512MB", "1GB", "2GB"),
+                options=("128MB", "256MB", "512MB", "1GB"),
             ),
             _integer_parameter("BENCHMARK_DUCKDB_THREADS", "duckdb_threads", 1, VISIBLE_CPU_COUNT),
             OpenTunerParameterSpec(
@@ -209,7 +228,7 @@ SUPPORTED_WORKFLOWS: dict[str, OpenTunerWorkflowSpec] = {
                 value_type="bool",
             ),
             _integer_parameter("BENCHMARK_NUM_WORKERS", "num_workers", 0, VISIBLE_CPU_COUNT),
-            _integer_parameter("BENCHMARK_PREFETCH_FACTOR", "prefetch_factor", 1, 8),
+            _integer_parameter("BENCHMARK_PREFETCH_FACTOR", "prefetch_factor", 1, VISIBLE_CPU_COUNT),
             OpenTunerParameterSpec(
                 parameter_name="BENCHMARK_PERSISTENT_WORKERS",
                 field_name="persistent_workers",
@@ -246,13 +265,7 @@ SUPPORTED_WORKFLOWS: dict[str, OpenTunerWorkflowSpec] = {
             _integer_parameter(
                 "BENCHMARK_TORCH_NUM_THREADS", "torch_num_threads", 1, VISIBLE_CPU_COUNT
             ),
-            OpenTunerParameterSpec(
-                parameter_name="BENCHMARK_S3_BLOCK_SIZE",
-                field_name="s3_block_size",
-                parameter_kind="enum",
-                options=("4096", "16384", "65536", "262144", "1048576"),
-                value_type="int",
-            ),
+            _integer_parameter("BENCHMARK_S3_BLOCK_SIZE", "s3_block_size", 4096, 1048576),
             OpenTunerParameterSpec(
                 parameter_name="BENCHMARK_S3_CACHE_TYPE",
                 field_name="s3_cache_type",
@@ -301,20 +314,14 @@ SUPPORTED_WORKFLOWS: dict[str, OpenTunerWorkflowSpec] = {
             "torch_cudnn_benchmark": True,
         },
         tunables=(
-            _integer_parameter("BENCHMARK_DALI_BATCH_SIZE", "dali_batch_size", 16, 256),
+            _integer_parameter("BENCHMARK_DALI_BATCH_SIZE", "dali_batch_size", 1, 512),
             _integer_parameter(
-                "BENCHMARK_DALI_PREFETCH_QUEUE_DEPTH", "dali_prefetch_queue_depth", 1, 4
+                "BENCHMARK_DALI_PREFETCH_QUEUE_DEPTH", "dali_prefetch_queue_depth", 1, VISIBLE_CPU_COUNT
             ),
-            OpenTunerParameterSpec(
-                parameter_name="BENCHMARK_DALI_HW_DECODER_LOAD",
-                field_name="dali_hw_decoder_load",
-                parameter_kind="enum",
-                options=("0.25", "0.5", "0.65", "0.75", "0.9"),
-                value_type="float",
-            ),
-            _integer_parameter("BENCHMARK_DALI_NUM_THREADS", "dali_num_threads", 1, 16),
+            _float_parameter("BENCHMARK_DALI_HW_DECODER_LOAD", "dali_hw_decoder_load", 0.0, 1.0),
+            _integer_parameter("BENCHMARK_DALI_NUM_THREADS", "dali_num_threads", 1, VISIBLE_CPU_COUNT),
             _integer_parameter("BENCHMARK_DALI_MPS_SHARE", "dali_mps_share", 1, 100),
-            _integer_parameter("BENCHMARK_TORCH_BATCH_SIZE", "torch_batch_size", 16, 256),
+            _integer_parameter("BENCHMARK_TORCH_BATCH_SIZE", "torch_batch_size", 1, 512),
             _integer_parameter("BENCHMARK_TORCH_MPS_SHARE", "torch_mps_share", 1, 100),
         ),
     ),

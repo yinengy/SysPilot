@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from opentuner import ConfigurationManipulator, MeasurementInterface, Result
-from opentuner.search.manipulator import EnumParameter, IntegerParameter
+from opentuner.search.manipulator import EnumParameter, FloatParameter, IntegerParameter
 from opentuner.search.objective import MaximizeAccuracy
 
 from experiments.LibContentBench.libcontentbench.common import (
@@ -24,6 +24,8 @@ from experiments.LibContentBench.opentuner_integration.specs import (
 def _encode_parameter_value(tunable: OpenTunerParameterSpec, raw_value: Any) -> Any:
     if tunable.parameter_kind == "integer":
         return int(raw_value)
+    if tunable.parameter_kind == "float":
+        return float(raw_value)
     if tunable.value_type == "bool":
         if isinstance(raw_value, str):
             normalized = raw_value.strip().lower()
@@ -86,6 +88,12 @@ def _as_text(value: Any) -> str:
     return str(value)
 
 
+def _required_bounds(tunable: OpenTunerParameterSpec) -> tuple[int | float, int | float]:
+    if tunable.min_value is None or tunable.max_value is None:
+        raise ValueError(f"Missing bounds for {tunable.parameter_name}")
+    return tunable.min_value, tunable.max_value
+
+
 class LibContentBenchOpenTunerInterface(MeasurementInterface):
     def __init__(
         self,
@@ -123,10 +131,15 @@ class LibContentBenchOpenTunerInterface(MeasurementInterface):
         manipulator = ConfigurationManipulator()
         for tunable in self.workflow_spec.tunables:
             if tunable.parameter_kind == "integer":
+                min_value, max_value = _required_bounds(tunable)
                 manipulator.add_parameter(
-                    IntegerParameter(
-                        tunable.parameter_name, int(tunable.min_value), int(tunable.max_value)
-                    )
+                    IntegerParameter(tunable.parameter_name, int(min_value), int(max_value))
+                )
+                continue
+            if tunable.parameter_kind == "float":
+                min_value, max_value = _required_bounds(tunable)
+                manipulator.add_parameter(
+                    FloatParameter(tunable.parameter_name, float(min_value), float(max_value))
                 )
                 continue
             manipulator.add_parameter(EnumParameter(tunable.parameter_name, list(tunable.options)))
@@ -251,4 +264,8 @@ class LibContentBenchOpenTunerInterface(MeasurementInterface):
             f"trial_wall_time_sec={trial_wall_time_sec}",
             flush=True,
         )
-        return Result(time=result_time, accuracy=objective_value, state=state)
+        result = Result()
+        setattr(result, "time", result_time)
+        setattr(result, "accuracy", objective_value)
+        setattr(result, "state", state)
+        return result

@@ -19,7 +19,7 @@ def _supported_workflow_ids() -> tuple[str, ...]:
     return supported_workflow_ids()
 
 
-def _load_workflow_spec(workflow_id: str) -> object:
+def _load_workflow_spec(workflow_id: str) -> Any:
     from experiments.LibContentBench.opentuner_integration.specs import load_workflow_spec
 
     return load_workflow_spec(workflow_id)
@@ -102,6 +102,17 @@ def resolve_metric_direction(metric_name: str, requested_direction: str) -> str:
     return "minimize"
 
 
+def resolve_trial_timeout_seconds(workflow_spec: Any, requested_timeout: int | None) -> int:
+    if requested_timeout is not None:
+        return requested_timeout
+    workflow_id = str(getattr(workflow_spec, "workflow_id", ""))
+    payload = getattr(workflow_spec, "fixed_workload_payload", {})
+    if workflow_id == "dali-nvjpeg-pytorch-cudnn" and isinstance(payload, dict):
+        worker_timeout = int(payload.get("timeout_seconds", 600))
+        return worker_timeout * 4
+    return 600
+
+
 def build_parser() -> argparse.ArgumentParser:
     from opentuner.measurement.driver import argparser as measurement_driver_argparser
     from opentuner.measurement.interface import argparser as measurement_interface_argparser
@@ -129,7 +140,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory for OpenTuner database and per-trial artifacts",
     )
     parser.add_argument(
-        "--timeout-sec", type=int, default=600, help="Per-trial subprocess timeout in seconds"
+        "--timeout-sec",
+        type=int,
+        default=None,
+        help=(
+            "Per-trial subprocess timeout in seconds. Defaults to 600 for most workflows; "
+            "DALI defaults to 4x its per-worker timeout because one trial runs multiple "
+            "worker phases."
+        ),
     )
     parser.add_argument(
         "--metric",
@@ -173,7 +191,7 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
             f"Unsupported workflow {args.workflow!r}. "
             f"Supported workflows: {', '.join(supported_ids)}"
         )
-    if args.timeout_sec < 1:
+    if args.timeout_sec is not None and args.timeout_sec < 1:
         parser.error("--timeout-sec must be >= 1")
 
 
@@ -201,6 +219,8 @@ def main(argv: list[str] | None = None) -> int:
         args.label = f"libcontentbench-{args.workflow}"
 
     workflow_spec = _load_workflow_spec(args.workflow)
+    timeout_seconds = resolve_trial_timeout_seconds(workflow_spec, args.timeout_sec)
+    args.timeout_sec = timeout_seconds
     requested_direction = args.tuning_goal or args.metric_direction
     metric_direction = resolve_metric_direction(str(args.metric), str(requested_direction))
     interface = LibContentBenchOpenTunerInterface(
@@ -208,7 +228,7 @@ def main(argv: list[str] | None = None) -> int:
         workflow_spec=workflow_spec,
         metric_name=str(args.metric),
         metric_direction=metric_direction,
-        timeout_seconds=int(args.timeout_sec),
+        timeout_seconds=timeout_seconds,
         output_dir=output_dir,
         repo_root=REPO_ROOT,
     )

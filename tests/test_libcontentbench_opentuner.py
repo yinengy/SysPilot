@@ -167,6 +167,34 @@ def test_manipulator_parameter_names_match_expected_whitelisted_controls() -> No
         assert names == parameter_names
 
 
+def test_dali_hw_decoder_load_uses_continuous_float_parameter() -> None:
+    from experiments.LibContentBench.opentuner_integration.harness import (
+        LibContentBenchOpenTunerInterface,
+    )
+
+    args = SimpleNamespace(parallel_compile=False, parallelism=1)
+    interface = LibContentBenchOpenTunerInterface(
+        args,
+        workflow_spec=load_workflow_spec("dali-nvjpeg-pytorch-cudnn"),
+        metric_name="score",
+        metric_direction="maximize",
+        timeout_seconds=60,
+        output_dir=Path("/tmp") / "lcb-opentuner-dali-float-param",
+        repo_root=_repo_root(),
+    )
+
+    parameter = next(
+        item
+        for item in interface.manipulator().params
+        if item.name == "BENCHMARK_DALI_HW_DECODER_LOAD"
+    )
+
+    assert parameter.__class__.__name__ == "FloatParameter"
+    assert parameter.min_value == 0.0
+    assert parameter.max_value == 1.0
+    assert interface.seed_configurations()[0]["BENCHMARK_DALI_HW_DECODER_LOAD"] == 0.65
+
+
 def test_harness_returns_result_time_from_metric_stdout(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -204,8 +232,8 @@ def test_harness_returns_result_time_from_metric_stdout(
 
     result = interface.run(desired_result, None, 0.0)
 
-    assert result.time >= 0.0
-    assert result.accuracy == -12.5
+    assert float(getattr(result, "time")) >= 0.0
+    assert float(getattr(result, "accuracy")) == -12.5
     artifact_path = tmp_path / "trials" / "trial_0001" / "trial_artifact.json"
     assert artifact_path.exists()
     artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
@@ -214,7 +242,7 @@ def test_harness_returns_result_time_from_metric_stdout(
     assert artifact["result_state"] == "OK"
     assert artifact["trial_wall_time_sec"] >= 0.0
     assert artifact["trial_finished_run_wall_time_sec"] >= artifact["trial_wall_time_sec"]
-    assert result.state == "OK"
+    assert str(getattr(result, "state")) == "OK"
 
 
 def test_harness_maximizes_throughput_via_negative_objective(
@@ -255,8 +283,8 @@ def test_harness_maximizes_throughput_via_negative_objective(
     assert "LibContentBench trial 1" in output
     assert "throughput=42.0" in output
     assert "goal=maximize" in output
-    assert result.time >= 0.0
-    assert result.accuracy == 42.0
+    assert float(getattr(result, "time")) >= 0.0
+    assert float(getattr(result, "accuracy")) == 42.0
     artifact_path = tmp_path / "trials" / "trial_0001" / "trial_artifact.json"
     artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
     assert artifact["metric_value"] == 42.0
@@ -264,7 +292,7 @@ def test_harness_maximizes_throughput_via_negative_objective(
     assert artifact["metric_direction"] == "maximize"
     assert artifact["trial_wall_time_sec"] >= 0.0
     assert artifact["trial_finished_run_wall_time_sec"] >= artifact["trial_wall_time_sec"]
-    assert result.state == "OK"
+    assert str(getattr(result, "state")) == "OK"
 
 
 def test_print_run_summary_reports_best_trial_and_wall_times(
@@ -302,7 +330,7 @@ def test_print_run_summary_reports_best_trial_and_wall_times(
     assert "total_process_wall_time_sec: 3.5" in output
 
 
-def test_nestedcpu_seed_matches_documented_medium_env() -> None:
+def test_nestedcpu_seed_matches_documented_small_env() -> None:
     from experiments.LibContentBench.opentuner_integration.harness import (
         LibContentBenchOpenTunerInterface,
     )
@@ -329,11 +357,10 @@ def test_nestedcpu_seed_matches_documented_medium_env() -> None:
     }
 
 
-def test_torchdata_open_tuner_spec_uses_pinned_minio_image() -> None:
+def test_torchdata_open_tuner_spec_matches_documented_small_minio_image() -> None:
     spec = load_workflow_spec("torchdata-fsspec-s3-ddp")
 
-    assert spec.fixed_workload_payload["minio_image"] != "quay.io/minio/minio:latest"
-    assert "RELEASE." in str(spec.fixed_workload_payload["minio_image"])
+    assert spec.fixed_workload_payload["minio_image"] == "quay.io/minio/minio:latest"
 
 
 def test_run_opentuner_main_passes_existing_interface_to_tuningrunmain(
@@ -390,6 +417,27 @@ def test_metric_direction_auto_resolves_throughput_to_maximize() -> None:
     assert resolve_metric_direction("samples_per_sec", "auto") == "maximize"
     assert resolve_metric_direction("wall_time_sec", "auto") == "minimize"
     assert resolve_metric_direction("p95_latency_ms", "auto") == "minimize"
+
+
+def test_dali_open_tuner_default_timeout_accounts_for_multiple_worker_phases() -> None:
+    from experiments.LibContentBench.opentuner_integration.cli import (
+        resolve_trial_timeout_seconds,
+    )
+
+    spec = load_workflow_spec("dali-nvjpeg-pytorch-cudnn")
+
+    assert resolve_trial_timeout_seconds(spec, None) == 2400
+    assert resolve_trial_timeout_seconds(spec, 900) == 900
+
+
+def test_non_dali_open_tuner_default_timeout_stays_short() -> None:
+    from experiments.LibContentBench.opentuner_integration.cli import (
+        resolve_trial_timeout_seconds,
+    )
+
+    spec = load_workflow_spec("nestedcpu-blas")
+
+    assert resolve_trial_timeout_seconds(spec, None) == 600
 
 
 def test_run_opentuner_main_passes_metric_direction_override(
@@ -475,7 +523,7 @@ def test_run_opentuner_main_passes_tuning_goal_override(
 
 
 def test_cli_help_and_invalid_workflow_under_agent_python(tmp_path: Path) -> None:
-    python_executable = "/home/yinengy/miniconda3/envs/agent/bin/python"
+    python_executable = sys.executable
     script_path = (
         _repo_root() / "experiments" / "LibContentBench" / "opentuner_integration" / "cli.py"
     )
@@ -511,7 +559,7 @@ def test_cli_help_and_invalid_workflow_under_agent_python(tmp_path: Path) -> Non
 
 
 def test_compatibility_shim_lists_workflows_under_agent_python() -> None:
-    python_executable = "/home/yinengy/miniconda3/envs/agent/bin/python"
+    python_executable = sys.executable
     script_path = _repo_root() / "experiments" / "LibContentBench" / "run_opentuner.py"
 
     result = subprocess.run(
