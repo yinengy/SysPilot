@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any
 
 from opentuner import ConfigurationManipulator, MeasurementInterface, Result
 from opentuner.search.manipulator import EnumParameter, IntegerParameter
+from opentuner.search.objective import MaximizeAccuracy
 
 from experiments.LibContentBench.libcontentbench.common import (
     load_json_object,
@@ -91,6 +93,7 @@ class LibContentBenchOpenTunerInterface(MeasurementInterface):
         *,
         workflow_spec: OpenTunerWorkflowSpec,
         metric_name: str,
+        metric_direction: str,
         timeout_seconds: int,
         output_dir: Path,
         repo_root: Path,
@@ -103,6 +106,7 @@ class LibContentBenchOpenTunerInterface(MeasurementInterface):
         )
         self.workflow_spec = workflow_spec
         self.metric_name = metric_name
+        self.metric_direction = metric_direction
         self.timeout_seconds = timeout_seconds
         self.output_dir = output_dir
         self.repo_root = repo_root
@@ -110,6 +114,10 @@ class LibContentBenchOpenTunerInterface(MeasurementInterface):
         self.trials_dir = self.output_dir / "trials"
         self.trials_dir.mkdir(parents=True, exist_ok=True)
         self._trial_index = 0
+        self._run_started_at = time.perf_counter()
+
+    def objective(self) -> MaximizeAccuracy:
+        return MaximizeAccuracy()
 
     def manipulator(self) -> ConfigurationManipulator:
         manipulator = ConfigurationManipulator()
@@ -177,7 +185,10 @@ class LibContentBenchOpenTunerInterface(MeasurementInterface):
             )
 
         command = build_direct_command(self.workflow_spec.workflow_id, payload)
+        trial_started_at = time.perf_counter()
         completed = self.call_program(command, limit=self.timeout_seconds, cwd=str(self.repo_root))
+        trial_wall_time_sec = time.perf_counter() - trial_started_at
+        trial_finished_run_wall_time_sec = time.perf_counter() - self._run_started_at
 
         stdout_text = _as_text(completed["stdout"])
         stderr_text = _as_text(completed["stderr"])
@@ -195,6 +206,7 @@ class LibContentBenchOpenTunerInterface(MeasurementInterface):
 
         state = "OK"
         result_time = float("inf")
+        objective_value = None
         if completed["timeout"]:
             state = "TIMEOUT"
         elif completed["returncode"] != 0:
@@ -202,14 +214,19 @@ class LibContentBenchOpenTunerInterface(MeasurementInterface):
         elif metric_value is None:
             state = "ERROR"
         else:
-            result_time = float(metric_value)
+            result_time = trial_wall_time_sec
+            objective_value = float(metric_value)
+            if self.metric_direction == "minimize":
+                objective_value = -objective_value
 
         artifact = {
             "workflow": self.workflow_spec.workflow_id,
             "trial_index": self._trial_index,
             "trial_name": trial_name,
             "metric_name": self.metric_name,
+            "metric_direction": self.metric_direction,
             "metric_value": metric_value,
+            "objective_value": objective_value,
             "result_state": state,
             "command": command,
             "config": config_data,
@@ -218,9 +235,20 @@ class LibContentBenchOpenTunerInterface(MeasurementInterface):
             "stderr": stderr_text,
             "returncode": completed["returncode"],
             "timed_out": completed["timeout"],
+            "trial_wall_time_sec": trial_wall_time_sec,
+            "trial_finished_run_wall_time_sec": trial_finished_run_wall_time_sec,
+            "call_program_time_sec": completed.get("time"),
             "output_json": str(output_json_path),
             "stdout_json": stdout_payload,
             "output_json_payload": fallback_payload,
         }
         write_json(trial_dir / "trial_artifact.json", artifact)
-        return Result(time=result_time, state=state)
+        print(
+            "LibContentBench trial "
+            f"{self._trial_index}: state={state}, "
+            f"{self.metric_name}={metric_value}, "
+            f"goal={self.metric_direction}, "
+            f"trial_wall_time_sec={trial_wall_time_sec}",
+            flush=True,
+        )
+        return Result(time=result_time, accuracy=objective_value, state=state)

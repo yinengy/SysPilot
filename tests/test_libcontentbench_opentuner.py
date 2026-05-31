@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -156,6 +157,7 @@ def test_manipulator_parameter_names_match_expected_whitelisted_controls() -> No
             args,
             workflow_spec=load_workflow_spec(workflow_id),
             metric_name="wall_time_sec",
+            metric_direction="minimize",
             timeout_seconds=60,
             output_dir=Path("/tmp") / f"lcb-opentuner-{workflow_id}",
             repo_root=_repo_root(),
@@ -177,6 +179,7 @@ def test_harness_returns_result_time_from_metric_stdout(
         args,
         workflow_spec=load_workflow_spec("nestedcpu-blas"),
         metric_name="wall_time_sec",
+        metric_direction="minimize",
         timeout_seconds=60,
         output_dir=tmp_path,
         repo_root=_repo_root(),
@@ -201,13 +204,102 @@ def test_harness_returns_result_time_from_metric_stdout(
 
     result = interface.run(desired_result, None, 0.0)
 
-    assert result.time == 12.5
+    assert result.time >= 0.0
+    assert result.accuracy == -12.5
     artifact_path = tmp_path / "trials" / "trial_0001" / "trial_artifact.json"
     assert artifact_path.exists()
-    artifact_text = artifact_path.read_text(encoding="utf-8")
-    assert '"metric_value": 12.5' in artifact_text
-    assert '"result_state": "OK"' in artifact_text
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    assert artifact["metric_value"] == 12.5
+    assert artifact["objective_value"] == -12.5
+    assert artifact["result_state"] == "OK"
+    assert artifact["trial_wall_time_sec"] >= 0.0
+    assert artifact["trial_finished_run_wall_time_sec"] >= artifact["trial_wall_time_sec"]
     assert result.state == "OK"
+
+
+def test_harness_maximizes_throughput_via_negative_objective(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from experiments.LibContentBench.opentuner_integration.harness import (
+        LibContentBenchOpenTunerInterface,
+    )
+
+    args = SimpleNamespace(parallel_compile=False, parallelism=1)
+    interface = LibContentBenchOpenTunerInterface(
+        args,
+        workflow_spec=load_workflow_spec("nestedcpu-blas"),
+        metric_name="throughput",
+        metric_direction="maximize",
+        timeout_seconds=60,
+        output_dir=tmp_path,
+        repo_root=_repo_root(),
+    )
+
+    def fake_call_program(command: str, limit: int, cwd: str) -> dict[str, object]:
+        del command, limit, cwd
+        return {
+            "returncode": 0,
+            "stdout": '{"wall_time_sec": 12.5, "throughput": 42.0}\n',
+            "stderr": "",
+            "timeout": False,
+            "time": 0.02,
+        }
+
+    monkeypatch.setattr(interface, "call_program", fake_call_program)
+    seed_config = interface.seed_configurations()[0]
+    desired_result = SimpleNamespace(configuration=SimpleNamespace(data=seed_config))
+
+    result = interface.run(desired_result, None, 0.0)
+
+    output = capsys.readouterr().out
+    assert "LibContentBench trial 1" in output
+    assert "throughput=42.0" in output
+    assert "goal=maximize" in output
+    assert result.time >= 0.0
+    assert result.accuracy == 42.0
+    artifact_path = tmp_path / "trials" / "trial_0001" / "trial_artifact.json"
+    artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    assert artifact["metric_value"] == 42.0
+    assert artifact["objective_value"] == 42.0
+    assert artifact["metric_direction"] == "maximize"
+    assert artifact["trial_wall_time_sec"] >= 0.0
+    assert artifact["trial_finished_run_wall_time_sec"] >= artifact["trial_wall_time_sec"]
+    assert result.state == "OK"
+
+
+def test_print_run_summary_reports_best_trial_and_wall_times(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    from experiments.LibContentBench.opentuner_integration.cli import print_run_summary
+
+    for trial_index, metric_value, finished_at in [(1, 10.0, 1.5), (2, 20.0, 3.0)]:
+        trial_dir = tmp_path / "trials" / f"trial_{trial_index:04d}"
+        trial_dir.mkdir(parents=True)
+        (trial_dir / "trial_artifact.json").write_text(
+            json.dumps(
+                {
+                    "trial_index": trial_index,
+                    "result_state": "OK",
+                    "metric_name": "throughput",
+                    "metric_direction": "maximize",
+                    "metric_value": metric_value,
+                    "trial_finished_run_wall_time_sec": finished_at,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    print_run_summary(tmp_path, total_process_wall_time_sec=3.5)
+
+    output = capsys.readouterr().out
+    assert "trials_completed: 2" in output
+    assert "trial_metrics:" in output
+    assert "trial 1: state=OK, throughput=10.0" in output
+    assert "trial 2: state=OK, throughput=20.0" in output
+    assert "best_trial: 2" in output
+    assert "best_metric_value: 20.0" in output
+    assert "wall_time_until_best_trial_finished_sec: 3.0" in output
+    assert "total_process_wall_time_sec: 3.5" in output
 
 
 def test_nestedcpu_seed_matches_documented_medium_env() -> None:
@@ -220,6 +312,7 @@ def test_nestedcpu_seed_matches_documented_medium_env() -> None:
         args,
         workflow_spec=load_workflow_spec("nestedcpu-blas"),
         metric_name="wall_time_sec",
+        metric_direction="minimize",
         timeout_seconds=60,
         output_dir=Path("/tmp") / "lcb-opentuner-nestedcpu-seed",
         repo_root=_repo_root(),
@@ -284,9 +377,101 @@ def test_run_opentuner_main_passes_existing_interface_to_tuningrunmain(
     interface = captured["interface"]
     assert isinstance(interface, LibContentBenchOpenTunerInterface)
     assert interface.workflow_spec.workflow_id == "nestedcpu-blas"
+    assert interface.metric_direction == "minimize"
     args = captured["args"]
     assert getattr(args, "workflow") == "nestedcpu-blas"
     assert getattr(args, "output_dir") == str(tmp_path / "run")
+
+
+def test_metric_direction_auto_resolves_throughput_to_maximize() -> None:
+    from experiments.LibContentBench.opentuner_integration.cli import resolve_metric_direction
+
+    assert resolve_metric_direction("throughput", "auto") == "maximize"
+    assert resolve_metric_direction("samples_per_sec", "auto") == "maximize"
+    assert resolve_metric_direction("wall_time_sec", "auto") == "minimize"
+    assert resolve_metric_direction("p95_latency_ms", "auto") == "minimize"
+
+
+def test_run_opentuner_main_passes_metric_direction_override(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import opentuner.tuningrunmain as tuningrunmain_module
+
+    from experiments.LibContentBench import run_opentuner
+
+    captured: dict[str, object] = {}
+
+    class FakeTuningRunMain:
+        def __init__(self, measurement_interface: object, args: object) -> None:
+            captured["interface"] = measurement_interface
+            captured["args"] = args
+
+        def main(self) -> None:
+            captured["main_called"] = True
+
+    monkeypatch.setattr(tuningrunmain_module, "TuningRunMain", FakeTuningRunMain)
+
+    exit_code = run_opentuner.main(
+        [
+            "--workflow",
+            "nestedcpu-blas",
+            "--output-dir",
+            str(tmp_path / "run-max"),
+            "--metric",
+            "throughput",
+            "--metric-direction",
+            "auto",
+            "--test-limit",
+            "1",
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["main_called"] is True
+    interface = captured["interface"]
+    assert getattr(interface, "metric_direction") == "maximize"
+
+
+def test_run_opentuner_main_passes_tuning_goal_override(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import opentuner.tuningrunmain as tuningrunmain_module
+
+    from experiments.LibContentBench import run_opentuner
+
+    captured: dict[str, object] = {}
+
+    class FakeTuningRunMain:
+        def __init__(self, measurement_interface: object, args: object) -> None:
+            captured["interface"] = measurement_interface
+            captured["args"] = args
+
+        def main(self) -> None:
+            captured["main_called"] = True
+
+    monkeypatch.setattr(tuningrunmain_module, "TuningRunMain", FakeTuningRunMain)
+
+    exit_code = run_opentuner.main(
+        [
+            "--workflow",
+            "nestedcpu-blas",
+            "--output-dir",
+            str(tmp_path / "run-goal"),
+            "--metric",
+            "throughput",
+            "--tuning-goal",
+            "minimize",
+            "--test-limit",
+            "1",
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["main_called"] is True
+    interface = captured["interface"]
+    assert getattr(interface, "metric_direction") == "minimize"
 
 
 def test_cli_help_and_invalid_workflow_under_agent_python(tmp_path: Path) -> None:
@@ -304,6 +489,8 @@ def test_cli_help_and_invalid_workflow_under_agent_python(tmp_path: Path) -> Non
     assert help_result.returncode == 0
     assert "--workflow" in help_result.stdout
     assert "--test-limit" in help_result.stdout
+    assert "--metric-direction" in help_result.stdout
+    assert "--tuning-goal" in help_result.stdout
 
     invalid_result = subprocess.run(
         [

@@ -40,7 +40,12 @@ The harness first parses metric-only JSON from direct-runner stdout. Use a metri
 {"wall_time_sec": 12.34, "throughput": 99.1}
 ```
 
-If stdout does not contain JSON, the harness falls back to the runner's `--output-json` artifact. OpenTuner stores the selected metric in `Result(time=...)`, so the chosen metric is treated as a value to minimize. The default metric is `wall_time_sec`.
+If stdout does not contain JSON, the harness falls back to the runner's `--output-json` artifact. The harness now keeps two separate values:
+
+- `metric_value`: the raw runner metric
+- `objective_value`: the value optimized through OpenTuner's objective field
+
+`Result.time` is always the measured trial wall-clock time so OpenTuner's `cost time=...` display stays meaningful. By default, `--metric-direction auto` maximizes obvious throughput/rate metrics (`throughput`, `*_per_sec`, names containing `throughput`) and minimizes wall-time/latency metrics such as `wall_time_sec` through the separate objective value. Use `--tuning-goal minimize|maximize` to set the goal explicitly; it overrides `--metric-direction`.
 
 Failing or timed-out trials return `Result(time=float('inf'))`.
 
@@ -54,8 +59,12 @@ Each OpenTuner trial writes a `trials/trial_XXXX/trial_artifact.json` file under
 - stdout/stderr
 - return code / timeout state
 - parsed metric value
+- resolved metric direction and OpenTuner objective value
+- independent `trial_wall_time_sec` measured around the `call_program(...)` subprocess launch
 - result state
 - the `output.json` path
+
+The CLI also prints one line per completed trial with the metric value and prints a final summary with every trial's metric, the trial where the best metric was found, wall time until that trial completed, and total tuning wall time.
 
 ## Usage
 
@@ -66,7 +75,8 @@ Use the agent Python environment:
   experiments/LibContentBench/opentuner_integration/cli.py \
   --workflow nestedcpu-blas \
   --output-dir /tmp/lcb-opentuner/nestedcpu \
-  --metric wall_time_sec \
+  --metric throughput \
+  --tuning-goal maximize \
   --test-limit 8
 ```
 
