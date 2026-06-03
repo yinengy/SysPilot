@@ -5,7 +5,7 @@ from toolbox.shared.probe_payload import combined_output, emit_result, excerpt_l
 
 def collect(payload: dict[str, object]) -> dict[str, object]:
     output = combined_output(payload)
-    excerpt = excerpt_lines(output, ["elapsed", "elapsed_sec", "wall time", "wall_time", "seconds"])
+    excerpt = excerpt_lines(output, ["elapsed", "elapsed_sec", "walltime", "wall time", "wall_time", "seconds"])
     value = numeric_from_text(excerpt[0]) if excerpt else None
     return {
         "observed": bool(excerpt),

@@ -1068,6 +1068,40 @@ def test_spawn_mode_manual_name_loads_manual_folder_content(tmp_path: Path) -> N
     assert "Application Manual Hints\n(No application manual hints provided)" in prompt
 
 
+def test_spawn_mode_does_not_write_tune_llm_prompts_by_default() -> None:
+    runner = CliRunner()
+    _DummyAgent.instances.clear()
+
+    with (
+        patch("syspilot.cli.SysPilotAgent", _DummyAgent),
+        patch("syspilot.cli._register_default_skills", _noop),
+        patch("syspilot.cli._register_profiling_tools", _noop),
+        patch("syspilot.cli._register_tuning_tools", _noop),
+        patch("syspilot.cli._run_live_profiling_pipeline", _fake_live_profile),
+        patch("syspilot.cli._run_command", _fake_run_command),
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "tune",
+                "--ui-mode",
+                "plain",
+                "--command",
+                "echo hi",
+                "--max-iterations",
+                "1",
+                "--timeout",
+                "1",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert _DummyAgent.instances
+    assert _DummyAgent.instances[0].prompt_log_path is None
+    assert "Saving LLM prompts to:" not in result.output
+
+
+
 def test_spawn_mode_accepts_debug_llm_flags_after_tune_command() -> None:
     runner = CliRunner()
     _DummyAgent.instances.clear()
@@ -1103,6 +1137,9 @@ def test_spawn_mode_accepts_debug_llm_flags_after_tune_command() -> None:
     config = cast(SysPilotConfig, _DummyAgent.instances[0].config)
     assert config.llm.debug_conversation is True
     assert config.llm.debug_markdown_file == "debug.md"
+    assert _DummyAgent.instances[0].prompt_log_path is not None
+    assert "artifacts/tune_llm_prompts" in str(_DummyAgent.instances[0].prompt_log_path)
+    assert "Saving LLM prompts to:" in result.output
 
 
 def test_default_skill_registration_does_not_load_ebpf_skill() -> None:

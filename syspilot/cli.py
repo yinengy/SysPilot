@@ -1695,8 +1695,9 @@ def tune(
     config.tuning.max_tuning_iterations = max_iterations
 
     agent = SysPilotAgent(config)
-    prompt_log_path = agent.enable_llm_prompt_logging(_default_tune_prompt_log_path())
-    sink.print(f"[cyan]Saving LLM prompts to: {prompt_log_path}[/cyan]")
+    if debug_llm or debug_llm_md:
+        prompt_log_path = agent.enable_llm_prompt_logging(_default_tune_prompt_log_path())
+        sink.print(f"[cyan]Saving LLM prompts to: {prompt_log_path}[/cyan]")
     loaded_manual_refs, manual_hints, missing_manual_refs = _load_spawn_manual_inputs(
         agent,
         manual_inputs,

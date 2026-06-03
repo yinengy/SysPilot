@@ -114,5 +114,11 @@ library_sources/*
 
 # Experiments
 experiments/*
-!experiments/LibContentBench/
+
+# Track VLCs runner/docs while keeping bulky packaged artifacts ignored
+!experiments/VLCs/
+experiments/VLCs/benchmarks
+!experiments/VLCs/benchmarks/Transformer/libtransformer.so
+experiments/VLCs/wikitext2_processed.pt
+# !experiments/LibContentBench/
 experiments/LibContentBench/reports/
