@@ -122,3 +122,38 @@ experiments/VLCs/benchmarks
 experiments/VLCs/wikitext2_processed.pt
 # !experiments/LibContentBench/
 experiments/LibContentBench/reports/
+
+# Track the nestedcpu-blas deep-trace research source without exposing
+# generated LibContentBench artifacts. This workflow is repository-checkout-only
+# and is intentionally excluded from production wheels.
+!experiments/LibContentBench/
+experiments/LibContentBench/*
+!experiments/LibContentBench/libcontentbench/
+experiments/LibContentBench/libcontentbench/*
+!experiments/LibContentBench/libcontentbench/tuner_trace.py
+!experiments/LibContentBench/nestedcpu-blas/
+experiments/LibContentBench/nestedcpu-blas/*
+!experiments/LibContentBench/nestedcpu-blas/__init__.py
+!experiments/LibContentBench/nestedcpu-blas/case_study/
+experiments/LibContentBench/nestedcpu-blas/case_study/*
+!experiments/LibContentBench/nestedcpu-blas/case_study/README.md
+!experiments/LibContentBench/nestedcpu-blas/case_study/__init__.py
+!experiments/LibContentBench/nestedcpu-blas/case_study/analysis.py
+!experiments/LibContentBench/nestedcpu-blas/case_study/analyze.py
+!experiments/LibContentBench/nestedcpu-blas/case_study/configuration.py
+!experiments/LibContentBench/nestedcpu-blas/case_study/ledger.py
+!experiments/LibContentBench/nestedcpu-blas/case_study/manifest.py
+!experiments/LibContentBench/nestedcpu-blas/case_study/search_space.json
+!experiments/LibContentBench/nestedcpu-blas/case_study/summary.py
+!experiments/LibContentBench/nestedcpu-blas/case_study/tests/
+experiments/LibContentBench/nestedcpu-blas/case_study/tests/*
+!experiments/LibContentBench/nestedcpu-blas/case_study/tests/test_analysis.py
+!experiments/LibContentBench/nestedcpu-blas/case_study/tests/test_foundation.py
+
+!experiments/LibContentBench/smac3/
+experiments/LibContentBench/smac3/*
+!experiments/LibContentBench/smac3/study_trace.py
+!experiments/LibContentBench/smac3/trace_callback.py
+!experiments/LibContentBench/opentuner_integration/
+experiments/LibContentBench/opentuner_integration/*
+!experiments/LibContentBench/opentuner_integration/trace.py
