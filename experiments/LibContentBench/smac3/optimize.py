@@ -26,6 +26,8 @@ from smac import HyperparameterOptimizationFacade, Scenario
 
 from experiments.LibContentBench.libcontentbench.common import write_csv, write_json
 from experiments.LibContentBench.libcontentbench.direct_commands import build_direct_command
+from experiments.LibContentBench.libcontentbench.tuner_trace import config_fingerprint
+from experiments.LibContentBench.smac3 import trace_callback
 from experiments.LibContentBench.smac3.config_space import (
     baseline_config_values,
     baseline_configuration,
@@ -82,7 +84,11 @@ def run_smac(
     n_workers: int,
     repo_root: Path,
     crash_cost: float,
+    study_ledger: Path | None = None,
+    study_proposal_cap: int | None = None,
+    study_unique_execution_target: int | None = None,
 ) -> dict[str, Any]:
+    smac_version = trace_callback.require_smac_2_4_0()
     os.environ.setdefault("PYTHONHASHSEED", "0")
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -90,9 +96,25 @@ def run_smac(
     cs = build_config_space(spec, seed=seed)
     baseline_cfg = baseline_configuration(cs, spec)
     baseline_values = baseline_config_values(spec)
+    baseline_fingerprint = config_fingerprint(baseline_values)
+    if hasattr(baseline_cfg, "origin"):
+        baseline_cfg.origin = "Initial Design: Baseline"
 
-    # The baseline seed consumes one SMAC trial; budget is total executions.
-    n_trials = budget
+    study_trace = None
+    if study_ledger is not None:
+        if spec.workflow_id != "nestedcpu-blas" or size != "small":
+            raise ValueError("SMAC study mode requires nestedcpu-blas with --size small")
+        if n_workers != 1:
+            raise ValueError("SMAC study mode requires --n-workers 1")
+        from experiments.LibContentBench.smac3.study_trace import SmacStudyTrace
+
+        study_trace = SmacStudyTrace(
+            study_ledger,
+            proposal_cap=study_proposal_cap,
+            unique_execution_target=study_unique_execution_target,
+        )
+
+    n_trials = study_trace.proposal_cap if study_trace is not None else budget
 
     evaluator = TrialEvaluator(
         spec=spec,
@@ -126,28 +148,83 @@ def run_smac(
     def target_function(config: Any, seed: int = 0) -> float:
         return evaluator(config, seed)
 
-    # The baseline seed is part of the trial budget. With budget=1, the initial
-    # design contains only the baseline; larger budgets leave budget-1 searched
-    # configurations after the baseline is measured.
+    initial_design_n_configs = (
+        min(7, max(0, study_trace.proposal_cap - 1))
+        if study_trace is not None
+        else max(0, budget - 1)
+    )
+    initial_design_max_ratio = 1.0 if study_trace is not None else 0.25
     initial_design = HyperparameterOptimizationFacade.get_initial_design(
-        scenario, n_configs=max(0, budget - 1), additional_configs=[baseline_cfg]
+        scenario,
+        n_configs=initial_design_n_configs,
+        max_ratio=initial_design_max_ratio,
+        additional_configs=[baseline_cfg],
+    )
+    decision_trace = trace_callback.SmacDecisionTrace(
+        output_dir=output_dir,
+        evaluator_records=evaluator.records,
+        baseline_fingerprint=baseline_fingerprint,
+        budget=budget,
+        metric_name=metric_name,
+        metric_mode=metric_mode,
+        installed_smac_version=smac_version,
+        initial_design_n_configs_requested=initial_design_n_configs,
+        initial_design_max_ratio=initial_design_max_ratio,
+        expected_baseline_ask_order=(
+            initial_design_n_configs + 1 if study_trace is not None else None
+        ),
+        study_proposal_cap=(study_trace.proposal_cap if study_trace is not None else None),
+        study_unique_execution_target=(
+            study_trace.unique_execution_target if study_trace is not None else None
+        ),
     )
     smac = HyperparameterOptimizationFacade(
         scenario,
         target_function,
         initial_design=initial_design,
+        callbacks=[decision_trace],
         overwrite=True,
     )
 
     wall_start = time.time()
-    smac.optimize()
+    study_summary = None
+    try:
+        if study_trace is None:
+            smac.optimize()
+        else:
+            stop_reason = _run_study_loop(
+                smac=smac,
+                evaluator=evaluator,
+                decision_trace=decision_trace,
+                study_trace=study_trace,
+                baseline_fingerprint=baseline_fingerprint,
+                metric_name=metric_name,
+                crash_cost=crash_cost,
+            )
+            study_summary = study_trace.finish(
+                stop_reason=stop_reason,
+                metric_name=metric_name,
+                metric_mode=metric_mode,
+            )
+    except BaseException as exc:
+        if study_trace is not None and study_summary is None:
+            study_trace.finish(
+                stop_reason=f"exception:{type(exc).__name__}",
+                metric_name=metric_name,
+                metric_mode=metric_mode,
+            )
+        raise
+    finally:
+        decision_trace.finalize()
     wall_time_sec = time.time() - wall_start
 
     records = sorted(evaluator.records, key=lambda r: r["trial_index"])
 
     # Mark which evaluations were the baseline seed config vs searched configs.
     for r in records:
-        r["is_baseline"] = r["config"] == baseline_values
+        r["is_baseline"] = r.get("config_fingerprint") == baseline_fingerprint
+        if "config_fingerprint" not in r:
+            r["is_baseline"] = config_fingerprint(r["config"]) == baseline_fingerprint
 
     baseline_record = next(
         (r for r in records if r["state"] == "OK" and r["is_baseline"]),
@@ -248,6 +325,17 @@ def run_smac(
         ),
         "trials": trial_rows,
     }
+    if study_summary is not None:
+        assert study_ledger is not None
+        summary["study"] = {
+            **study_summary,
+            "ledger_path": str(Path(study_ledger).resolve()),
+        }
+        summary["round_trial_note"] = (
+            "SMAC study mode records every native ask, excludes the same-session baseline "
+            "from unique candidate accounting, reuses repeated configurations without "
+            "relaunching, and stops at the unique-execution target or proposal cap."
+        )
 
     write_json(output_dir / "summary.json", summary)
     write_json(
@@ -319,3 +407,133 @@ def run_smac(
     )
 
     return summary
+
+
+def _run_study_loop(
+    *,
+    smac: Any,
+    evaluator: TrialEvaluator,
+    decision_trace: trace_callback.SmacDecisionTrace,
+    study_trace: Any,
+    baseline_fingerprint: str,
+    metric_name: str,
+    crash_cost: float,
+) -> str:
+    results_by_fingerprint: dict[str, dict[str, Any]] = {}
+    first_ask_by_fingerprint: dict[str, int] = {}
+
+    while not study_trace.proposal_cap_reached:
+        if study_trace.target_reached and study_trace.baseline_finished:
+            return "unique_execution_target_reached"
+        try:
+            info = smac.ask()
+        except StopIteration:
+            return "smac_ask_exhausted"
+
+        ask_order = study_trace.proposal_count + 1
+        config_values = dict(info.config)
+        fingerprint = config_fingerprint(config_values)
+        origin_value = getattr(info.config, "origin", None)
+        origin = None if origin_value is None else str(origin_value)
+        is_baseline = fingerprint == baseline_fingerprint
+        study_ask = study_trace.record_ask(
+            config_values,
+            ask_order=ask_order,
+            origin=origin,
+            is_baseline=is_baseline,
+        )
+        prior_record = results_by_fingerprint.get(fingerprint)
+        duplicate_of_ask_order = first_ask_by_fingerprint.get(fingerprint)
+        first_ask_by_fingerprint.setdefault(fingerprint, ask_order)
+
+        if is_baseline:
+            if prior_record is None:
+                decision_trace.annotate_latest_ask(info, disposition="baseline")
+                evaluator(info.config, info.seed or 0)
+                record = evaluator.records[-1]
+                results_by_fingerprint[fingerprint] = record
+                study_trace.record_baseline_finished(record, metric_name=metric_name)
+            else:
+                record = prior_record
+                decision_trace.annotate_latest_ask(
+                    info,
+                    disposition="duplicate",
+                    reused_record=record,
+                    duplicate_of_ask_order=duplicate_of_ask_order,
+                )
+                study_trace.record_baseline_finished(
+                    record,
+                    metric_name=metric_name,
+                    reused_execution_order=int(record["trial_index"]),
+                )
+            value = _trial_value_from_record(record, reused=prior_record is not None)
+        elif study_ask.disposition == "candidate":
+            decision_trace.annotate_latest_ask(info, disposition="candidate")
+            execution_sequence = study_trace.record_execution_started(
+                study_ask,
+                execution_order=len(evaluator.records) + 1,
+            )
+            evaluator(info.config, info.seed or 0)
+            record = evaluator.records[-1]
+            results_by_fingerprint[fingerprint] = record
+            study_trace.record_execution_finished(
+                execution_sequence,
+                record,
+                metric_name=metric_name,
+            )
+            value = _trial_value_from_record(record)
+        elif study_ask.disposition == "duplicate":
+            if prior_record is None:
+                raise RuntimeError("duplicate SMAC proposal has no prior execution result")
+            decision_trace.annotate_latest_ask(
+                info,
+                disposition="duplicate",
+                reused_record=prior_record,
+                duplicate_of_ask_order=duplicate_of_ask_order,
+            )
+            value = _trial_value_from_record(prior_record, reused=True)
+        else:
+            decision_trace.annotate_latest_ask(info, disposition="rejected")
+            value = _rejected_trial_value(crash_cost)
+        smac.tell(info, value)
+
+    return "proposal_cap_reached"
+
+
+def _trial_value_from_record(record: dict[str, Any], *, reused: bool = False) -> Any:
+    from smac.runhistory.dataclasses import TrialValue
+    from smac.runhistory.enumerations import StatusType
+
+    state = str(record["state"])
+    if state == "OK":
+        status = StatusType.SUCCESS
+    elif state == "TIMEOUT":
+        status = StatusType.TIMEOUT
+    else:
+        status = StatusType.CRASHED
+    return TrialValue(
+        cost=float(record["cost"]),
+        time=0.0 if reused else float(record["elapsed_sec"]),
+        status=status,
+        additional_info={
+            "metric_value": record.get("metric_value"),
+            "result_state": state,
+            "result_reused": reused,
+            "execution_order": int(record["trial_index"]),
+        },
+    )
+
+
+def _rejected_trial_value(crash_cost: float) -> Any:
+    from smac.runhistory.dataclasses import TrialValue
+    from smac.runhistory.enumerations import StatusType
+
+    return TrialValue(
+        cost=float(crash_cost),
+        status=StatusType.CRASHED,
+        additional_info={
+            "result_state": "REJECTED",
+            "result_reused": False,
+            "reason": "unique_execution_target_reached_before_launch",
+        },
+    )

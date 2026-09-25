@@ -89,6 +89,25 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print the baseline command and search space, then exit (no SMAC3 run)",
     )
+    parser.add_argument(
+        "--study-ledger",
+        help=(
+            "Opt in to the nestedcpu-blas deep-trace study and write the shared "
+            "case-study JSONL ledger to this path"
+        ),
+    )
+    parser.add_argument(
+        "--study-proposal-cap",
+        type=int,
+        default=None,
+        help="Override the study proposal cap (default from the shared manifest: 60)",
+    )
+    parser.add_argument(
+        "--study-unique-execution-target",
+        type=int,
+        default=None,
+        help="Override the unique non-baseline execution target (default: 30)",
+    )
     return parser
 
 
@@ -103,6 +122,31 @@ def _validate(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None
         parser.error("--budget must be >= 1")
     if args.n_workers < 1:
         parser.error("--n-workers must be >= 1")
+    has_study_override = (
+        args.study_proposal_cap is not None or args.study_unique_execution_target is not None
+    )
+    if has_study_override and not args.study_ledger:
+        parser.error(
+            "--study-proposal-cap and --study-unique-execution-target require --study-ledger"
+        )
+    if args.study_ledger:
+        if args.workflow != "nestedcpu-blas" or args.size != "small":
+            parser.error("--study-ledger requires --workflow nestedcpu-blas --size small")
+        if args.n_workers != 1:
+            parser.error("--study-ledger requires --n-workers 1")
+        if args.study_proposal_cap is not None and args.study_proposal_cap < 1:
+            parser.error("--study-proposal-cap must be >= 1")
+        if (
+            args.study_unique_execution_target is not None
+            and args.study_unique_execution_target < 1
+        ):
+            parser.error("--study-unique-execution-target must be >= 1")
+        if (
+            args.study_proposal_cap is not None
+            and args.study_unique_execution_target is not None
+            and args.study_proposal_cap < args.study_unique_execution_target
+        ):
+            parser.error("--study-proposal-cap cannot be below --study-unique-execution-target")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -191,12 +235,26 @@ def main(argv: list[str] | None = None) -> int:
         n_workers=args.n_workers,
         repo_root=REPO_ROOT,
         crash_cost=args.crash_cost,
+        study_ledger=(Path(args.study_ledger).resolve() if args.study_ledger else None),
+        study_proposal_cap=args.study_proposal_cap,
+        study_unique_execution_target=args.study_unique_execution_target,
     )
 
-    print(f"workflow:            {summary['workflow']} ({summary['size']}, budget {summary['budget']})")
+    print(
+        f"workflow:            {summary['workflow']} "
+        f"({summary['size']}, budget {summary['budget']})"
+    )
     print(f"metric:              {summary['metric']} ({summary['metric_mode']})")
     print(f"total executions:    {summary['total_executions']} (baseline included; "
           f"searched candidates: {summary['n_search_trials']})")
+    if summary.get("study"):
+        study = summary["study"]
+        print(
+            f"study proposals:     {study['proposal_count']} / {study['proposal_cap']} "
+            f"(unique launches: {study['unique_execution_count']} / "
+            f"{study['unique_execution_target']})"
+        )
+        print(f"study terminal:      {study['terminal_reason']}")
     print(f"executions ok:       {summary['n_trials_ok']} / {summary['total_executions']}")
     print(f"trials to best:      {summary['trials_to_best']} "
           f"(rounds==trials for SMAC)")

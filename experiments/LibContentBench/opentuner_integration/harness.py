@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import math
 import shutil
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -16,10 +18,23 @@ from experiments.LibContentBench.libcontentbench.common import (
     write_json,
 )
 from experiments.LibContentBench.libcontentbench.direct_commands import build_direct_command
+from experiments.LibContentBench.libcontentbench.tuner_trace import config_fingerprint
 from experiments.LibContentBench.opentuner_integration.specs import (
     OpenTunerParameterSpec,
     OpenTunerWorkflowSpec,
 )
+
+DOMINATED_ACCURACY = -sys.float_info.max
+DOMINATED_TIME = sys.float_info.max
+
+
+class BaselineTrialFailed(RuntimeError):  # noqa: N818
+    def __init__(self, *, state: str, artifact_path: Path) -> None:
+        self.state = state
+        self.artifact_path = artifact_path
+        super().__init__(
+            f"OpenTuner baseline trial failed with state={state}; evidence: {artifact_path}"
+        )
 
 
 def _encode_parameter_value(tunable: OpenTunerParameterSpec, raw_value: Any) -> Any:
@@ -64,7 +79,8 @@ def _metric_from_payload(payload: dict[str, Any], metric_name: str) -> float | N
     raw_value = payload.get(metric_name)
     if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
         return None
-    return float(raw_value)
+    metric_value = float(raw_value)
+    return metric_value if math.isfinite(metric_value) else None
 
 
 def _payload_from_stdout(stdout: str) -> dict[str, Any] | None:
@@ -95,6 +111,21 @@ def _required_bounds(tunable: OpenTunerParameterSpec) -> tuple[int | float, int 
     return tunable.min_value, tunable.max_value
 
 
+def select_best_trial_artifact(
+    artifacts: list[dict[str, Any]], metric_direction: str
+) -> dict[str, Any] | None:
+    candidates = [
+        artifact
+        for artifact in artifacts
+        if artifact.get("result_state") == "OK" and artifact.get("metric_value") is not None
+    ]
+    if not candidates:
+        return None
+    if metric_direction == "maximize":
+        return max(candidates, key=lambda artifact: float(artifact["metric_value"]))
+    return min(candidates, key=lambda artifact: float(artifact["metric_value"]))
+
+
 class LibContentBenchOpenTunerInterface(MeasurementInterface):
     def __init__(
         self,
@@ -106,6 +137,7 @@ class LibContentBenchOpenTunerInterface(MeasurementInterface):
         timeout_seconds: int,
         output_dir: Path,
         repo_root: Path,
+        study_trace: Any | None = None,
     ) -> None:
         super().__init__(
             args=args,
@@ -119,11 +151,29 @@ class LibContentBenchOpenTunerInterface(MeasurementInterface):
         self.timeout_seconds = timeout_seconds
         self.output_dir = output_dir
         self.repo_root = repo_root
+        self.study_trace = study_trace
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.trials_dir = self.output_dir / "trials"
         self.trials_dir.mkdir(parents=True, exist_ok=True)
         self._trial_index = 0
         self._run_started_at = time.perf_counter()
+        self.baseline_config = self.seed_configurations()[0]
+        self.baseline_fingerprint = (
+            config_fingerprint(self.baseline_config)
+            if self.study_trace is None
+            else self.study_trace.fingerprint(self.baseline_config)
+        )
+        self.study_unique_execution_count = 0
+        if self.study_trace is not None:
+            setattr(self, "extra_convergence_criteria", self._study_convergence_criteria)
+
+    def _study_convergence_criteria(self, result: list[Any]) -> bool:
+        del result
+        return bool(
+            self.study_trace is not None
+            and self.study_unique_execution_count
+            >= self.study_trace.unique_execution_target
+        )
 
     def objective(self) -> MaximizeAccuracy:
         return MaximizeAccuracy()
@@ -156,9 +206,24 @@ class LibContentBenchOpenTunerInterface(MeasurementInterface):
         return [baseline]
 
     def save_final_config(self, config: Any) -> None:
+        del config
+        artifacts = [
+            load_json_object(path)
+            for path in sorted(self.trials_dir.glob("trial_*/trial_artifact.json"))
+        ]
+        best = select_best_trial_artifact(artifacts, self.metric_direction)
+        if best is None:
+            return
         write_json(
             self.output_dir / "best_config.json",
-            {"workflow": self.workflow_spec.workflow_id, "config": dict(config.data)},
+            {
+                "workflow": self.workflow_spec.workflow_id,
+                "trial_index": best["trial_index"],
+                "metric_name": self.metric_name,
+                "metric_direction": self.metric_direction,
+                "metric_value": best["metric_value"],
+                "config": best["config"],
+            },
         )
 
     def run(self, desired_result: Any, input: Any, limit: float) -> Result:
@@ -171,8 +236,18 @@ class LibContentBenchOpenTunerInterface(MeasurementInterface):
         output_json_path = trial_dir / "output.json"
         case_output_dir = trial_dir / "case_output"
         runtime_root = trial_dir / "runtime"
-        runtime_base = Path("/var/tmp/libcontentbench/tuner-runtime") / self.output_dir.name / trial_name
+        runtime_base = (
+            Path("/var/tmp/libcontentbench/tuner-runtime") / self.output_dir.name / trial_name
+        )
         config_data = dict(desired_result.configuration.data)
+        current_fingerprint = (
+            config_fingerprint(config_data)
+            if self.study_trace is None
+            else self.study_trace.fingerprint(config_data)
+        )
+        is_baseline = current_fingerprint == self.baseline_fingerprint
+        if self.study_trace is not None and not is_baseline:
+            self.study_unique_execution_count += 1
 
         payload = dict(self.workflow_spec.fixed_workload_payload)
         payload.update(
@@ -223,14 +298,14 @@ class LibContentBenchOpenTunerInterface(MeasurementInterface):
             metric_value = _metric_from_payload(fallback_payload, self.metric_name)
 
         state = "OK"
-        result_time = float("inf")
-        objective_value = None
+        result_time = DOMINATED_TIME
+        objective_value = DOMINATED_ACCURACY
         if completed["timeout"]:
             state = "TIMEOUT"
         elif completed["returncode"] != 0:
             state = "ERROR"
         elif metric_value is None:
-            state = "ERROR"
+            state = "NO_METRIC"
         else:
             result_time = trial_wall_time_sec
             objective_value = float(metric_value)
@@ -246,6 +321,15 @@ class LibContentBenchOpenTunerInterface(MeasurementInterface):
             "metric_value": metric_value,
             "objective_value": objective_value,
             "result_state": state,
+            "result_accuracy": objective_value,
+            "result_time": result_time,
+            "is_baseline": is_baseline,
+            "config_fingerprint": current_fingerprint,
+            "desired_result_id": getattr(desired_result, "id", None),
+            "desired_result_generation": getattr(desired_result, "generation", None),
+            "desired_result_requestor": getattr(desired_result, "requestor", None),
+            "configuration_id": getattr(desired_result, "configuration_id", None),
+            "configuration_hash": getattr(desired_result.configuration, "hash", None),
             "command": command,
             "config": config_data,
             "materialized_payload": payload,
@@ -260,8 +344,12 @@ class LibContentBenchOpenTunerInterface(MeasurementInterface):
             "stdout_json": stdout_payload,
             "output_json_payload": fallback_payload,
         }
-        write_json(trial_dir / "trial_artifact.json", artifact)
-        if self.workflow_spec.workflow_id in {"dali-nvjpeg-pytorch-cudnn", "torchdata-fsspec-s3-ddp"}:
+        artifact_path = trial_dir / "trial_artifact.json"
+        write_json(artifact_path, artifact)
+        if self.workflow_spec.workflow_id in {
+            "dali-nvjpeg-pytorch-cudnn",
+            "torchdata-fsspec-s3-ddp",
+        }:
             shutil.rmtree(runtime_root.parent, ignore_errors=True)
         print(
             "LibContentBench trial "
@@ -271,8 +359,10 @@ class LibContentBenchOpenTunerInterface(MeasurementInterface):
             f"trial_wall_time_sec={trial_wall_time_sec}",
             flush=True,
         )
+        if is_baseline and state != "OK":
+            raise BaselineTrialFailed(state=state, artifact_path=artifact_path)
         result = Result()
         setattr(result, "time", result_time)
         setattr(result, "accuracy", objective_value)
-        setattr(result, "state", state)
+        setattr(result, "state", state if state in {"OK", "TIMEOUT", "ERROR"} else "ERROR")
         return result

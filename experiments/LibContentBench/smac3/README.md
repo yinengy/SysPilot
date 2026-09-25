@@ -29,7 +29,10 @@ The metric per workflow and the parameter/whitelist sources follow
 [`docs/fixed_budget_exp_prompt.md`](../../../docs/fixed_budget_exp_prompt.md):
 the SMAC3 `--budget` is the total number of benchmark executions, including
 the baseline seed, and `--metric`/direction default to the per-benchmark
-`--primary-objective` values listed there.
+`--primary-objective` values listed there. SMAC 2.4.0 yields generated Sobol
+initial-design configurations first and appends the additional baseline after
+them; with budget 30, the 25% cap produces seven Sobol asks and the baseline is
+expected at ask position 8.
 
 ## Layout
 
@@ -44,6 +47,7 @@ smac3/
 ├── workflows.py         # specs: size tiers, baselines, whitelisted tunables, metric (no SMAC import)
 ├── config_space.py      # WorkflowSpec -> ConfigSpace mapping
 ├── runner.py            # SMAC target function: build cmd, run, parse metric, write artifacts
+├── study_trace.py       # opt-in shared nestedcpu-blas case-study ledger adapter
 └── optimize.py          # SMAC3 scenario/facade orchestration + summary/CSV
 ```
 
@@ -164,6 +168,35 @@ PYTHONHASHSEED=0 $PY experiments/LibContentBench/smac3/cli.py \
   --output-dir experiments/LibContentBench/smac3/runs/nestedcpu-blas/small-b20
 ```
 
+### NestedCPU-BLAS deep-trace study mode
+
+The normalized cross-optimizer case-study ledger is opt-in and restricted to the
+pinned `nestedcpu-blas` small workload:
+
+```bash
+PYTHONHASHSEED=0 $PY experiments/LibContentBench/smac3/cli.py \
+  --workflow nestedcpu-blas \
+  --size small \
+  --budget 30 \
+  --output-dir experiments/LibContentBench/smac3/runs/nestedcpu-blas/deep-trace \
+  --study-ledger experiments/LibContentBench/smac3/runs/nestedcpu-blas/deep-trace/case_study.jsonl
+```
+
+Study mode uses SMAC 2.4.0's public `ask()` / `tell()` API. It records every
+native ask before execution, preserves the seven generated Sobol asks followed
+by the added baseline ask at position 8, and continues until 30 unique
+non-baseline configurations have launched or 60 total proposals have been
+observed. The baseline runs once in the same session but is excluded from the
+30-candidate target. Repeated configurations reuse the first result without a
+second benchmark launch; failed and timed-out first launches still count once
+toward the unique target and are told back to SMAC with the finite crash cost.
+If proposal exhaustion prevents 30 unique launches, the ledger ends with
+`proposal_cap_reached_with_shortfall` (or another explicit shortfall reason).
+
+Use `--study-proposal-cap` and `--study-unique-execution-target` only for bounded
+smoke validation. They require `--study-ledger`; normal runs ignore this study
+protocol and keep the existing `--budget` behavior unchanged.
+
 Run each tuning job individually (one workflow × size × budget per command), as
 in the experiment protocol. Examples for the other workflows:
 
@@ -195,6 +228,9 @@ $PY .../smac3/cli.py --workflow torchdata-fsspec-s3-ddp --size small --budget 20
 | `--seed` | `0` | SMAC3 / ConfigSpace seed |
 | `--n-workers` | `1` | parallel trial workers — **keep 1** (see below) |
 | `--crash-cost` | `1e9` | cost for failed/timed-out trials |
+| `--study-ledger` | off | opt in to the normalized nestedcpu-blas deep-trace ledger |
+| `--study-proposal-cap` | manifest (`60`) | study-only total native ask cap |
+| `--study-unique-execution-target` | manifest (`30`) | study-only unique non-baseline launch target |
 | `--dry-run` | off | print search space + baseline command, then exit |
 | `--list-workflows` | off | print `id  metric  mode` and exit |
 
@@ -226,8 +262,11 @@ a bug; inspect `trials.csv` / `trials/trial_XXXX/trial_artifact.json` for the
 per-trial state and stderr.
 
 The baseline (seed) configuration — each workflow's documented default knobs — is
-injected as the first initial-design point, consumes one budgeted execution, and is
-used as the speedup denominator.
+passed as an additional initial-design configuration and consumes one budgeted
+execution. SMAC 2.4.0 yields generated Sobol points before additional configurations,
+so the baseline follows the capped Sobol points and is used as the speedup denominator.
+For budget 30, `n_configs=29` is capped to seven Sobol points and the baseline is
+expected at ask position 8.
 
 ## Fair comparison with SysPilot (budget, round vs trial)
 
@@ -238,7 +277,7 @@ SysPilot protocol **except the tunable value ranges** — read the two ⚠️ ca
 just below this section (**Known difference #1 — search-space bounds** and
 **#2 — doc pitfall**) before reconciling numbers against SysPilot.
 
-- **Budget includes the baseline.** `--budget N` is the total number of benchmark executions SMAC3 may run. The baseline seed consumes one execution, so `--budget 1` runs only the baseline and `--budget N` leaves at most `N - 1` searched candidates.
+- **Budget includes the baseline.** `--budget N` is the total number of benchmark executions SMAC3 may run. The baseline seed consumes one execution, so `--budget 1` runs only the baseline and `--budget N` leaves at most `N - 1` searched candidates. For budgets above one, generated Sobol initial-design points are yielded before the additional baseline; budget 30 yields seven Sobol points followed by the baseline at expected ask position 8.
 - **Round vs trial.** SysPilot has two levels — a *round* is one LLM reasoning
   step that may emit several *candidate trials*; the budget counts candidate
   trials. SMAC evaluates exactly **one configuration per ask/tell step**, so for
@@ -333,14 +372,25 @@ Each single run (`cli.py --output-dir DIR`, also one per sweep cell) writes:
 | `run_report.csv` | single row (SysPilot CSV items 2–7) for cross-run concatenation |
 | `best_config.json` | the incumbent knobs + metric + speedup + `baseline_is_best` |
 | `trials.csv` | one row per trial: `is_baseline`, state, metric, speedup, timings, and every tuned knob |
+| `optimizer_trace.jsonl` | deterministic ask-order trace; every row carries `schema_version`, `optimizer=smac3`, `optimizer_version`, execution order, config fingerprint, raw/normalized origin, baseline identity, result, and incumbent transitions |
+| `trace_manifest.json` | trace schema, exact SMAC version check, initial-design settings, baseline fingerprint, and explicit acquisition-score availability |
+| `trace_summary.json` | trace counts, origin distribution, baseline position metadata, incomplete asks, and final incumbent identity |
+| study ledger path | shared normalized proposal/baseline/execution/duplicate/terminal JSONL events when `--study-ledger` is enabled |
 | `trials/trial_XXXX/trial_artifact.json` | full record: command, config, materialized payload, stdout/stderr tails, return code, metric |
 | `trials/trial_XXXX/{runtime,case_output,output.json}` | per-trial working dirs + runner output |
 | `smac3_runs/<name>/` | SMAC3's own run history / database |
 
 ## Reproducibility & determinism
 
-- `setup.sh` rebuilds every environment from scratch; `requirements.txt` pins the
-  SMAC3 major version; the MinIO image is pinned to a fixed release tag.
+- `setup.sh` rebuilds every environment from scratch; `requirements.txt` pins
+  SMAC3 exactly to `2.4.0`; the MinIO image is pinned to a fixed release tag.
+- The runner reads the installed distribution version with
+  `importlib.metadata.version("smac")` and fails before optimization unless it is
+  exactly `2.4.0`.
+- The repository callback uses only SMAC 2.4.0 public ask/tell, runhistory, and
+  intensifier surfaces. SMAC does not expose acquisition scores through those
+  callbacks, so traces record a null score with an explicit unavailability reason
+  instead of fabricating one.
 - `PYTHONHASHSEED=0` is exported into every trial subprocess (and the CLI sets it
   for the driver too); pass `--seed` to fix SMAC's own RNG. Export
   `PYTHONHASHSEED=0` before launching for end-to-end determinism.

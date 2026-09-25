@@ -20,10 +20,9 @@ isolation, mirroring the OpenTuner integration.
 from __future__ import annotations
 
 import json
-import numbers
 import os
-import shutil
 import shlex
+import shutil
 import subprocess
 import threading
 import time
@@ -36,6 +35,10 @@ from experiments.LibContentBench.libcontentbench.common import (
     write_json,
 )
 from experiments.LibContentBench.libcontentbench.direct_commands import build_direct_command
+from experiments.LibContentBench.libcontentbench.tuner_trace import (
+    config_fingerprint,
+    normalize_config,
+)
 from experiments.LibContentBench.smac3.workflows import WorkflowSpec, build_trial_payload
 
 
@@ -59,28 +62,6 @@ def _metric_from_payload(payload: dict[str, Any], metric_name: str) -> float | N
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
         return None
     return float(raw)
-
-
-def _normalize_config(config: Any) -> dict[str, Any]:
-    """Plain-Python copy of a ConfigSpace Configuration.
-
-    ConfigSpace 1.x Categorical values come back as ``numpy.str_`` (and integers
-    can be numpy scalars); converting to native ``str``/``int``/``float`` keeps
-    artifacts, JSON, and printed configs clean and avoids ``np.str_('...')`` noise.
-    """
-    normalized: dict[str, Any] = {}
-    for key, value in dict(config).items():
-        if isinstance(value, bool):
-            normalized[key] = value
-        elif isinstance(value, str):
-            normalized[key] = str(value)
-        elif isinstance(value, numbers.Integral):
-            normalized[key] = int(value)
-        elif isinstance(value, numbers.Real):
-            normalized[key] = float(value)
-        else:
-            normalized[key] = value
-    return normalized
 
 
 def _tail(text: str, limit: int = 8000) -> str:
@@ -123,7 +104,8 @@ class TrialEvaluator:
 
     # SMAC calls the instance as ``target(config, seed)``.
     def __call__(self, config: Any, seed: int = 0) -> float:
-        config_values = _normalize_config(config)
+        config_values = normalize_config(config)
+        fingerprint = config_fingerprint(config_values)
 
         with self._lock:
             self._counter += 1
@@ -133,7 +115,9 @@ class TrialEvaluator:
         trial_dir = self.trials_dir / trial_name
         trial_dir.mkdir(parents=True, exist_ok=True)
         output_json_path = trial_dir / "output.json"
-        runtime_base = Path("/var/tmp/libcontentbench/tuner-runtime") / self.output_dir.name / trial_name
+        runtime_base = (
+            Path("/var/tmp/libcontentbench/tuner-runtime") / self.output_dir.name / trial_name
+        )
 
         per_trial: dict[str, Any] = {
             "case_id": trial_name,
@@ -227,6 +211,7 @@ class TrialEvaluator:
             "result_state": state,
             "command": command,
             "config": config_values,
+            "config_fingerprint": fingerprint,
             "materialized_payload": payload,
             "returncode": returncode,
             "timed_out": timed_out,
@@ -238,7 +223,11 @@ class TrialEvaluator:
             "stdout_json": stdout_payload,
         }
         write_json(trial_dir / "trial_artifact.json", artifact)
-        if self.spec.workflow_id in {"dali-nvjpeg-pytorch-cudnn", "torchdata-fsspec-s3-ddp"} and "runtime_root" in payload:
+        ephemeral_runtime = self.spec.workflow_id in {
+            "dali-nvjpeg-pytorch-cudnn",
+            "torchdata-fsspec-s3-ddp",
+        }
+        if ephemeral_runtime and "runtime_root" in payload:
             shutil.rmtree(Path(str(payload["runtime_root"])).parent, ignore_errors=True)
 
         with self._lock:
@@ -249,8 +238,11 @@ class TrialEvaluator:
                     "metric_value": metric_value,
                     "cost": cost,
                     "config": config_values,
+                    "config_fingerprint": fingerprint,
                     "elapsed_sec": elapsed_sec,
                     "cumulative_wall_sec": cumulative_wall_sec,
+                    "returncode": returncode,
+                    "timed_out": timed_out,
                 }
             )
 

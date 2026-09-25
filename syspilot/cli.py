@@ -54,6 +54,11 @@ from syspilot.skills.builtin import (
     StraceAnalyzerSkill,
 )
 from syspilot.spawn_runtime import execute_profiled_spawn_run, execute_unprofiled_spawn_run
+from syspilot.study_trace import (
+    NestedCpuBlasStudyTrace,
+    RepositoryStudySourceUnavailableError,
+    StudyProposal,
+)
 from syspilot.toolbox_runtime import (
     finish_toolbox_probe_sessions,
     sample_toolbox_probe_sessions,
@@ -1461,6 +1466,27 @@ def skills() -> None:
     ),
 )
 @click.option(
+    "--study-ledger",
+    type=click.Path(dir_okay=False, path_type=Path),
+    help=(
+        "Opt-in nestedcpu-blas deep-trace JSONL ledger path for spawn-mode tune; "
+        "requires a repository source checkout."
+    ),
+)
+@click.option(
+    "--study-proposal-cap",
+    type=click.IntRange(min=1),
+    help="Deep-trace model proposal cap; requires --study-ledger (default: manifest value 60).",
+)
+@click.option(
+    "--study-unique-execution-target",
+    type=click.IntRange(min=1),
+    help=(
+        "Deep-trace unique non-baseline execution target; requires --study-ledger "
+        "(default: manifest value 30)."
+    ),
+)
+@click.option(
     "--max-iterations",
     default=20,
     show_default=True,
@@ -1591,6 +1617,9 @@ def tune(
     tunable_whitelist: Path | None,
     fixed_budget: int | None,
     fixed_goal: float | None,
+    study_ledger: Path | None,
+    study_proposal_cap: int | None,
+    study_unique_execution_target: int | None,
     max_iterations: int,
     dry_run: bool,
     timeout: int,
@@ -1626,6 +1655,30 @@ def tune(
     if quick_mode and not profile_enabled:
         sink.print("[red]Error: --no-profile is not supported with --quick-mode[/red]")
         raise SystemExit(1)
+    if quick_mode and study_ledger is not None:
+        sink.print("[red]Error: --study-ledger is supported only by standard spawn-mode tune[/red]")
+        raise SystemExit(1)
+    if study_ledger is None and (
+        study_proposal_cap is not None or study_unique_execution_target is not None
+    ):
+        sink.print(
+            "[red]Error: --study-proposal-cap and --study-unique-execution-target "
+            "require --study-ledger[/red]"
+        )
+        raise SystemExit(1)
+
+    study_trace: NestedCpuBlasStudyTrace | None = None
+    if study_ledger is not None:
+        try:
+            study_trace = NestedCpuBlasStudyTrace(
+                study_ledger,
+                proposal_cap=study_proposal_cap,
+                unique_execution_target=study_unique_execution_target,
+            )
+        except (RepositoryStudySourceUnavailableError, OSError, ValueError) as exc:
+            sink.print("[red]Error: could not initialize --study-ledger[/red]")
+            sink.print(f"[red]{exc}[/red]")
+            raise SystemExit(1) from exc
 
     resolved_primary_objective: str | None = None
     resolved_primary_objective_mode: str | None = None
@@ -1831,6 +1884,7 @@ def tune(
                 initial_hypothesis_profiles,
                 excluded_config_names,
                 tunable_whitelist_names,
+                study_trace,
             )
     finally:
         if logger_forward_handler is not None:
@@ -3315,6 +3369,14 @@ def _validate_spawn_command_rewrite(
     return issues
 
 
+def _extract_raw_spawn_candidates(response: str) -> list[object]:
+    parsed = _extract_json_object(response)
+    if not parsed:
+        return []
+    candidates = parsed.get("candidates")
+    return list(candidates) if isinstance(candidates, list) else []
+
+
 def _parse_spawn_actions(
     response: str,
     *,
@@ -3331,6 +3393,7 @@ def _parse_spawn_actions(
             "evidence": [],
             "actions": [],
             "candidates": [],
+            "raw_candidates": [],
             "skipped_actions": [],
         }
 
@@ -3363,6 +3426,7 @@ def _parse_spawn_actions(
             "hypothesis_refs": hypothesis_refs,
             "actions": [],
             "candidates": [],
+            "raw_candidates": [],
             "skipped_actions": [],
         }
 
@@ -3377,6 +3441,7 @@ def _parse_spawn_actions(
             "hypothesis_refs": hypothesis_refs,
             "actions": [],
             "candidates": [],
+            "raw_candidates": [],
             "skipped_actions": [],
         }
 
@@ -3401,7 +3466,9 @@ def _parse_spawn_actions(
             if key not in {"reason", "manual_citation", *candidate_fields}
         )
         for field_name in unknown_candidate_fields:
-            skipped_actions.append(f"candidate[{candidate_idx}] has unsupported field '{field_name}'")
+            skipped_actions.append(
+                f"candidate[{candidate_idx}] has unsupported field '{field_name}'"
+            )
 
         changes_raw = candidate.get("changes", {})
         if not isinstance(changes_raw, dict):
@@ -3422,13 +3489,15 @@ def _parse_spawn_actions(
                 continue
             if isinstance(raw_value, (dict, list)):
                 skipped_actions.append(
-                    f"candidate[{candidate_idx}].changes['{control_name}'] must be a concrete scalar value"
+                    f"candidate[{candidate_idx}].changes['{control_name}'] must be a "
+                    "concrete scalar value"
                 )
                 continue
             control_value = str(raw_value).strip()
             if "|" in control_value:
                 skipped_actions.append(
-                    f"candidate[{candidate_idx}].changes['{control_name}'] uses unsupported bundled value syntax"
+                    f"candidate[{candidate_idx}].changes['{control_name}'] uses unsupported "
+                    "bundled value syntax"
                 )
                 continue
             if _is_option_token(control_name):
@@ -3468,6 +3537,7 @@ def _parse_spawn_actions(
 
         normalized_candidates.append(
             {
+                "source_candidate_index": candidate_idx,
                 "reason": candidate_reason,
                 "manual_citation": candidate_manual_citation,
                 "actions": candidate_actions,
@@ -3483,6 +3553,7 @@ def _parse_spawn_actions(
         "hypothesis_refs": hypothesis_refs,
         "actions": normalized_actions,
         "candidates": normalized_candidates,
+        "raw_candidates": _extract_raw_spawn_candidates(response),
         "skipped_actions": skipped_actions,
     }
 
@@ -4088,7 +4159,11 @@ def _materialize_spawn_candidate_attempts_from_candidate_sets(
         )
         label = str(candidate.get("label", "")).strip()
         if not label:
-            label = ", ".join(applied_actions) if applied_actions else f"candidate {candidate_idx + 1}"
+            label = (
+                ", ".join(applied_actions)
+                if applied_actions
+                else f"candidate {candidate_idx + 1}"
+            )
         key = _command_key(tuned_cmd, env_overrides) if tuned_cmd else None
         materialized_status = "ready"
         materialized_reason = "candidate materialized"
@@ -4112,6 +4187,7 @@ def _materialize_spawn_candidate_attempts_from_candidate_sets(
                 "label": label,
                 "skipped_actions": skipped_actions,
                 "actions": action_set,
+                "source_candidate_index": candidate.get("source_candidate_index"),
                 "materialized_status": materialized_status,
                 "materialized_reason": materialized_reason,
             }
@@ -4765,6 +4841,7 @@ async def _run_spawn_tune_loop_async(
     initial_hypothesis_profiles: list[dict[str, Any]] | None = None,
     excluded_config_names: Sequence[str] | None = None,
     tunable_whitelist_names: Sequence[str] | None = None,
+    study_trace: NestedCpuBlasStudyTrace | None = None,
 ) -> None:
     tune_started_at = time.time()
     best_config_find_wall_time_s = 0.0
@@ -4888,8 +4965,19 @@ async def _run_spawn_tune_loop_async(
     candidate_trial_limit_display = (
         f"fixed budget {fixed_budget_state.total} (--max-iterations ignored)"
         if fixed_budget_state.enabled
-        else str(max_iterations)
+        else (
+            f"deep-trace target {study_trace.unique_execution_target} unique non-baseline "
+            f"launches / {study_trace.proposal_cap} proposals (--max-iterations ignored)"
+            if study_trace is not None
+            else str(max_iterations)
+        )
     )
+    if tunable_whitelist_list:
+        tunable_whitelist_display = ", ".join(tunable_whitelist_list)
+    elif tunable_whitelist_list is not None:
+        tunable_whitelist_display = "(empty)"
+    else:
+        tunable_whitelist_display = "(not set)"
     sink.panel(
         f"[bold green]SysPilot Tuning Engine (Spawn Mode)[/bold green]\n"
         f"Command: {command}\n"
@@ -4901,8 +4989,7 @@ async def _run_spawn_tune_loop_async(
         f"Candidate Trial Limit: {candidate_trial_limit_display}\n"
         f"Timeout: {timeout}s\n"
         f"Contracts: {len(loaded_contract_names)} loaded\n"
-        f"Tunable whitelist: "
-        f"{', '.join(tunable_whitelist_list) if tunable_whitelist_list is not None and tunable_whitelist_list else ('(empty)' if tunable_whitelist_list is not None else '(not set)')}\n"
+        f"Tunable whitelist: {tunable_whitelist_display}\n"
         f"{manual_context_status}",
         title="Starting",
     )
@@ -4939,6 +5026,16 @@ async def _run_spawn_tune_loop_async(
 
     evidence_kind = "profiled" if profiling_enabled else "raw-output"
     run_count_label = "profiled run(s)" if profiling_enabled else "raw-output run(s)"
+    if study_trace is not None:
+        study_trace.record_baseline_started(
+            cmd_parts,
+            inline_env_overrides,
+            metadata={
+                "command": command,
+                "workdir": workdir,
+                "primary_objective_query": primary_objective,
+            },
+        )
     sink.print(f"\n[bold cyan]Round 0 Step 0: Initial Baseline Run ({evidence_kind})[/bold cyan]")
     _emit_tune_event(
         event_emitter,
@@ -5017,6 +5114,14 @@ async def _run_spawn_tune_loop_async(
         },
     )
     if baseline_rc != 0 and not baseline_timed_out:
+        if study_trace is not None:
+            study_trace.record_baseline_finished(
+                status="error",
+                wall_time_s=float(baseline_time),
+                objective_name=None,
+                objective_value=None,
+                returncode=int(baseline_rc),
+            )
         fixed_budget_stop_reason = "hard_failure" if fixed_budget_state.enabled else ""
         _emit_tune_event(
             event_emitter,
@@ -5098,6 +5203,14 @@ async def _run_spawn_tune_loop_async(
             primary_objective,
         )
         if resolved_primary_objective_metric is None:
+            if study_trace is not None:
+                study_trace.record_baseline_finished(
+                    status="timeout" if baseline_timed_out else "ok",
+                    wall_time_s=float(baseline_time),
+                    objective_name=None,
+                    objective_value=None,
+                    returncode=int(baseline_rc),
+                )
             fixed_budget_stop_reason = "hard_failure" if fixed_budget_state.enabled else ""
             _emit_tune_event(
                 event_emitter,
@@ -5141,6 +5254,14 @@ async def _run_spawn_tune_loop_async(
             resolved_primary_objective_metric
         )
         if primary_objective_mode is None:
+            if study_trace is not None:
+                study_trace.record_baseline_finished(
+                    status="timeout" if baseline_timed_out else "ok",
+                    wall_time_s=float(baseline_time),
+                    objective_name=resolved_primary_objective_metric,
+                    objective_value=None,
+                    returncode=int(baseline_rc),
+                )
             fixed_budget_stop_reason = "hard_failure" if fixed_budget_state.enabled else ""
             _emit_tune_event(
                 event_emitter,
@@ -5186,6 +5307,14 @@ async def _run_spawn_tune_loop_async(
             resolved_primary_objective_metric,
         )
         if baseline_objective_value is None:
+            if study_trace is not None:
+                study_trace.record_baseline_finished(
+                    status="timeout" if baseline_timed_out else "ok",
+                    wall_time_s=float(baseline_time),
+                    objective_name=resolved_primary_objective_metric,
+                    objective_value=None,
+                    returncode=int(baseline_rc),
+                )
             fixed_budget_stop_reason = "hard_failure" if fixed_budget_state.enabled else ""
             _emit_tune_event(
                 event_emitter,
@@ -5232,6 +5361,15 @@ async def _run_spawn_tune_loop_async(
         sink.print(
             f"  Baseline {_objective_display_name(primary_objective)}: "
             f"{_format_metric_value(baseline_objective_value)}"
+        )
+
+    if study_trace is not None:
+        study_trace.record_baseline_finished(
+            status="timeout" if baseline_timed_out else "ok",
+            wall_time_s=float(baseline_time),
+            objective_name=resolved_primary_objective_metric,
+            objective_value=baseline_objective_value,
+            returncode=int(baseline_rc),
         )
 
     current_command_parts = list(cmd_parts)
@@ -5416,7 +5554,9 @@ async def _run_spawn_tune_loop_async(
             entry["current_wall_time_s"] = round(current_wall_time_s, 6)
         return entry
 
-    def _command_main_tokens(command_parts: Sequence[str]) -> tuple[list[str], list[str], dict[str, str]]:
+    def _command_main_tokens(
+        command_parts: Sequence[str],
+    ) -> tuple[list[str], list[str], dict[str, str]]:
         normalized_command, inline_env = _extract_inline_env_assignments(list(command_parts))
         base_executable = Path(cmd_parts[0]).name if cmd_parts else ""
         if not normalized_command or not base_executable:
@@ -5453,7 +5593,12 @@ async def _run_spawn_tune_loop_async(
         )
         for name in env_names:
             if candidate_env.get(name) != base_env.get(name):
-                changes.append({"name": f"env.{name}", "new_value": candidate_env.get(name, "(unset)")})
+                changes.append(
+                    {
+                        "name": f"env.{name}",
+                        "new_value": candidate_env.get(name, "(unset)"),
+                    }
+                )
 
         if prefix_tokens:
             changes.append({"name": "command_prefix", "new_value": " ".join(prefix_tokens)})
@@ -5507,7 +5652,12 @@ async def _run_spawn_tune_loop_async(
             else "(baseline only; no changed candidate values tried yet)"
         )
         findings_text = (
-            yaml.safe_dump(previous_round_findings, sort_keys=False, allow_unicode=True, width=10_000)
+            yaml.safe_dump(
+                previous_round_findings,
+                sort_keys=False,
+                allow_unicode=True,
+                width=10_000,
+            )
             if previous_round_findings
             else "(none)"
         )
@@ -5519,7 +5669,10 @@ async def _run_spawn_tune_loop_async(
         )
 
     def _current_changes_history_text() -> str:
-        changes = _baseline_relative_changes(current_command_parts, tuple(current_env_overrides.items()))
+        changes = _baseline_relative_changes(
+            current_command_parts,
+            tuple(current_env_overrides.items()),
+        )
         if not changes:
             return "baseline"
         return json.dumps(changes, sort_keys=True)
@@ -5557,6 +5710,11 @@ async def _run_spawn_tune_loop_async(
     def _candidate_trials_remaining() -> int:
         if fixed_budget_state.enabled:
             return cast(int, fixed_budget_state.remaining)
+        if study_trace is not None:
+            return max(
+                0,
+                study_trace.unique_execution_target - study_trace.unique_execution_count,
+            )
         return max(0, max_iterations - total_candidate_trials_executed)
 
     def _fixed_goal_search_active() -> bool:
@@ -5567,10 +5725,18 @@ async def _run_spawn_tune_loop_async(
         )
 
     def _bounded_search_active() -> bool:
-        return fixed_budget_state.enabled or _fixed_goal_search_active()
+        return (
+            fixed_budget_state.enabled
+            or _fixed_goal_search_active()
+            or (study_trace is not None and study_trace.search_active)
+        )
 
     def _reprompt_scope() -> str:
-        return "fixed budget" if fixed_budget_state.enabled else "fixed goal"
+        if fixed_budget_state.enabled:
+            return "fixed budget"
+        if study_trace is not None:
+            return "deep-trace study"
+        return "fixed goal"
 
     def _no_action_reprompts_used() -> int:
         if fixed_budget_state.enabled:
@@ -5586,6 +5752,11 @@ async def _run_spawn_tune_loop_async(
         nonlocal fixed_goal_no_action_reprompts_used
         if fixed_budget_state.enabled:
             return fixed_budget_state.record_no_action_reprompt(stall_reprompts_used)
+        if study_trace is not None:
+            if not study_trace.search_active or stall_reprompts_used >= 3:
+                return False
+            fixed_goal_no_action_reprompts_used += 1
+            return True
         if not _fixed_goal_search_active():
             return False
         if stall_reprompts_used >= fixed_goal_max_no_action_reprompts:
@@ -5683,7 +5854,17 @@ async def _run_spawn_tune_loop_async(
             if fixed_budget_state.enabled
             else _candidate_trials_remaining()
         )
-        reprompt_heading = "Fixed-Budget" if fixed_budget_state.enabled else "Fixed-Goal"
+        if fixed_budget_state.enabled:
+            reprompt_heading = "Fixed-Budget"
+        elif study_trace is not None:
+            reprompt_heading = "Deep-Trace Study"
+        else:
+            reprompt_heading = "Fixed-Goal"
+        whitelist_prompt_display = (
+            json.dumps(tunable_whitelist_list)
+            if tunable_whitelist_list is not None
+            else "(not restricted)"
+        )
         return (
             f"{base_prompt}\n\n"
             f"## {reprompt_heading} Re-prompt\n"
@@ -5699,8 +5880,7 @@ async def _run_spawn_tune_loop_async(
             f"Successful configs: {json.dumps(_successful_configs_snapshot(), indent=2)}\n"
             f"Untouched current controls (where known): {json.dumps(untouched_controls)}\n"
             f"Protected/excluded controls: {json.dumps(excluded_config_list)}\n\n"
-            "Allowed tunable controls: "
-            f"{json.dumps(tunable_whitelist_list) if tunable_whitelist_list is not None else '(not restricted)'}\n\n"
+            f"Allowed tunable controls: {whitelist_prompt_display}\n\n"
             "## Re-prompt Requirements\n"
             "- Budget is fixed and only materialized concrete candidate attempts consume it.\n"
             "- Return at least one concrete safe action that can materialize into a new executable "
@@ -5716,12 +5896,17 @@ async def _run_spawn_tune_loop_async(
             "- Keep the current command, current environment, immutable controls, and primary "
             "objective constraints in mind.\n"
             "- If no safe concrete candidate can be materialized, return the same JSON schema with "
-            '"summary": "STOP:<machine_readable_reason>", empty "candidates", and concise "evidence" '
+            '"summary": "STOP:<machine_readable_reason>", empty "candidates", and concise '
+            '"evidence" '
             "explaining why no candidate can be formed.\n"
         )
 
     iteration = 0
     while True:
+        if study_trace is not None and study_trace.unique_execution_target_reached:
+            break
+        if study_trace is not None and study_trace.proposal_cap_reached:
+            break
         if fixed_goal is not None and _fixed_goal_is_reached():
             fixed_goal_stop_reason = "fixed_goal_reached"
             break
@@ -5755,6 +5940,11 @@ async def _run_spawn_tune_loop_async(
 
         prior_findings_and_tried_changes_text = _prior_findings_and_tried_changes_text()
         candidate_trials_remaining = _candidate_trials_remaining()
+        max_candidates_this_response = (
+            min(3, study_trace.proposal_cap - study_trace.proposal_count)
+            if study_trace is not None
+            else 3
+        )
 
         memory_envelope_block = _render_effective_memory_envelope(profiling_json, memory_high)
         immutable_controls_rule = (
@@ -5766,7 +5956,10 @@ async def _run_spawn_tune_loop_async(
             "the Tunable Whitelist section. Return no actions if no listed control is supported "
             "by evidence."
             if tunable_whitelist_list is not None
-            else "- No tunable whitelist is active; supported non-immutable controls may be changed."
+            else (
+                "- No tunable whitelist is active; supported non-immutable controls may be "
+                "changed."
+            )
         )
         evidence_heading = (
             "Refined Profiling Evidence" if profiling_enabled else "Raw Runtime Output Evidence"
@@ -5836,7 +6029,7 @@ async def _run_spawn_tune_loop_async(
 {profiling_json_for_prompt(profiling_json) if profiling_json else profiling_text[:2500]}
 
 ## Generated Contract Hypotheses
-{generated_hypothesis_content if generated_hypothesis_content else "(No generated contract hypotheses)"}
+{generated_hypothesis_content or "(No generated contract hypotheses)"}
 
 ## Contract Hypothesis Validation
 {
@@ -5879,7 +6072,7 @@ async def _run_spawn_tune_loop_async(
 - Prefer new concrete values for already tried tunable controls over stopping early when the
   remaining budget can still test safe variants.
 - Return JSON only (no markdown, no prose).
-- Provide up to 3 candidate objects ordered best-first.
+- Provide up to {max_candidates_this_response} candidate objects ordered best-first.
 
 ## JSON Schema
 {{
@@ -5918,9 +6111,11 @@ Do not use placeholder keys in real responses. Do not use bundled or alternation
         round_recommendation_evidence: list[str] = []
         round_llm_response_text = ""
         round_recommended_actions: list[dict[str, Any]] = []
+        candidate_trace_proposals: dict[int, StudyProposal] = {}
 
         while True:
             analysis_unavailable = False
+            candidate_trace_proposals = {}
             if benchmark_deterministic:
                 analysis_wall_time_s = 0.0
                 recommendation = {
@@ -5932,6 +6127,7 @@ Do not use placeholder keys in real responses. Do not use bundled or alternation
                     "hypothesis_refs": [],
                     "actions": [],
                     "candidates": [],
+                    "raw_candidates": [],
                     "skipped_actions": [],
                 }
                 round_llm_response_text = str(recommendation["summary"])
@@ -5956,6 +6152,7 @@ Do not use placeholder keys in real responses. Do not use bundled or alternation
                         "hypothesis_refs": [],
                         "actions": [],
                         "candidates": [],
+                        "raw_candidates": [],
                         "skipped_actions": [],
                     }
                     round_llm_response_text = str(recommendation["summary"])
@@ -5963,11 +6160,43 @@ Do not use placeholder keys in real responses. Do not use bundled or alternation
                     analysis_wall_time_s = time.time() - analysis_started_at
                     sink.print(f"\n[dim]{response.content}[/dim]")
                     round_llm_response_text = response.content
+                    if study_trace is not None:
+                        candidate_trace_proposals = study_trace.record_proposals(
+                            _extract_raw_spawn_candidates(response.content),
+                            current_command_parts,
+                            current_env_overrides,
+                            metadata={
+                                "round": iteration,
+                                "current_wall_time_s": current_time,
+                                "current_objective_value": current_objective_value,
+                                "incumbent_wall_time_s": best_time,
+                                "incumbent_objective_value": best_objective_value,
+                            },
+                        )
                     recommendation = _parse_spawn_actions(
                         response.content,
                         baseline_command_tokens=cmd_parts,
                         baseline_env_overrides=inline_env_overrides,
                     )
+
+            if study_trace is not None:
+                valid_source_indices = {
+                    int(candidate["source_candidate_index"])
+                    for candidate in recommendation.get("candidates", [])
+                    if isinstance(candidate, dict)
+                    and isinstance(candidate.get("source_candidate_index"), int)
+                }
+                invalid_reason = "; ".join(
+                    str(item) for item in recommendation.get("skipped_actions", [])
+                ) or str(recommendation.get("error", "candidate rejected during parsing"))
+                for source_index, trace_proposal in candidate_trace_proposals.items():
+                    if source_index not in valid_source_indices:
+                        study_trace.validate_proposal(
+                            trace_proposal,
+                            accepted=False,
+                            reason=invalid_reason,
+                            metadata={"validation_stage": "response_parsing"},
+                        )
 
             if not recommendation["valid"]:
                 _emit_tune_event(
@@ -6090,6 +6319,12 @@ Do not use placeholder keys in real responses. Do not use bundled or alternation
                 candidate_hypothesis_profiles = startup_hypothesis_profiles
 
             candidate_specs = recommendation["candidates"]
+            if study_trace is not None:
+                candidate_specs = [
+                    candidate
+                    for candidate in candidate_specs
+                    if candidate.get("source_candidate_index") in candidate_trace_proposals
+                ]
             actions = recommendation["actions"]
             if not candidate_specs:
                 if (
@@ -6160,6 +6395,8 @@ Do not use placeholder keys in real responses. Do not use bundled or alternation
             _capture_action_controls(actions)
 
             candidate_attempt_limit = _candidate_trials_remaining()
+            if study_trace is not None:
+                candidate_attempt_limit = len(candidate_specs)
             if fixed_budget_state.enabled:
                 candidate_attempt_limit = min(
                     candidate_attempt_limit,
@@ -6174,6 +6411,26 @@ Do not use placeholder keys in real responses. Do not use bundled or alternation
                 excluded_config_names=excluded_config_list,
                 tunable_whitelist_names=tunable_whitelist_list,
             )
+            if study_trace is not None:
+                attempted_source_indices: set[int] = set()
+                for attempt in candidate_attempts:
+                    source_index = attempt.get("source_candidate_index")
+                    if isinstance(source_index, int):
+                        attempted_source_indices.add(source_index)
+                        attempt["study_proposal"] = candidate_trace_proposals.get(source_index)
+                for candidate_spec in candidate_specs:
+                    source_index = candidate_spec.get("source_candidate_index")
+                    if (
+                        isinstance(source_index, int)
+                        and source_index not in attempted_source_indices
+                        and source_index in candidate_trace_proposals
+                    ):
+                        study_trace.validate_proposal(
+                            candidate_trace_proposals[source_index],
+                            accepted=False,
+                            reason="candidate excluded by active candidate-attempt limit",
+                            metadata={"validation_stage": "candidate_attempt_limit"},
+                        )
 
             if candidate_attempts:
                 break
@@ -6245,7 +6502,7 @@ Do not use placeholder keys in real responses. Do not use bundled or alternation
                 },
             )
             stagnation_iterations += 1
-            if stagnation_iterations >= convergence_patience:
+            if study_trace is None and stagnation_iterations >= convergence_patience:
                 _emit_tune_event(
                     event_emitter,
                     "phase.finished",
@@ -6291,6 +6548,20 @@ Do not use placeholder keys in real responses. Do not use bundled or alternation
         non_improving_trials = 0
 
         for idx, candidate in enumerate(candidate_attempts, start=1):
+            if study_trace is not None and study_trace.unique_execution_target_reached:
+                for remaining_attempt in candidate_attempts[idx - 1 :]:
+                    remaining_proposal = remaining_attempt.get("study_proposal")
+                    if isinstance(remaining_proposal, StudyProposal):
+                        study_trace.validate_proposal(
+                            remaining_proposal,
+                            accepted=False,
+                            reason="unique execution target reached before candidate launch",
+                            metadata={
+                                "validation_stage": "unique_execution_target",
+                                "round": iteration,
+                            },
+                        )
+                break
             total_candidate_trials_executed += 1
             if fixed_budget_state.enabled:
                 fixed_budget_state.consume(
@@ -6305,8 +6576,28 @@ Do not use placeholder keys in real responses. Do not use bundled or alternation
             trial_label = trial_plan["label"]
             skipped_execution_actions = trial_plan["skipped_actions"]
             trial_actions = trial_plan.get("actions", [])
+            study_proposal = trial_plan.get("study_proposal")
 
             materialized_status = str(trial_plan.get("materialized_status", "ready"))
+            if study_trace is not None and isinstance(study_proposal, StudyProposal):
+                trace_disposition = study_trace.validate_proposal(
+                    study_proposal,
+                    accepted=materialized_status == "ready",
+                    reason=str(trial_plan.get("materialized_reason", "candidate materialized")),
+                    metadata={
+                        "validation_stage": "materialization",
+                        "round": iteration,
+                        "trial": idx,
+                    },
+                )
+                if trace_disposition != "candidate":
+                    materialized_status = trace_disposition
+                    trial_plan["materialized_reason"] = (
+                        "candidate duplicated a previously proposed or baseline configuration"
+                        if trace_disposition == "duplicate"
+                        else study_proposal.error
+                        or str(trial_plan.get("materialized_reason", "candidate rejected"))
+                    )
             if materialized_status != "ready":
                 _append_candidate_outcome(
                     str(trial_label),
@@ -6381,6 +6672,21 @@ Do not use placeholder keys in real responses. Do not use bundled or alternation
                 },
             )
 
+            study_execution_sequence: int | None = None
+            if study_trace is not None and isinstance(study_proposal, StudyProposal):
+                study_execution_sequence = study_trace.record_execution_started(
+                    study_proposal,
+                    metadata={
+                        "round": iteration,
+                        "trial": idx,
+                        "label": trial_label,
+                        "current_wall_time_s": current_time,
+                        "current_objective_value": current_objective_value,
+                        "incumbent_wall_time_s": best_time,
+                        "incumbent_objective_value": best_objective_value,
+                    },
+                )
+
             while True:
                 seen_trials.add(_command_key(trial_cmd, trial_env))
                 sink.print(f"  Trial {idx}/{len(candidate_attempts)}: {trial_label}")
@@ -6431,6 +6737,7 @@ Do not use placeholder keys in real responses. Do not use bundled or alternation
                 trial_stdout = trial_artifacts.get("stdout", "")
                 trial_stderr = trial_artifacts.get("stderr", "")
                 trial_rc = trial_artifacts["returncode"]
+                trial_timed_out = bool(trial_artifacts.get("timed_out"))
                 _emit_tune_event(
                     event_emitter,
                     "exec.finished",
@@ -6490,6 +6797,53 @@ Do not use placeholder keys in real responses. Do not use bundled or alternation
                 if retry_key in seen_trials:
                     break
 
+                if study_trace is not None:
+                    if study_execution_sequence is not None:
+                        study_trace.record_execution_finished(
+                            study_execution_sequence,
+                            status="timeout" if trial_timed_out else "error",
+                            wall_time_s=float(trial_time),
+                            objective_name=None,
+                            objective_value=None,
+                            returncode=int(trial_rc),
+                            timed_out=trial_timed_out,
+                            failure_reason="runtime_unsupported_option",
+                        )
+                        study_execution_sequence = None
+                    retry_study_proposal = study_trace.record_runtime_candidate(
+                        retry_plan["cmd"],
+                        retry_plan["env_overrides"],
+                        metadata={
+                            "round": iteration,
+                            "trial": idx,
+                            "source": "unsupported_option_retry",
+                            "removed_options": removed_options,
+                        },
+                    )
+                    if retry_study_proposal is None:
+                        break
+                    retry_disposition = study_trace.validate_proposal(
+                        retry_study_proposal,
+                        accepted=True,
+                        reason="runtime retry after removing unsupported options",
+                        metadata={"validation_stage": "runtime_retry"},
+                    )
+                    if (
+                        retry_disposition != "candidate"
+                        or study_trace.unique_execution_target_reached
+                    ):
+                        break
+                    study_proposal = retry_study_proposal
+                    study_execution_sequence = study_trace.record_execution_started(
+                        retry_study_proposal,
+                        metadata={
+                            "round": iteration,
+                            "trial": idx,
+                            "label": retry_plan["label"],
+                            "source": "unsupported_option_retry",
+                        },
+                    )
+
                 sink.print(
                     "    [yellow]Retrying without unsupported option(s): "
                     f"{', '.join(removed_options)}[/yellow]"
@@ -6502,6 +6856,16 @@ Do not use placeholder keys in real responses. Do not use bundled or alternation
                 trial_actions = retry_plan.get("actions", [])
 
             if trial_rc != 0:
+                if study_trace is not None and study_execution_sequence is not None:
+                    study_trace.record_execution_finished(
+                        study_execution_sequence,
+                        status="timeout" if trial_timed_out else "error",
+                        wall_time_s=float(trial_time),
+                        objective_name=None,
+                        objective_value=None,
+                        returncode=int(trial_rc),
+                        timed_out=trial_timed_out,
+                    )
                 _append_candidate_outcome(
                     str(trial_label),
                     "failed",
@@ -6530,6 +6894,7 @@ Do not use placeholder keys in real responses. Do not use bundled or alternation
                 if (
                     fixed_goal is None
                     and not fixed_budget_state.enabled
+                    and study_trace is None
                     and non_improving_trials >= convergence_patience
                     and successful_trials > 0
                 ):
@@ -6558,6 +6923,17 @@ Do not use placeholder keys in real responses. Do not use bundled or alternation
                     resolved_primary_objective_metric,
                 )
                 if trial_objective_value is None:
+                    if study_trace is not None and study_execution_sequence is not None:
+                        study_trace.record_execution_finished(
+                            study_execution_sequence,
+                            status="error",
+                            wall_time_s=float(trial_time),
+                            objective_name=resolved_primary_objective_metric,
+                            objective_value=None,
+                            returncode=int(trial_rc),
+                            timed_out=False,
+                            failure_reason="missing_primary_objective",
+                        )
                     _append_candidate_outcome(
                         str(trial_label),
                         "missing_primary_objective",
@@ -6591,6 +6967,7 @@ Do not use placeholder keys in real responses. Do not use bundled or alternation
                     if (
                         fixed_goal is None
                         and not fixed_budget_state.enabled
+                        and study_trace is None
                         and non_improving_trials >= convergence_patience
                         and successful_trials > 0
                     ):
@@ -6618,6 +6995,17 @@ Do not use placeholder keys in real responses. Do not use bundled or alternation
                 current_change_value = _format_metric_value(trial_objective_value)
                 trial_is_better_than_iteration_best = best_order > 0 or (
                     best_order == 0 and trial_time < iteration_best_time
+                )
+
+            if study_trace is not None and study_execution_sequence is not None:
+                study_trace.record_execution_finished(
+                    study_execution_sequence,
+                    status="ok",
+                    wall_time_s=float(trial_time),
+                    objective_name=resolved_primary_objective_metric,
+                    objective_value=trial_objective_value,
+                    returncode=int(trial_rc),
+                    timed_out=False,
                 )
 
             successful_trials += 1
@@ -6700,6 +7088,7 @@ Do not use placeholder keys in real responses. Do not use bundled or alternation
             if (
                 fixed_goal is None
                 and not fixed_budget_state.enabled
+                and study_trace is None
                 and non_improving_trials >= convergence_patience
                 and successful_trials > 0
             ):
@@ -6741,7 +7130,7 @@ Do not use placeholder keys in real responses. Do not use bundled or alternation
                     break
                 continue
             stagnation_iterations += 1
-            if stagnation_iterations >= convergence_patience:
+            if study_trace is None and stagnation_iterations >= convergence_patience:
                 break
             continue
 
@@ -6899,6 +7288,21 @@ Do not use placeholder keys in real responses. Do not use bundled or alternation
             fixed_budget_stop_reason = "fixed_budget_exhausted"
             break
 
+        if study_trace is not None and study_trace.unique_execution_target_reached:
+            sink.print(
+                "  Stopped: deep-trace unique execution target reached after "
+                f"{study_trace.unique_execution_count}/"
+                f"{study_trace.unique_execution_target} non-baseline launches"
+            )
+            break
+
+        if study_trace is not None and study_trace.proposal_cap_reached:
+            sink.print(
+                "  Stopped: deep-trace proposal cap reached after "
+                f"{study_trace.proposal_count}/{study_trace.proposal_cap} proposals"
+            )
+            break
+
         if _candidate_trials_remaining() == 0:
             if fixed_goal is not None:
                 fixed_goal_stop_reason = "max_iterations_exhausted"
@@ -6926,6 +7330,7 @@ Do not use placeholder keys in real responses. Do not use bundled or alternation
         if (
             fixed_goal is None
             and not fixed_budget_state.enabled
+            and study_trace is None
             and stagnation_iterations >= convergence_patience
         ):
             sink.print("  Iterative loop converged after non-improving iterations")
@@ -7222,6 +7627,18 @@ Do not use placeholder keys in real responses. Do not use bundled or alternation
             ),
         },
     )
+    if study_trace is not None:
+        study_trace.finish(
+            metadata={
+                "run_status": run_status,
+                "current_wall_time_s": current_time,
+                "current_objective_value": current_objective_value,
+                "incumbent_wall_time_s": best_time,
+                "incumbent_objective_value": best_objective_value,
+                "total_candidate_trials_executed": total_candidate_trials_executed,
+                "ordinary_stop_reason": _final_stop_reason(),
+            }
+        )
 
 
 def _run_spawn_tune_loop(
@@ -7244,31 +7661,37 @@ def _run_spawn_tune_loop(
     initial_hypothesis_profiles: list[dict[str, Any]] | None = None,
     excluded_config_names: Sequence[str] | None = None,
     tunable_whitelist_names: Sequence[str] | None = None,
+    study_trace: NestedCpuBlasStudyTrace | None = None,
 ) -> None:
     workdir_str = str(workdir) if workdir else None
-    asyncio.run(
-        _run_spawn_tune_loop_async(
-            agent=agent,
-            command=command,
-            contracts=contracts,
-            manual_hints=manual_hints,
-            fixed_budget=fixed_budget,
-            fixed_goal=fixed_goal,
-            max_iterations=max_iterations,
-            timeout=timeout,
-            primary_objective=primary_objective,
-            primary_objective_mode=primary_objective_mode,
-            workdir=workdir_str,
-            memory_high=memory_high,
-            profiling_enabled=profiling_enabled,
-            sink=sink,
-            event_emitter=event_emitter,
-            structured_context_bundle=structured_context_bundle,
-            initial_hypothesis_profiles=initial_hypothesis_profiles,
-            excluded_config_names=excluded_config_names,
-            tunable_whitelist_names=tunable_whitelist_names,
+    try:
+        asyncio.run(
+            _run_spawn_tune_loop_async(
+                agent=agent,
+                command=command,
+                contracts=contracts,
+                manual_hints=manual_hints,
+                fixed_budget=fixed_budget,
+                fixed_goal=fixed_goal,
+                max_iterations=max_iterations,
+                timeout=timeout,
+                primary_objective=primary_objective,
+                primary_objective_mode=primary_objective_mode,
+                workdir=workdir_str,
+                memory_high=memory_high,
+                profiling_enabled=profiling_enabled,
+                sink=sink,
+                event_emitter=event_emitter,
+                structured_context_bundle=structured_context_bundle,
+                initial_hypothesis_profiles=initial_hypothesis_profiles,
+                excluded_config_names=excluded_config_names,
+                tunable_whitelist_names=tunable_whitelist_names,
+                study_trace=study_trace,
+            )
         )
-    )
+    finally:
+        if study_trace is not None:
+            study_trace.finish()
 
 
 def _run_quick_tune_loop(

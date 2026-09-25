@@ -6,4 +6,4 @@
 # pyrfr ships manylinux wheels for CPython 3.8-3.11, so a normal install needs
 # no compiler/SWIG. On exotic platforms where pyrfr must build from source,
 # install SWIG first (`apt-get install swig` or `pip install swig`).
-smac>=2.0,<3
+smac==2.4.0

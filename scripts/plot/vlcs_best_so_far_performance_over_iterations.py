@@ -274,7 +274,7 @@ def plot(processed_csv: Path, output_path: Path, max_iteration: int | None) -> N
         )
 
     _ = ax.set_xlabel("candidate trial")
-    _ = ax.set_ylabel("speedup over even partition baseline")
+    _ = ax.set_ylabel("speedup over baseline")
     _ = ax.set_xlim(0, plot_max_iteration)
     _ = ax.set_ylim(1.0, max(1.25, max_speedup + 0.03))
     ax.xaxis.set_major_locator(MultipleLocator(10))

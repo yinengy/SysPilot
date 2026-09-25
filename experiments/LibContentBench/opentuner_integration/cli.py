@@ -6,7 +6,7 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
@@ -174,6 +174,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--list-workflows", action="store_true", help="Print supported workflow ids and exit"
     )
+    parser.add_argument(
+        "--study-ledger",
+        help=(
+            "Opt in to the nestedcpu-blas deep-trace study and write the shared "
+            "case-study JSONL ledger to this path"
+        ),
+    )
+    parser.add_argument(
+        "--study-proposal-cap",
+        type=int,
+        default=None,
+        help="Override the study proposal cap (default from the shared manifest: 60)",
+    )
+    parser.add_argument(
+        "--study-unique-execution-target",
+        type=int,
+        default=None,
+        help="Override the unique non-baseline execution target (default: 30)",
+    )
     parser.set_defaults(parallelism=1)
     return parser
 
@@ -193,9 +212,44 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         )
     if args.timeout_sec is not None and args.timeout_sec < 1:
         parser.error("--timeout-sec must be >= 1")
+    has_study_override = (
+        args.study_proposal_cap is not None or args.study_unique_execution_target is not None
+    )
+    if has_study_override and not args.study_ledger:
+        parser.error(
+            "--study-proposal-cap and --study-unique-execution-target require --study-ledger"
+        )
+    if args.study_ledger:
+        if args.workflow != "nestedcpu-blas":
+            parser.error("--study-ledger requires --workflow nestedcpu-blas")
+        if args.parallelism != 1:
+            parser.error("--study-ledger requires --parallelism 1")
+        if args.pipelining != 0:
+            parser.error("--study-ledger requires --pipelining 0")
+        if args.seed_configuration:
+            parser.error("--study-ledger does not allow additional --seed-configuration values")
+        if args.study_proposal_cap is not None and args.study_proposal_cap < 1:
+            parser.error("--study-proposal-cap must be >= 1")
+        if (
+            args.study_unique_execution_target is not None
+            and args.study_unique_execution_target < 1
+        ):
+            parser.error("--study-unique-execution-target must be >= 1")
+        if (
+            args.study_proposal_cap is not None
+            and args.study_unique_execution_target is not None
+            and args.study_proposal_cap < args.study_unique_execution_target
+        ):
+            parser.error("--study-proposal-cap cannot be below --study-unique-execution-target")
 
 
 def main(argv: list[str] | None = None) -> int:
+    from experiments.LibContentBench.opentuner_integration.trace import (
+        finalize_opentuner_trace,
+        require_opentuner_0_8_8,
+    )
+
+    require_opentuner_0_8_8()
     parser = build_parser()
     args = parser.parse_args(argv)
     _validate_args(parser, args)
@@ -223,6 +277,18 @@ def main(argv: list[str] | None = None) -> int:
     args.timeout_sec = timeout_seconds
     requested_direction = args.tuning_goal or args.metric_direction
     metric_direction = resolve_metric_direction(str(args.metric), str(requested_direction))
+    study_trace = None
+    if args.study_ledger:
+        from experiments.LibContentBench.opentuner_integration.trace import (
+            OpenTunerStudyTrace,
+        )
+
+        study_trace = OpenTunerStudyTrace(
+            Path(args.study_ledger).resolve(),
+            proposal_cap=args.study_proposal_cap,
+            unique_execution_target=args.study_unique_execution_target,
+        )
+        args.test_limit = study_trace.proposal_cap
     interface = LibContentBenchOpenTunerInterface(
         args,
         workflow_spec=workflow_spec,
@@ -231,9 +297,42 @@ def main(argv: list[str] | None = None) -> int:
         timeout_seconds=timeout_seconds,
         output_dir=output_dir,
         repo_root=REPO_ROOT,
+        study_trace=study_trace,
     )
     process_started_at = time.perf_counter()
-    TuningRunMain(interface, args).main()
+    tuning_run_main = TuningRunMain(interface, args)
+    tuning_run_main.init()
+    tuning_run_main.session.flush()
+    if tuning_run_main.tuning_run is None:
+        raise RuntimeError("OpenTuner did not initialize a tuning run")
+    tuning_run_id = int(cast(Any, tuning_run_main.tuning_run.id))
+    run_error: BaseException | None = None
+    run_traceback = None
+    try:
+        tuning_run_main.main()
+    except BaseException as exc:
+        run_error = exc
+        run_traceback = exc.__traceback__
+    try:
+        finalize_opentuner_trace(
+            database_url=str(args.database),
+            tuning_run_id=tuning_run_id,
+            output_dir=output_dir,
+            baseline_fingerprint=interface.baseline_fingerprint,
+            configured_techniques=args.technique,
+            study_trace=study_trace,
+            metric_name=str(args.metric),
+            metric_mode=metric_direction,
+            optimizer_stop_reason=(
+                "opentuner_aborted" if run_error is not None else "opentuner_completed"
+            ),
+        )
+    except BaseException as trace_error:
+        if run_error is not None:
+            raise trace_error from run_error
+        raise
+    if run_error is not None:
+        raise run_error.with_traceback(run_traceback)
     total_process_wall_time_sec = time.perf_counter() - process_started_at
     print_run_summary(output_dir, total_process_wall_time_sec)
     return 0
