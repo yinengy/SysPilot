@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "study_id": "nestedcpu-blas-deep-trace-v1",
+  "workload": {
+    "matrix_size": 320,
+    "task_count": 800,
+    "repetitions": 6
+  },
+  "controls": [
+    {
+      "name": "outer_jobs",
+      "kind": "integer",
+      "minimum": 1,
+      "maximum": 48,
+      "aliases": ["outer_jobs", "joblib_n_jobs", "--joblib-n-jobs", "--outer-jobs"]
+    },
+    {
+      "name": "omp_threads",
+      "kind": "integer",
+      "minimum": 1,
+      "maximum": 48,
+      "aliases": ["omp_threads", "OMP_NUM_THREADS"]
+    },
+    {
+      "name": "openblas_threads",
+      "kind": "integer",
+      "minimum": 1,
+      "maximum": 48,
+      "aliases": ["openblas_threads", "OPENBLAS_NUM_THREADS"]
+    },
+    {
+      "name": "mkl_threads",
+      "kind": "integer",
+      "minimum": 1,
+      "maximum": 48,
+      "aliases": ["mkl_threads", "MKL_NUM_THREADS"]
+    },
+    {
+      "name": "blis_threads",
+      "kind": "integer",
+      "minimum": 1,
+      "maximum": 48,
+      "aliases": ["blis_threads", "BLIS_NUM_THREADS"]
+    },
+    {
+      "name": "numexpr_threads",
+      "kind": "integer",
+      "minimum": 1,
+      "maximum": 48,
+      "aliases": ["numexpr_threads", "NUMEXPR_NUM_THREADS"]
+    },
+    {
+      "name": "backend_prefer",
+      "kind": "categorical",
+      "options": ["processes", "threads"],
+      "aliases": ["backend_prefer", "--backend-prefer"]
+    }
+  ],
+  "baseline": {
+    "outer_jobs": 6,
+    "omp_threads": 6,
+    "openblas_threads": 6,
+    "mkl_threads": 1,
+    "blis_threads": 1,
+    "numexpr_threads": 1,
+    "backend_prefer": "processes"
+  },
+  "reference_subset": {
+    "label": "evidenced_reference_line",
+    "vary": "outer_jobs",
+    "values": {"minimum": 1, "maximum": 48},
+    "fixed": {
+      "omp_threads": 1,
+      "openblas_threads": 1,
+      "mkl_threads": 1,
+      "blis_threads": 1,
+      "numexpr_threads": 1,
+      "backend_prefer": "threads"
+    }
+  },
+  "budgets": {
+    "proposal_cap": 60,
+    "unique_execution_target": 30
+  },
+  "domain_cardinality": 24461180928
+}
