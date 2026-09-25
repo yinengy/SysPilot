@@ -164,6 +164,20 @@ syspilot tune \
 - Quick-mode artifacts are written under `artifacts/quick_tune_runs/<run_id>/` and include structured baseline/full/short run metadata, per-run raw `run_artifact.json` files, saved stdout/stderr, flattened per-signal sample rows, ranked abnormal windows, promotion decisions, and a final `quick_report.json`.
 - Quick mode now filters duplicate semantic signals before ranking and excludes objective-only `role=outcome` metrics such as benchmark elapsed time from the profiling-first quick-mode signal set.
 
+### Research-only nestedcpu-blas deep trace
+
+The opt-in `--study-ledger` mechanism is available only from a SysPilot repository source checkout. Its shared case-study support lives under `experiments/` and is intentionally not included in production wheels. Ordinary tuning does not load or depend on these research sources and is unaffected when `--study-ledger` is absent.
+
+From a repository checkout, enable the trace with:
+
+```bash
+syspilot tune \
+  --command "env ... python run_nestedcpu_blas_case.py ..." \
+  --study-ledger ./concord-trace.jsonl
+```
+
+The study defaults to 60 model proposals and 30 unique non-baseline launches. `--study-proposal-cap` and `--study-unique-execution-target` can override those bounds when the ledger is enabled; the study protocol then replaces `--max-iterations` as the stopping bound.
+
 ### Quick Mode Workflow
 
 Use quick mode when you have contract signals that are directionally meaningful early in the run and you want to screen more candidates before paying for full validation.
