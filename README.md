@@ -433,3 +433,19 @@ black syspilot
 ## License
 
 MIT
+
+## How to Cite
+
+If you use SysPilot in your research, please cite:
+
+```bibtex
+@misc{syspilot,
+      title={SysPilot: Cross-Library Performance Autotuning via Library Performance Contracts}, 
+      author={Yineng Yan and Haowei Chen and Christopher J. Rossbach},
+      year={2026},
+      eprint={2611.06078},
+      archivePrefix={arXiv},
+      primaryClass={cs.PF},
+      url={https://arxiv.org/abs/2611.06078}, 
+}
+```
